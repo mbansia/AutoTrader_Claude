@@ -12,7 +12,35 @@ class Candidate:
     spot_symbol: str
     perp_symbol: str
     funding_rate: float
+    funding_interval_hours: float
     quote_volume: float
+
+    @property
+    def funding_apr(self) -> float:
+        return annualize_rate(self.funding_rate, self.funding_interval_hours)
+
+
+def annualize_rate(period_rate: float, interval_hours: float) -> float:
+    """Convert a per-funding-period rate (decimal) to annualized (decimal). 8h interval ≈ 1095 periods/yr."""
+    if interval_hours <= 0:
+        return 0.0
+    return period_rate * (24.0 * 365.0 / interval_hours)
+
+
+def _interval_hours(row: dict) -> float:
+    interval = row.get('interval')
+    if isinstance(interval, str) and interval.endswith('h'):
+        try:
+            return float(interval[:-1])
+        except ValueError:
+            pass
+    fund_ts = row.get('fundingTimestamp')
+    next_ts = row.get('nextFundingTimestamp')
+    if fund_ts and next_ts and next_ts > fund_ts:
+        hours = (next_ts - fund_ts) / 3_600_000.0
+        if 1.0 <= hours <= 24.0:
+            return round(hours)
+    return 8.0
 
 
 class BinanceGateway:
@@ -24,7 +52,7 @@ class BinanceGateway:
         self.spot.load_markets()
         self.futures.load_markets()
 
-    def scan_funding(self, entry_threshold: float, min_quote_volume: float) -> tuple[list[Candidate], int, list[tuple[str, str, float]]]:
+    def scan_funding(self, entry_apr_threshold: float, min_quote_volume: float) -> tuple[list[Candidate], int, list[tuple[str, str, float]]]:
         rates = self.futures.fetch_funding_rates()
         passing: list[Candidate] = []
         rejected: list[tuple[str, str, float]] = []
@@ -34,24 +62,26 @@ class BinanceGateway:
             if fr is None or not symbol.endswith(':USDT'):
                 continue
             total += 1
-            if fr < entry_threshold:
+            interval_h = _interval_hours(row)
+            apr = annualize_rate(float(fr), interval_h)
+            if apr < entry_apr_threshold:
                 continue
             base = symbol.split('/')[0]
             spot_symbol = f'{base}/USDT'
             if spot_symbol not in self.spot.markets:
-                rejected.append((symbol, 'no_spot_market', float(fr)))
+                rejected.append((symbol, 'no_spot_market', apr))
                 continue
             try:
                 t = self.spot.fetch_ticker(spot_symbol)
             except Exception:
-                rejected.append((symbol, 'ticker_error', float(fr)))
+                rejected.append((symbol, 'ticker_error', apr))
                 continue
             qv = float(t.get('quoteVolume') or 0)
             if qv < min_quote_volume:
-                rejected.append((symbol, f'volume<{min_quote_volume:.0f}', float(fr)))
+                rejected.append((symbol, f'volume<{min_quote_volume:.0f}', apr))
                 continue
-            passing.append(Candidate(spot_symbol=spot_symbol, perp_symbol=symbol, funding_rate=float(fr), quote_volume=qv))
-        passing.sort(key=lambda c: c.funding_rate, reverse=True)
+            passing.append(Candidate(spot_symbol=spot_symbol, perp_symbol=symbol, funding_rate=float(fr), funding_interval_hours=interval_h, quote_volume=qv))
+        passing.sort(key=lambda c: c.funding_apr, reverse=True)
         return passing, total, rejected
 
     def safe_balances(self) -> dict | None:

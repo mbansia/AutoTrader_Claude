@@ -19,6 +19,7 @@ class Position(Base):
     last_funding_rate: Mapped[float] = mapped_column(Float, default=0.0)
     spot_entry_price: Mapped[float] = mapped_column(Float, default=0.0)
     perp_entry_price: Mapped[float] = mapped_column(Float, default=0.0)
+    funding_interval_hours: Mapped[float] = mapped_column(Float, default=8.0)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
@@ -71,8 +72,11 @@ class RuntimeState(Base):
 class StrategyConfig(Base):
     __tablename__ = 'strategy_config'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    entry_funding_threshold: Mapped[float] = mapped_column(Float, default=0.0002)
-    exit_funding_threshold: Mapped[float] = mapped_column(Float, default=0.00005)
+    # Funding-rate thresholds are stored as annualized decimals (APR).
+    # 0.20 = 20% APR. The bot annualizes each candidate's period rate using
+    # its funding interval (4h or 8h on Binance) before comparing.
+    entry_funding_threshold: Mapped[float] = mapped_column(Float, default=0.20)
+    exit_funding_threshold: Mapped[float] = mapped_column(Float, default=0.05)
     max_hold_hours: Mapped[int] = mapped_column(Integer, default=72)
     max_open_positions: Mapped[int] = mapped_column(Integer, default=1)
     max_trades_per_day: Mapped[int] = mapped_column(Integer, default=8)

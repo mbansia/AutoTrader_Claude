@@ -15,7 +15,7 @@ from sqlalchemy import desc, func, select
 from app.bot import get_runtime_state, get_strategy_config, run_loop, run_one_cycle
 from app.config import settings
 from app.db import Base, SessionLocal, engine
-from app.exchange import BinanceGateway
+from app.exchange import BinanceGateway, annualize_rate
 from app.finance import (
     net_capital_in,
     portfolio_xirr,
@@ -175,6 +175,10 @@ def dashboard(request: Request, _: None = Depends(auth)):
                 latest_scan_top = json.loads(latest_scan.top_candidates) or []
             except Exception:
                 latest_scan_top = []
+        # Backfill apr field for old scan rows that pre-date APR storage.
+        for c in latest_scan_top:
+            if 'apr' not in c:
+                c['apr'] = annualize_rate(c.get('fr', 0.0), c.get('interval_h', 8.0))
 
         current_equity, equity_source = _current_equity(db)
         balances_error = None
@@ -231,6 +235,7 @@ def positions_page(request: Request, _: None = Depends(auth)):
         for p in open_positions:
             spot_now = gw.safe_price(p.spot_symbol) or 0.0
             perp_now = gw.safe_price(p.perp_symbol, perp=True) or 0.0
+            interval_h = p.funding_interval_hours or 8.0
             rows.append({
                 'symbol': p.symbol,
                 'quantity': p.quantity,
@@ -238,8 +243,9 @@ def positions_page(request: Request, _: None = Depends(auth)):
                 'spot_now': spot_now,
                 'perp_entry': p.perp_entry_price,
                 'perp_now': perp_now,
-                'entry_funding': p.entry_funding_rate,
-                'last_funding': p.last_funding_rate,
+                'entry_funding_apr': annualize_rate(p.entry_funding_rate, interval_h),
+                'last_funding_apr': annualize_rate(p.last_funding_rate, interval_h),
+                'interval_hours': interval_h,
                 'age': _fmt_age(datetime.utcnow() - p.opened_at),
                 'unrealized_pnl': position_unrealized_pnl(p, spot_now, perp_now) if (spot_now and perp_now) else 0.0,
             })
@@ -349,7 +355,10 @@ def logs_page(request: Request, _: None = Depends(auth)):
             try:
                 top = json.loads(s.top_candidates) or []
                 if top:
-                    top_label = f"{top[0]['perp']} @ {top[0]['fr']*100:.4f}%"
+                    apr = top[0].get('apr')
+                    if apr is None:
+                        apr = annualize_rate(top[0].get('fr', 0.0), top[0].get('interval_h', 8.0))
+                    top_label = f"{top[0]['perp']} @ {apr*100:.2f}% APR"
             except Exception:
                 pass
             scans.append({'ts': _fmt_ts(s.ts), 'candidates_total': s.candidates_total, 'candidates_passing': s.candidates_passing, 'action': s.action, 'top_candidate_label': top_label, 'note': s.note})

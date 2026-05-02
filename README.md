@@ -12,7 +12,8 @@ DASHBOARD_PASSWORD=your_password
 
 Optional:
 ```env
-BOT_WORKER_ENABLED=1   # default; set to 0 if you want to run the worker as a separate process
+BOT_WORKER_ENABLED=1                    # default; set to 0 if you want to run the worker as a separate process
+DATABASE_URL=sqlite:///./bot.db         # default; set to sqlite:////app/data/bot.db when using a Coolify volume mount at /app/data
 ```
 
 All strategy/risk parameters are now editable from the **Configuration** tab in the dashboard and persist in the local SQLite DB.
@@ -24,7 +25,7 @@ The simplest setup is **one app**: the API process auto-starts the bot loop in a
 - Start command: `uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1`
 - Port: `8000`
 - Env vars: the 4 above
-- Persist `./bot.db` across deploys (mount it on a volume)
+- Persist `bot.db` across deploys: in Coolify "Persistent Storage", add a **Volume Mount** with destination `/app/data`, then set the env var `DATABASE_URL=sqlite:////app/data/bot.db` (four slashes — three for `sqlite://` plus one for the absolute path)
 
 Note: keep `--workers 1` so only one bot loop runs against the SQLite DB. If you want to scale the API horizontally, set `BOT_WORKER_ENABLED=0` on every API replica and run a single dedicated worker app:
 

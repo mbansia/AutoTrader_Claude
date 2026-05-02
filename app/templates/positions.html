@@ -18,8 +18,9 @@
         <th class="num">Spot now</th>
         <th class="num">Perp entry</th>
         <th class="num">Perp now</th>
-        <th class="num">Entry funding</th>
-        <th class="num">Current funding</th>
+        <th class="num">Entry funding APR</th>
+        <th class="num">Current funding APR</th>
+        <th class="num">Interval</th>
         <th class="num">Age</th>
         <th class="num">Unrealized PnL</th>
       </tr>
@@ -33,8 +34,9 @@
         <td class="num">{{ ('%.6f' % r.spot_now) if r.spot_now else '—' }}</td>
         <td class="num">{{ '%.6f' % r.perp_entry }}</td>
         <td class="num">{{ ('%.6f' % r.perp_now) if r.perp_now else '—' }}</td>
-        <td class="num">{{ '%.4f%%' % (r.entry_funding * 100) }}</td>
-        <td class="num">{{ '%.4f%%' % (r.last_funding * 100) }}</td>
+        <td class="num">{{ '%.2f%%' % (r.entry_funding_apr * 100) }}</td>
+        <td class="num {{ 'good' if r.last_funding_apr >= cfg.exit_funding_threshold else 'warn' }}">{{ '%.2f%%' % (r.last_funding_apr * 100) }}</td>
+        <td class="num muted">{{ '%dh' % r.interval_hours }}</td>
         <td class="num">{{ r.age }}</td>
         <td class="num {{ 'good' if r.unrealized_pnl >= 0 else 'bad' }}">{{ '%+.4f' % r.unrealized_pnl }}</td>
       </tr>
@@ -42,7 +44,7 @@
     </tbody>
   </table>
   {% else %}
-  <div class="empty">No open positions. The bot will open one when funding rate exceeds {{ '%.4f%%' % (cfg.entry_funding_threshold * 100) }}.</div>
+  <div class="empty">No open positions. The bot will open one when funding APR exceeds {{ '%.2f%%' % (cfg.entry_funding_threshold * 100) }}.</div>
   {% endif %}
 </div>
 

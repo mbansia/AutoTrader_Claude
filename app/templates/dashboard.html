@@ -90,10 +90,10 @@
       </div>
       {% if latest_scan_top %}
       <table>
-        <thead><tr><th>Symbol</th><th class="num">Funding rate</th><th class="num">24h Volume</th></tr></thead>
+        <thead><tr><th>Symbol</th><th class="num">Funding APR</th><th class="num">Interval</th><th class="num">24h Volume</th></tr></thead>
         <tbody>
         {% for c in latest_scan_top %}
-          <tr><td class="mono">{{ c.perp }}</td><td class="num">{{ '%.4f%%' % (c.fr * 100) }}</td><td class="num">{{ '{:,.0f}'.format(c.qv) }}</td></tr>
+          <tr><td class="mono">{{ c.perp }}</td><td class="num good">{{ '%.2f%%' % (c.apr * 100) }}</td><td class="num muted">{{ '%dh' % (c.interval_h or 8) }}</td><td class="num">{{ '{:,.0f}'.format(c.qv) }}</td></tr>
         {% endfor %}
         </tbody>
       </table>

@@ -9,12 +9,12 @@ class Settings(BaseSettings):
     binance_api_secret: str = Field(default='')
     dashboard_user: str = Field(default='admin')
     dashboard_password: str = Field(default='change-me')
+    database_url: str = Field(default='sqlite:///./bot.db')
 
 
-# Strategy/runtime defaults intentionally coded in source (not required as env vars)
-DATABASE_URL = 'sqlite:///./bot.db'
-ENTRY_FUNDING_THRESHOLD = 0.0002
-EXIT_FUNDING_THRESHOLD = 0.00005
+# Strategy/runtime defaults — all funding-rate thresholds are annualized (APR, decimal).
+ENTRY_FUNDING_APR = 0.20
+EXIT_FUNDING_APR = 0.05
 MAX_HOLD_HOURS = 72
 MAX_OPEN_POSITIONS = 1
 MAX_TRADES_PER_DAY = 8

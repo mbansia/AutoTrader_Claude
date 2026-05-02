@@ -22,8 +22,8 @@
   <table>
     <thead><tr><th>Rule</th><th>Current setting</th><th>Effect</th></tr></thead>
     <tbody>
-      <tr><th>Entry funding threshold</th><td class="num">{{ '%.4f%%' % (cfg.entry_funding_threshold * 100) }}</td><td>Only open when current funding rate ≥ this.</td></tr>
-      <tr><th>Exit funding threshold</th><td class="num">{{ '%.4f%%' % (cfg.exit_funding_threshold * 100) }}</td><td>Close when refreshed funding rate falls below this.</td></tr>
+      <tr><th>Entry funding threshold</th><td class="num">{{ '%.2f%% APR' % (cfg.entry_funding_threshold * 100) }}</td><td>Only open when annualized funding rate ≥ this. Each candidate's per-period rate is annualized using its 4h/8h interval before comparing.</td></tr>
+      <tr><th>Exit funding threshold</th><td class="num">{{ '%.2f%% APR' % (cfg.exit_funding_threshold * 100) }}</td><td>Close when refreshed annualized funding falls below this.</td></tr>
       <tr><th>Stop-loss</th><td class="num">{{ '%.2f%%' % (cfg.stop_loss_pct * 100) }}</td><td>Close when MTM PnL ÷ entry notional ≤ this.</td></tr>
       <tr><th>Max hold</th><td class="num">{{ cfg.max_hold_hours }}h</td><td>Close after this elapsed time regardless of funding.</td></tr>
       <tr><th>Max open positions</th><td class="num">{{ cfg.max_open_positions }}</td><td>Hard cap on simultaneous arb pairs.</td></tr>

@@ -12,7 +12,7 @@ from app.config import (
     settings,
 )
 from app.db import SessionLocal
-from app.exchange import BinanceGateway
+from app.exchange import BinanceGateway, _interval_hours, annualize_rate
 from app.finance import position_realized_pnl, position_unrealized_pnl, total_realized_pnl
 from app.models import (
     BalanceSnapshot,
@@ -44,11 +44,27 @@ def get_runtime_state(db) -> RuntimeState:
     return state
 
 
+_LEGACY_PERIOD_SENTINEL = 0.005  # any threshold below this is treated as a legacy per-period value
+
+
 def get_strategy_config(db) -> StrategyConfig:
     cfg = db.scalar(select(StrategyConfig).where(StrategyConfig.id == 1))
     if cfg is None:
         cfg = StrategyConfig(id=1)
         db.add(cfg)
+        db.flush()
+        return cfg
+    # One-time migration: thresholds used to be per-funding-period; now they're APR.
+    # Detect legacy values and convert assuming an 8h funding interval (1095 periods/yr).
+    migrated = False
+    if 0 < cfg.entry_funding_threshold < _LEGACY_PERIOD_SENTINEL:
+        cfg.entry_funding_threshold = round(cfg.entry_funding_threshold * 1095.0, 6)
+        migrated = True
+    if 0 < cfg.exit_funding_threshold < _LEGACY_PERIOD_SENTINEL:
+        cfg.exit_funding_threshold = round(cfg.exit_funding_threshold * 1095.0, 6)
+        migrated = True
+    if migrated:
+        log_event(db, f'Migrated funding thresholds to APR: entry={cfg.entry_funding_threshold:.4f}, exit={cfg.exit_funding_threshold:.4f}')
         db.flush()
     return cfg
 
@@ -157,9 +173,11 @@ def run_one_cycle(gateway: BinanceGateway | None = None) -> int:
                     fr = row.get('fundingRate')
                     if fr is not None:
                         p.last_funding_rate = float(fr)
+                        p.funding_interval_hours = _interval_hours(row)
+                    current_apr = annualize_rate(p.last_funding_rate, p.funding_interval_hours or 8.0)
                     age = datetime.utcnow() - p.opened_at
                     exit_reason = None
-                    if p.last_funding_rate < cfg.exit_funding_threshold:
+                    if current_apr < cfg.exit_funding_threshold:
                         exit_reason = 'funding_below_threshold'
                     elif age > timedelta(hours=cfg.max_hold_hours):
                         exit_reason = 'max_hold'
@@ -196,9 +214,9 @@ def run_one_cycle(gateway: BinanceGateway | None = None) -> int:
                     passing, candidates_total, rejected_scan = [], 0, []
                     log_event(db, f'scan_funding failed: {e}', level='ERROR')
                 candidates_passing = len(passing)
-                top_candidates_payload = [{'perp': c.perp_symbol, 'fr': c.funding_rate, 'qv': c.quote_volume} for c in passing[:5]]
-                for sym, reason, fr in rejected_scan[:20]:
-                    db.add(RejectedCandidate(symbol=sym, reason=reason, funding_rate=fr))
+                top_candidates_payload = [{'perp': c.perp_symbol, 'fr': c.funding_rate, 'apr': c.funding_apr, 'interval_h': c.funding_interval_hours, 'qv': c.quote_volume} for c in passing[:5]]
+                for sym, reason, apr in rejected_scan[:20]:
+                    db.add(RejectedCandidate(symbol=sym, reason=reason, funding_rate=apr))
 
                 bals = gateway.safe_balances() if not paper_mode else None
                 if not paper_mode and bals is None:
@@ -217,7 +235,7 @@ def run_one_cycle(gateway: BinanceGateway | None = None) -> int:
                             free_fut = float((bals['futures'].get('USDT') or {}).get('free') or 0)
                         notional = min(free_spot, free_fut) * 0.97
                         if notional < cfg.min_symbol_notional:
-                            db.add(RejectedCandidate(symbol=c.perp_symbol, reason='below min notional', funding_rate=c.funding_rate))
+                            db.add(RejectedCandidate(symbol=c.perp_symbol, reason='below min notional', funding_rate=c.funding_apr))
                             scan_action = 'below_min_notional'
                             continue
                         spot_px = gateway.safe_price(c.spot_symbol) or 0
@@ -233,6 +251,7 @@ def run_one_cycle(gateway: BinanceGateway | None = None) -> int:
                             quantity=qty,
                             entry_funding_rate=c.funding_rate,
                             last_funding_rate=c.funding_rate,
+                            funding_interval_hours=c.funding_interval_hours,
                             spot_entry_price=float(s.get('price') or 0),
                             perp_entry_price=float(f.get('price') or 0),
                         )
@@ -241,7 +260,7 @@ def run_one_cycle(gateway: BinanceGateway | None = None) -> int:
                         record_trade(db, pos.id, c.spot_symbol, 'spot', 'buy', qty, s)
                         record_trade(db, pos.id, c.perp_symbol, 'futures', 'sell', qty, f)
                         scan_action = f'opened {c.perp_symbol}'
-                        log_event(db, f'Opened {c.perp_symbol} qty={qty:.6f} fr={c.funding_rate:.5%}')
+                        log_event(db, f'Opened {c.perp_symbol} qty={qty:.6f} apr={c.funding_apr:.2%}')
                         break
             else:
                 if not cfg.entry_enabled:
