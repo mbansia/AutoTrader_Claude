@@ -1,6 +1,6 @@
 import os
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 from app.config import settings
@@ -10,8 +10,6 @@ def _ensure_sqlite_dir(url: str) -> None:
     """Make sure the parent directory exists when DATABASE_URL points at a SQLite file."""
     if not url.startswith('sqlite:'):
         return
-    # sqlite:///relative/path  -> 'relative/path'
-    # sqlite:////absolute/path -> '/absolute/path'
     path = url.split('sqlite:///', 1)[-1] if url.startswith('sqlite:///') else ''
     if not path or path == ':memory:':
         return
@@ -25,3 +23,23 @@ _ensure_sqlite_dir(settings.database_url)
 Base = declarative_base()
 engine = create_engine(settings.database_url, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+
+
+def _add_column_if_missing(table: str, column: str, ddl: str) -> None:
+    insp = inspect(engine)
+    if table not in insp.get_table_names():
+        return  # create_all will produce it with the right schema
+    cols = {c['name'] for c in insp.get_columns(table)}
+    if column in cols:
+        return
+    with engine.begin() as conn:
+        conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {column} {ddl}'))
+
+
+def run_schema_migrations() -> None:
+    """Apply lightweight in-place migrations for columns added after the initial schema."""
+    _add_column_if_missing('positions', 'funding_interval_hours', 'FLOAT NOT NULL DEFAULT 8.0')
+    _add_column_if_missing('strategy_config', 'max_entry_basis_bps', 'FLOAT NOT NULL DEFAULT 20.0')
+    _add_column_if_missing('strategy_config', 'max_exit_basis_bps', 'FLOAT NOT NULL DEFAULT 5.0')
+    _add_column_if_missing('strategy_config', 'enforce_hedge_check', 'BOOLEAN NOT NULL DEFAULT 1')
+    _add_column_if_missing('strategy_config', 'delisting_check', 'BOOLEAN NOT NULL DEFAULT 1')

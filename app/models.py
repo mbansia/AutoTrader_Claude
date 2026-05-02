@@ -90,6 +90,10 @@ class StrategyConfig(Base):
     paper_starting_equity: Mapped[float] = mapped_column(Float, default=1000.0)
     entry_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     exit_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    max_entry_basis_bps: Mapped[float] = mapped_column(Float, default=20.0)
+    max_exit_basis_bps: Mapped[float] = mapped_column(Float, default=5.0)
+    enforce_hedge_check: Mapped[bool] = mapped_column(Boolean, default=True)
+    delisting_check: Mapped[bool] = mapped_column(Boolean, default=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 

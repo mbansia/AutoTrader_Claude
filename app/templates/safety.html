@@ -13,6 +13,8 @@
       <tr><th>Maintenance mode</th><td><span class="tag {{ 'warn' if state.maintenance_mode else 'good' }}">{{ 'ON — closing all positions then exiting' if state.maintenance_mode else 'off' }}</span></td></tr>
       <tr><th>Entry switch</th><td><span class="tag {{ 'good' if cfg.entry_enabled else 'bad' }}">{{ 'enabled' if cfg.entry_enabled else 'DISABLED' }}</span></td></tr>
       <tr><th>Exit switch</th><td><span class="tag {{ 'good' if cfg.exit_enabled else 'bad' }}">{{ 'enabled' if cfg.exit_enabled else 'DISABLED' }}</span></td></tr>
+      <tr><th>Hedge check</th><td><span class="tag {{ 'good' if cfg.enforce_hedge_check else 'warn' }}">{{ 'enabled' if cfg.enforce_hedge_check else 'OFF' }}</span></td></tr>
+      <tr><th>Delisting check</th><td><span class="tag {{ 'good' if cfg.delisting_check else 'warn' }}">{{ 'enabled' if cfg.delisting_check else 'OFF' }}</span></td></tr>
     </tbody>
   </table>
 </div>
@@ -31,7 +33,11 @@
       <tr><th>Min position notional</th><td class="num">{{ '%.2f' % cfg.min_symbol_notional }} USDT</td><td>Skip candidates whose available notional is below this.</td></tr>
       <tr><th>Max position notional</th><td class="num">{{ '%.2f' % cfg.max_position_notional }} USDT</td><td>Cap any single open at this size.</td></tr>
       <tr><th>Min 24h quote volume</th><td class="num">{{ '{:,.0f}'.format(cfg.min_24h_quote_volume) }} USDT</td><td>Liquidity filter on spot leg.</td></tr>
-      <tr><th>Loop interval</th><td class="num">{{ cfg.loop_seconds }}s</td><td>Frequency of scan / exit / snapshot.</td></tr>
+      <tr><th>Max entry basis</th><td class="num">±{{ '%.1f' % cfg.max_entry_basis_bps }} bps</td><td>Refuse to open when |perp − spot| / spot exceeds this — protects against entering during a dislocation.</td></tr>
+      <tr><th>Max exit basis</th><td class="num">{{ '%.1f' % cfg.max_exit_basis_bps }} bps</td><td>Defer voluntary exits (funding decay, max hold) until basis is favorable. Stop-loss, naked-leg, delisting and maintenance bypass this gate.</td></tr>
+      <tr><th>Hedge integrity check</th><td><span class="tag {{ 'good' if cfg.enforce_hedge_check else 'warn' }}">{{ 'every loop' if cfg.enforce_hedge_check else 'OFF' }}</span></td><td>Verify both spot and perp legs exist on Binance with the expected size; flatten any naked leg automatically.</td></tr>
+      <tr><th>Market-status check</th><td><span class="tag {{ 'good' if cfg.delisting_check else 'warn' }}">{{ 'every loop' if cfg.delisting_check else 'OFF' }}</span></td><td>Force-close if either leg's market is not in <span class="mono">TRADING</span> status (delisting, halt, settlement).</td></tr>
+      <tr><th>Loop interval</th><td class="num">{{ cfg.loop_seconds }}s</td><td>Frequency of scan / exit / safety / snapshot cycle.</td></tr>
       <tr><th>LIVE mode confirmation</th><td>required word: <span class="mono">LIVE</span></td><td>Switching out of paper requires typing the word LIVE.</td></tr>
       <tr><th>Position reconciliation</th><td>on startup</td><td>Untracked perp positions detected on Binance are rehydrated.</td></tr>
     </tbody>

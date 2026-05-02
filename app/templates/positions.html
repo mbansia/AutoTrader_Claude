@@ -14,12 +14,13 @@
       <tr>
         <th>Symbol</th>
         <th class="num">Quantity</th>
-        <th class="num">Spot entry</th>
-        <th class="num">Spot now</th>
-        <th class="num">Perp entry</th>
-        <th class="num">Perp now</th>
-        <th class="num">Entry funding APR</th>
-        <th class="num">Current funding APR</th>
+        <th class="num">Notional entry</th>
+        <th class="num">Notional now</th>
+        <th class="num">Spot entry → now</th>
+        <th class="num">Perp entry → now</th>
+        <th class="num">Basis entry</th>
+        <th class="num">Basis now</th>
+        <th class="num">Funding APR (now)</th>
         <th class="num">Interval</th>
         <th class="num">Age</th>
         <th class="num">Unrealized PnL</th>
@@ -30,11 +31,12 @@
       <tr>
         <td class="mono">{{ r.symbol }}</td>
         <td class="num">{{ '%.6f' % r.quantity }}</td>
-        <td class="num">{{ '%.6f' % r.spot_entry }}</td>
-        <td class="num">{{ ('%.6f' % r.spot_now) if r.spot_now else '—' }}</td>
-        <td class="num">{{ '%.6f' % r.perp_entry }}</td>
-        <td class="num">{{ ('%.6f' % r.perp_now) if r.perp_now else '—' }}</td>
-        <td class="num">{{ '%.2f%%' % (r.entry_funding_apr * 100) }}</td>
+        <td class="num">{{ '%.2f' % r.notional_entry }}</td>
+        <td class="num">{{ ('%.2f' % r.notional_now) if r.notional_now else '—' }}</td>
+        <td class="num">{{ '%.6f' % r.spot_entry }} → {{ ('%.6f' % r.spot_now) if r.spot_now else '—' }}</td>
+        <td class="num">{{ '%.6f' % r.perp_entry }} → {{ ('%.6f' % r.perp_now) if r.perp_now else '—' }}</td>
+        <td class="num muted">{{ '%+.1f bps' % r.basis_entry_bps }}</td>
+        <td class="num {{ 'good' if r.basis_now_bps <= cfg.max_exit_basis_bps else 'warn' }}">{{ '%+.1f bps' % r.basis_now_bps }}</td>
         <td class="num {{ 'good' if r.last_funding_apr >= cfg.exit_funding_threshold else 'warn' }}">{{ '%.2f%%' % (r.last_funding_apr * 100) }}</td>
         <td class="num muted">{{ '%dh' % r.interval_hours }}</td>
         <td class="num">{{ r.age }}</td>
@@ -44,7 +46,7 @@
     </tbody>
   </table>
   {% else %}
-  <div class="empty">No open positions. The bot will open one when funding APR exceeds {{ '%.2f%%' % (cfg.entry_funding_threshold * 100) }}.</div>
+  <div class="empty">No open positions. The bot will open one when funding APR exceeds {{ '%.2f%%' % (cfg.entry_funding_threshold * 100) }} and the spot/perp basis is within ±{{ '%.0f' % cfg.max_entry_basis_bps }} bps.</div>
   {% endif %}
 </div>
 

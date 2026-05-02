@@ -14,8 +14,9 @@ from sqlalchemy import desc, func, select
 
 from app.bot import get_runtime_state, get_strategy_config, run_loop, run_one_cycle
 from app.config import settings
-from app.db import Base, SessionLocal, engine
+from app.db import Base, SessionLocal, engine, run_schema_migrations
 from app.exchange import BinanceGateway, annualize_rate
+from app.safety import basis_bps
 from app.finance import (
     net_capital_in,
     portfolio_xirr,
@@ -67,6 +68,7 @@ def auth(creds: HTTPBasicCredentials = Depends(security)):
 @app.on_event('startup')
 def startup() -> None:
     Base.metadata.create_all(bind=engine)
+    run_schema_migrations()
     with SessionLocal() as db:
         get_runtime_state(db)
         get_strategy_config(db)
@@ -243,6 +245,10 @@ def positions_page(request: Request, _: None = Depends(auth)):
                 'spot_now': spot_now,
                 'perp_entry': p.perp_entry_price,
                 'perp_now': perp_now,
+                'notional_entry': p.quantity * p.spot_entry_price,
+                'notional_now': p.quantity * spot_now if spot_now else 0.0,
+                'basis_entry_bps': basis_bps(p.spot_entry_price, p.perp_entry_price),
+                'basis_now_bps': basis_bps(spot_now, perp_now) if (spot_now and perp_now) else 0.0,
                 'entry_funding_apr': annualize_rate(p.entry_funding_rate, interval_h),
                 'last_funding_apr': annualize_rate(p.last_funding_rate, interval_h),
                 'interval_hours': interval_h,
@@ -402,6 +408,10 @@ def save_config(
     paper_starting_equity: float = Form(...),
     entry_enabled: int = Form(...),
     exit_enabled: int = Form(...),
+    max_entry_basis_bps: float = Form(...),
+    max_exit_basis_bps: float = Form(...),
+    enforce_hedge_check: int = Form(...),
+    delisting_check: int = Form(...),
     _: None = Depends(auth),
 ):
     with SessionLocal() as db:
@@ -421,6 +431,10 @@ def save_config(
         cfg.paper_starting_equity = paper_starting_equity
         cfg.entry_enabled = bool(entry_enabled)
         cfg.exit_enabled = bool(exit_enabled)
+        cfg.max_entry_basis_bps = max_entry_basis_bps
+        cfg.max_exit_basis_bps = max_exit_basis_bps
+        cfg.enforce_hedge_check = bool(enforce_hedge_check)
+        cfg.delisting_check = bool(delisting_check)
         db.commit()
     return RedirectResponse(url='/config?saved=1', status_code=303)
 

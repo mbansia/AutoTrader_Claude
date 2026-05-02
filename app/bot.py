@@ -14,6 +14,13 @@ from app.config import (
 from app.db import SessionLocal
 from app.exchange import BinanceGateway, _interval_hours, annualize_rate
 from app.finance import position_realized_pnl, position_unrealized_pnl, total_realized_pnl
+from app.safety import (
+    basis_bps,
+    check_hedge,
+    check_market_health,
+    is_basis_entry_acceptable,
+    is_basis_exit_favorable,
+)
 from app.models import (
     BalanceSnapshot,
     BotEvent,
@@ -71,6 +78,32 @@ def get_strategy_config(db) -> StrategyConfig:
 
 def record_trade(db, position_id: int | None, symbol: str, venue: str, side: str, qty: float, order: dict):
     db.add(Trade(position_id=position_id, symbol=symbol, venue=venue, side=side, quantity=qty, price=float(order.get('price') or 0), fee=float((order.get('fee') or {}).get('cost') or 0)))
+
+
+def _force_close_both(db, gateway: BinanceGateway, p: Position, paper_mode: bool, cfg: StrategyConfig, reason: str) -> None:
+    """Close both legs of a Position immediately, regardless of basis. Used for stop-loss, delisting,
+    maintenance mode, and any other mandatory exit."""
+    s = gateway.close_spot(p.spot_symbol, p.quantity, paper_mode, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+    f = gateway.close_perp(p.perp_symbol, p.quantity, paper_mode, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+    record_trade(db, p.id, p.spot_symbol, 'spot', 'sell', p.quantity, s)
+    record_trade(db, p.id, p.perp_symbol, 'futures', 'buy', p.quantity, f)
+    p.status = 'closed'
+    p.closed_at = datetime.utcnow()
+    log_event(db, f'Closed {p.perp_symbol} ({reason}); realized={position_realized_pnl(db, p):+.4f}')
+
+
+def _close_naked_leg(db, gateway: BinanceGateway, p: Position, paper_mode: bool, cfg: StrategyConfig, surviving_leg: str | None, reason: str) -> None:
+    """A leg disappeared from the exchange (liquidation, manual close, withdrawal). Flatten the
+    remaining leg so we don't sit on directional exposure, then mark the position closed."""
+    if surviving_leg == 'spot':
+        s = gateway.close_spot(p.spot_symbol, p.quantity, paper_mode, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+        record_trade(db, p.id, p.spot_symbol, 'spot', 'sell', p.quantity, s)
+    elif surviving_leg == 'perp':
+        f = gateway.close_perp(p.perp_symbol, p.quantity, paper_mode, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+        record_trade(db, p.id, p.perp_symbol, 'futures', 'buy', p.quantity, f)
+    p.status = 'closed'
+    p.closed_at = datetime.utcnow()
+    log_event(db, f'Closed naked leg on {p.perp_symbol}: {reason}; flattened {surviving_leg or "no surviving leg"}', level='ERROR')
 
 
 def reconcile_positions(gateway: BinanceGateway) -> None:
@@ -151,18 +184,30 @@ def run_one_cycle(gateway: BinanceGateway | None = None) -> int:
 
             if state.maintenance_mode:
                 for p in db.scalars(select(Position).where(Position.status == 'open')).all():
-                    s = gateway.close_spot(p.spot_symbol, p.quantity, paper_mode, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-                    f = gateway.close_perp(p.perp_symbol, p.quantity, paper_mode, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-                    record_trade(db, p.id, p.spot_symbol, 'spot', 'sell', p.quantity, s)
-                    record_trade(db, p.id, p.perp_symbol, 'futures', 'buy', p.quantity, f)
-                    p.status = 'closed'
-                    p.closed_at = datetime.utcnow()
+                    _force_close_both(db, gateway, p, paper_mode, cfg, 'maintenance')
                 log_event(db, 'Maintenance mode: closed all open positions')
                 db.commit()
                 return sleep_seconds
 
             open_positions = db.scalars(select(Position).where(Position.status == 'open')).all()
 
+            # Phase A: per-position safety (hedge + market health). Real account only — paper mode has no
+            # authoritative external state to verify against. Failures here override every other decision
+            # except maintenance mode and run before voluntary exits so a delisting beats a basis defer.
+            if open_positions and not paper_mode:
+                for p in list(open_positions):
+                    if cfg.delisting_check:
+                        healthy, market_reason = check_market_health(gateway, p)
+                        if not healthy:
+                            _force_close_both(db, gateway, p, paper_mode, cfg, f'market_unhealthy:{market_reason}')
+                            continue
+                    if cfg.enforce_hedge_check:
+                        hedged, hedge_reason, surviving_leg = check_hedge(gateway, p)
+                        if not hedged:
+                            _close_naked_leg(db, gateway, p, paper_mode, cfg, surviving_leg, hedge_reason)
+                open_positions = db.scalars(select(Position).where(Position.status == 'open')).all()
+
+            # Phase B: voluntary exits (funding decay, max hold, stop-loss).
             if cfg.exit_enabled and open_positions:
                 try:
                     current_funding = gateway.futures.fetch_funding_rates()
@@ -176,27 +221,30 @@ def run_one_cycle(gateway: BinanceGateway | None = None) -> int:
                         p.funding_interval_hours = _interval_hours(row)
                     current_apr = annualize_rate(p.last_funding_rate, p.funding_interval_hours or 8.0)
                     age = datetime.utcnow() - p.opened_at
+                    spot_now = gateway.safe_price(p.spot_symbol)
+                    perp_now = gateway.safe_price(p.perp_symbol, perp=True)
+
                     exit_reason = None
+                    mandatory = False
                     if current_apr < cfg.exit_funding_threshold:
                         exit_reason = 'funding_below_threshold'
                     elif age > timedelta(hours=cfg.max_hold_hours):
                         exit_reason = 'max_hold'
-                    elif p.spot_entry_price > 0 and p.perp_entry_price > 0:
-                        spot_now = gateway.safe_price(p.spot_symbol)
-                        perp_now = gateway.safe_price(p.perp_symbol, perp=True)
-                        if spot_now and perp_now:
-                            pnl = (spot_now - p.spot_entry_price) * p.quantity + (p.perp_entry_price - perp_now) * p.quantity
-                            notional = p.spot_entry_price * p.quantity
-                            if notional > 0 and pnl / notional <= cfg.stop_loss_pct:
-                                exit_reason = 'stop_loss'
+                    if p.spot_entry_price > 0 and p.perp_entry_price > 0 and spot_now and perp_now:
+                        pnl = (spot_now - p.spot_entry_price) * p.quantity + (p.perp_entry_price - perp_now) * p.quantity
+                        notional = p.spot_entry_price * p.quantity
+                        if notional > 0 and pnl / notional <= cfg.stop_loss_pct:
+                            exit_reason = 'stop_loss'
+                            mandatory = True
+
+                    if exit_reason and not mandatory and spot_now and perp_now:
+                        favorable, bps = is_basis_exit_favorable(spot_now, perp_now, cfg.max_exit_basis_bps)
+                        if not favorable:
+                            log_event(db, f'Exit deferred for {p.perp_symbol} ({exit_reason}): basis={bps:+.1f}bps > max_exit={cfg.max_exit_basis_bps:.1f}bps')
+                            continue
+
                     if exit_reason:
-                        s = gateway.close_spot(p.spot_symbol, p.quantity, paper_mode, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-                        f = gateway.close_perp(p.perp_symbol, p.quantity, paper_mode, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-                        record_trade(db, p.id, p.spot_symbol, 'spot', 'sell', p.quantity, s)
-                        record_trade(db, p.id, p.perp_symbol, 'futures', 'buy', p.quantity, f)
-                        p.status = 'closed'
-                        p.closed_at = datetime.utcnow()
-                        log_event(db, f'Closed {p.perp_symbol} ({exit_reason}); realized={position_realized_pnl(db, p):+.4f}')
+                        _force_close_both(db, gateway, p, paper_mode, cfg, exit_reason)
 
             open_positions = db.scalars(select(Position).where(Position.status == 'open')).all()
             daily_trades = db.scalar(select(func.count(Trade.id)).where(Trade.ts >= datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0))) or 0
@@ -239,7 +287,13 @@ def run_one_cycle(gateway: BinanceGateway | None = None) -> int:
                             scan_action = 'below_min_notional'
                             continue
                         spot_px = gateway.safe_price(c.spot_symbol) or 0
-                        if spot_px <= 0:
+                        perp_px = gateway.safe_price(c.perp_symbol, perp=True) or 0
+                        if spot_px <= 0 or perp_px <= 0:
+                            continue
+                        ok, entry_bps = is_basis_entry_acceptable(spot_px, perp_px, cfg.max_entry_basis_bps)
+                        if not ok:
+                            db.add(RejectedCandidate(symbol=c.perp_symbol, reason=f'basis_too_wide ({entry_bps:+.1f}bps > ±{cfg.max_entry_basis_bps:.1f})', funding_rate=c.funding_apr))
+                            scan_action = 'basis_too_wide'
                             continue
                         qty = min(notional, cfg.max_position_notional) / max(0.0001, spot_px)
                         s = gateway.create_spot_buy(c.spot_symbol, qty, paper_mode, cfg.paper_slippage_bps, cfg.paper_fee_bps)
