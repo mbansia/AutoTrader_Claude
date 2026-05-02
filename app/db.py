@@ -52,3 +52,6 @@ def run_schema_migrations() -> None:
     _add_column_if_missing('strategy_config', 'earn_enabled', 'BOOLEAN NOT NULL DEFAULT 0')
     _add_column_if_missing('strategy_config', 'earn_idle_threshold_usdt', 'FLOAT NOT NULL DEFAULT 1.0')
     _add_column_if_missing('strategy_config', 'earn_paper_apr', 'FLOAT NOT NULL DEFAULT 0.05')
+    # Per-position funding-income tracking.
+    _add_column_if_missing('positions', 'funding_income_accrued', 'FLOAT NOT NULL DEFAULT 0.0')
+    _add_column_if_missing('positions', 'last_funding_accrual_ts', "DATETIME NOT NULL DEFAULT '1970-01-01 00:00:00'")

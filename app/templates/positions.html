@@ -14,15 +14,14 @@
       <tr>
         <th>Symbol</th>
         <th class="num">Qty</th>
-        <th class="num">Notional entry</th>
         <th class="num">Notional now</th>
         <th class="num">Spot entry → now</th>
         <th class="num">Perp entry → now</th>
-        <th class="num">Basis entry</th>
         <th class="num">Basis now</th>
-        <th class="num">Funding APR</th>
+        <th class="num">Funding APY</th>
         <th class="num">Interval</th>
         <th class="num">Age</th>
+        <th class="num">Funding earned</th>
         <th class="num">Unrealized PnL</th>
         <th></th>
       </tr>
@@ -32,15 +31,14 @@
       <tr>
         <td class="mono">{{ r.symbol }}</td>
         <td class="num">{{ '%.6f' % r.quantity }}</td>
-        <td class="num">{{ '%.2f' % r.notional_entry }}</td>
-        <td class="num">{{ ('%.2f' % r.notional_now) if r.notional_now else '—' }}</td>
+        <td class="num">{{ ('%.2f' % r.notional_now) if r.notional_now else ('%.2f' % r.notional_entry) }}</td>
         <td class="num">{{ '%.6f' % r.spot_entry }} → {{ ('%.6f' % r.spot_now) if r.spot_now else '—' }}</td>
         <td class="num">{{ '%.6f' % r.perp_entry }} → {{ ('%.6f' % r.perp_now) if r.perp_now else '—' }}</td>
-        <td class="num muted">{{ '%+.1f bps' % r.basis_entry_bps }}</td>
         <td class="num {{ 'good' if r.basis_now_bps <= cfg.max_exit_basis_bps else 'warn' }}">{{ '%+.1f bps' % r.basis_now_bps }}</td>
-        <td class="num {{ 'good' if r.last_funding_apr >= cfg.exit_funding_threshold else 'warn' }}">{{ '%.2f%%' % (r.last_funding_apr * 100) }}</td>
+        <td class="num {{ 'good' if r.last_funding_apy >= cfg.exit_funding_threshold else 'warn' }}">{{ '%.2f%%' % (r.last_funding_apy * 100) }}</td>
         <td class="num muted">{{ '%dh' % r.interval_hours }}</td>
         <td class="num">{{ r.age }}</td>
+        <td class="num {{ 'good' if r.funding_income >= 0 else 'bad' }}">{{ '%+.4f' % r.funding_income }}</td>
         <td class="num {{ 'good' if r.unrealized_pnl >= 0 else 'bad' }}">{{ '%+.4f' % r.unrealized_pnl }}</td>
         <td>
           <form action="/positions/{{ r.id }}/close" method="post" style="display:inline" onsubmit="return confirm('Market-close both legs of {{ r.symbol }}?');">
@@ -52,7 +50,7 @@
     </tbody>
   </table>
   {% else %}
-  <div class="empty">No open positions in {{ view|upper }}. The bot will open one when funding APR exceeds {{ '%.2f%%' % (cfg.entry_funding_threshold * 100) }} and the spot/perp basis is within ±{{ '%.0f' % cfg.max_entry_basis_bps }} bps.</div>
+  <div class="empty">No open positions in {{ view|upper }}. The bot will open one when funding APY exceeds {{ '%.2f%%' % (cfg.entry_funding_threshold * 100) }} and the spot/perp basis is within ±{{ '%.0f' % cfg.max_entry_basis_bps }} bps.</div>
   {% endif %}
 </div>
 
@@ -60,7 +58,7 @@
   <h3>Closed positions (last 20)</h3>
   {% if closed %}
   <table>
-    <thead><tr><th>Symbol</th><th class="num">Qty</th><th>Opened</th><th>Closed</th><th class="num">Realized PnL</th></tr></thead>
+    <thead><tr><th>Symbol</th><th class="num">Qty</th><th>Opened</th><th>Closed</th><th class="num">Trade PnL</th><th class="num">Funding earned</th><th class="num">Realized total</th></tr></thead>
     <tbody>
     {% for c in closed %}
       <tr>
@@ -68,6 +66,8 @@
         <td class="num">{{ '%.6f' % c.quantity }}</td>
         <td class="muted">{{ c.opened_at }}</td>
         <td class="muted">{{ c.closed_at }}</td>
+        <td class="num {{ 'good' if c.trade_pnl >= 0 else 'bad' }}">{{ '%+.4f' % c.trade_pnl }}</td>
+        <td class="num {{ 'good' if c.funding_income >= 0 else 'bad' }}">{{ '%+.4f' % c.funding_income }}</td>
         <td class="num {{ 'good' if c.realized >= 0 else 'bad' }}">{{ '%+.4f' % c.realized }}</td>
       </tr>
     {% endfor %}

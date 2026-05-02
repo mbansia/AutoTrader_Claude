@@ -21,10 +21,19 @@ class Candidate:
 
 
 def annualize_rate(period_rate: float, interval_hours: float) -> float:
-    """Convert a per-funding-period rate (decimal) to annualized (decimal). 8h interval ≈ 1095 periods/yr."""
+    """Compounded annualization (APY) — what you'd actually make over a year if the
+    per-period rate persisted and every payout were reinvested.
+    APY = (1 + period_rate) ** periods_per_year − 1.
+    For an 8h interval, periods_per_year ≈ 1095."""
     if interval_hours <= 0:
         return 0.0
-    return period_rate * (24.0 * 365.0 / interval_hours)
+    if period_rate <= -1.0:
+        return -1.0  # would imply >100% loss per period; clamp instead of complex math
+    periods = 24.0 * 365.0 / interval_hours
+    try:
+        return (1.0 + period_rate) ** periods - 1.0
+    except OverflowError:
+        return float('inf') if period_rate > 0 else -1.0
 
 
 def _interval_hours(row: dict) -> float:

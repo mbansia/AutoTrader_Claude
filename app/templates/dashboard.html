@@ -37,10 +37,10 @@
   <div class="kpi">
     <div class="label">Total PnL</div>
     <div class="value {{ 'good' if total_pnl >= 0 else 'bad' }}">{{ '%+.2f' % total_pnl }} USDT</div>
-    <div class="sub">realized {{ '%+.2f' % realized_pnl }} · unrealized {{ '%+.2f' % unrealized_pnl }}</div>
+    <div class="sub">trade {{ '%+.2f' % trade_pnl }} · funding {{ '%+.2f' % funding_income }} · MTM {{ '%+.2f' % unrealized_pnl }}</div>
   </div>
   <div class="kpi">
-    <div class="label">XIRR (annualized)</div>
+    <div class="label">XIRR (compounded)</div>
     <div class="value {{ 'good' if (xirr_value or 0) >= 0 else 'bad' }}">{{ '%.2f%%' % (xirr_value * 100) if xirr_value is not none else '—' }}</div>
     <div class="sub">over {{ flow_count }} flow(s)</div>
   </div>
@@ -88,7 +88,7 @@
       </div>
       {% if latest_scan_top %}
       <table>
-        <thead><tr><th>Symbol</th><th class="num">Funding APR</th><th class="num">Interval</th><th class="num">24h Volume</th></tr></thead>
+        <thead><tr><th>Symbol</th><th class="num">Funding APY</th><th class="num">Interval</th><th class="num">24h Volume</th></tr></thead>
         <tbody>
         {% for c in latest_scan_top %}
           <tr><td class="mono">{{ c.perp }}</td><td class="num good">{{ '%.2f%%' % (c.apr * 100) }}</td><td class="num muted">{{ '%dh' % (c.interval_h or 8) }}</td><td class="num">{{ '{:,.0f}'.format(c.qv) }}</td></tr>

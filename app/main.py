@@ -30,6 +30,7 @@ from app.finance import (
     portfolio_xirr,
     position_realized_pnl,
     position_unrealized_pnl,
+    total_funding_income,
     total_realized_pnl,
 )
 from app.models import (
@@ -294,7 +295,9 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             if bals is None:
                 balances_error = 'unable to fetch from Binance'
 
-        realized = total_realized_pnl(db, mode=v)
+        trade_realized = total_realized_pnl(db, mode=v)
+        funding_income = total_funding_income(db, mode=v)
+        realized = trade_realized + funding_income
         unrealized = _unrealized_for_open(db, gw, v)
         net_capital = net_capital_in(db, mode=v)
         flow_count_n = db.scalar(select(func.count(CapitalFlow.id)).where(CapitalFlow.mode == v)) or 0
@@ -319,6 +322,8 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             'equity_source': equity_source,
             'balances_error': balances_error,
             'realized_pnl': realized,
+            'trade_pnl': trade_realized,
+            'funding_income': funding_income,
             'unrealized_pnl': unrealized,
             'total_pnl': realized + unrealized,
             'net_capital': net_capital,
@@ -364,11 +369,12 @@ def positions_page(request: Request, view: str | None = None, view_cookie: str |
                 'notional_now': p.quantity * spot_now if spot_now else 0.0,
                 'basis_entry_bps': basis_bps(p.spot_entry_price, p.perp_entry_price),
                 'basis_now_bps': basis_bps(spot_now, perp_now) if (spot_now and perp_now) else 0.0,
-                'entry_funding_apr': annualize_rate(p.entry_funding_rate, interval_h),
-                'last_funding_apr': annualize_rate(p.last_funding_rate, interval_h),
+                'entry_funding_apy': annualize_rate(p.entry_funding_rate, interval_h),
+                'last_funding_apy': annualize_rate(p.last_funding_rate, interval_h),
                 'interval_hours': interval_h,
                 'age': _fmt_age(datetime.utcnow() - p.opened_at),
                 'unrealized_pnl': position_unrealized_pnl(p, spot_now, perp_now) if (spot_now and perp_now) else 0.0,
+                'funding_income': p.funding_income_accrued,
             })
 
         closed_rows = db.scalars(select(Position).where(Position.status == 'closed', Position.mode == v).order_by(desc(Position.id)).limit(20)).all()
@@ -378,7 +384,9 @@ def positions_page(request: Request, view: str | None = None, view_cookie: str |
             'quantity': c.quantity,
             'opened_at': _fmt_ts(c.opened_at),
             'closed_at': _fmt_ts(c.closed_at),
-            'realized': position_realized_pnl(db, c),
+            'trade_pnl': position_realized_pnl(db, c),
+            'funding_income': c.funding_income_accrued,
+            'realized': position_realized_pnl(db, c) + c.funding_income_accrued,
         } for c in closed_rows]
         ctx.update({'rows': rows, 'closed': closed})
     response = templates.TemplateResponse(request, 'positions.html', ctx)
@@ -396,7 +404,9 @@ def portfolio_page(request: Request, view: str | None = None, view_cookie: str |
         ctx['cfg'] = cfg
         gw = BinanceGateway()
         current_equity, equity_source = _current_equity(db, v)
-        realized = total_realized_pnl(db, mode=v)
+        trade_realized = total_realized_pnl(db, mode=v)
+        funding_income = total_funding_income(db, mode=v)
+        realized = trade_realized + funding_income
         unrealized = _unrealized_for_open(db, gw, v)
         net_capital = net_capital_in(db, mode=v)
         xirr_value = portfolio_xirr(db, current_equity, mode=v)
@@ -417,7 +427,9 @@ def portfolio_page(request: Request, view: str | None = None, view_cookie: str |
                 'quantity': p.quantity,
                 'opened_at': _fmt_ts(p.opened_at),
                 'closed_at': _fmt_ts(p.closed_at) if p.closed_at else None,
-                'realized': position_realized_pnl(db, p),
+                'trade_pnl': position_realized_pnl(db, p),
+                'funding_income': p.funding_income_accrued,
+                'realized': position_realized_pnl(db, p) + p.funding_income_accrued,
                 'unrealized': unreal,
             })
 
@@ -425,6 +437,8 @@ def portfolio_page(request: Request, view: str | None = None, view_cookie: str |
             'current_equity': current_equity,
             'equity_source': equity_source,
             'realized_pnl': realized,
+            'trade_pnl': trade_realized,
+            'funding_income': funding_income,
             'unrealized_pnl': unrealized,
             'total_pnl': realized + unrealized,
             'net_capital': net_capital,
@@ -475,10 +489,10 @@ def logs_page(request: Request, view: str | None = None, view_cookie: str | None
             try:
                 top = json.loads(s.top_candidates) or []
                 if top:
-                    apr = top[0].get('apr')
-                    if apr is None:
-                        apr = annualize_rate(top[0].get('fr', 0.0), top[0].get('interval_h', 8.0))
-                    top_label = f"{top[0]['perp']} @ {apr*100:.2f}% APR"
+                    apy = top[0].get('apr')  # legacy field name; the value is now compounded APY
+                    if apy is None:
+                        apy = annualize_rate(top[0].get('fr', 0.0), top[0].get('interval_h', 8.0))
+                    top_label = f"{top[0]['perp']} @ {apy*100:.2f}% APY"
             except Exception:
                 pass
             scans.append({'ts': _fmt_ts(s.ts), 'candidates_total': s.candidates_total, 'candidates_passing': s.candidates_passing, 'action': s.action, 'top_candidate_label': top_label, 'note': s.note})

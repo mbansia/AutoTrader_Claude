@@ -12,12 +12,12 @@
   <h3>Strategy thresholds</h3>
   <div class="body">
     <div class="form-grid">
-      <div class="form-row"><label>Entry funding threshold (APR, decimal)</label>
+      <div class="form-row"><label>Entry funding threshold (APY, decimal)</label>
         <input type="number" step="0.001" name="entry_funding_threshold" value="{{ '%.4f' % cfg.entry_funding_threshold }}">
-        <span class="hint">annualized; 0.20 = 20% APR. The bot annualizes each candidate's per-period rate (4h or 8h) before comparing.</span></div>
-      <div class="form-row"><label>Exit funding threshold (APR, decimal)</label>
+        <span class="hint">compounded annualized yield (assuming reinvestment). 0.20 = 20% APY. The bot computes APY = (1 + period_rate) ^ periods_per_year − 1 using each candidate's own funding interval.</span></div>
+      <div class="form-row"><label>Exit funding threshold (APY, decimal)</label>
         <input type="number" step="0.001" name="exit_funding_threshold" value="{{ '%.4f' % cfg.exit_funding_threshold }}">
-        <span class="hint">close when current annualized funding falls below this. 0.05 = 5% APR.</span></div>
+        <span class="hint">close when current funding APY falls below this. 0.05 = 5% APY.</span></div>
       <div class="form-row"><label>Min 24h quote volume (USDT)</label>
         <input type="number" step="1" name="min_24h_quote_volume" value="{{ cfg.min_24h_quote_volume }}"></div>
       <div class="form-row"><label>Stop-loss (decimal, negative)</label>

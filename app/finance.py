@@ -27,11 +27,24 @@ def position_unrealized_pnl(position: Position, spot_now: float, perp_now: float
 
 
 def total_realized_pnl(db, mode: str | None = None) -> float:
+    """Closed-position trade PnL only. Does not include funding income — see total_funding_income."""
     stmt = select(Position).where(Position.status == 'closed')
     if mode is not None:
         stmt = stmt.where(Position.mode == mode)
     closed = db.scalars(stmt).all()
     return sum(position_realized_pnl(db, p) for p in closed)
+
+
+def total_funding_income(db, mode: str | None = None, status: str | None = None) -> float:
+    """Sum of funding payments (accrued in paper, would-be auto-credited in live).
+    Pass status='open' or 'closed' to scope; default is all."""
+    from sqlalchemy import func as _func
+    stmt = select(_func.coalesce(_func.sum(Position.funding_income_accrued), 0.0))
+    if mode is not None:
+        stmt = stmt.where(Position.mode == mode)
+    if status is not None:
+        stmt = stmt.where(Position.status == status)
+    return float(db.scalar(stmt) or 0.0)
 
 
 def net_capital_in(db, mode: str | None = None) -> float:

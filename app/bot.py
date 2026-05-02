@@ -84,6 +84,30 @@ def _accrue_paper_yield(earn: EarnState, apr: float) -> None:
     earn.last_accrual_ts = now
 
 
+def _accrue_paper_funding(db, mode: str) -> None:
+    """Linearly accrue funding income on every open paper position based on the wall-clock
+    elapsed since last accrual. Funding payments are real cash that lands in the trader's
+    wallet — credit them so the next cycle's % sizing can deploy the larger equity."""
+    if mode != MODE_PAPER:
+        return
+    now = datetime.utcnow()
+    for p in db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all():
+        last = p.last_funding_accrual_ts or p.opened_at
+        elapsed_seconds = (now - last).total_seconds()
+        if elapsed_seconds <= 0:
+            continue
+        interval_h = p.funding_interval_hours or 8.0
+        period_seconds = interval_h * 3600.0
+        if period_seconds <= 0:
+            continue
+        # Linear accrual within a period — the per-second slice of one funding payment.
+        # Notional reference: spot_entry × qty (close enough; real funding is on mark price × qty).
+        notional = p.spot_entry_price * p.quantity
+        income = notional * p.last_funding_rate * (elapsed_seconds / period_seconds)
+        p.funding_income_accrued += income
+        p.last_funding_accrual_ts = now
+
+
 def _refresh_live_earn_balance(gateway: BinanceGateway, earn: EarnState) -> None:
     bal, err = gateway.earn_balance_usdt()
     if bal is not None:
@@ -179,14 +203,21 @@ def _compute_equity_and_free(db, gateway: BinanceGateway, mode: str, cfg: Strate
         open_ps = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all()
         unrealized = 0.0
         open_notional = 0.0
+        open_funding = 0.0
         for p in open_ps:
             spot_now = gateway.safe_price(p.spot_symbol) or p.spot_entry_price or 0
             perp_now = gateway.safe_price(p.perp_symbol, perp=True) or p.perp_entry_price or 0
             unrealized += position_unrealized_pnl(p, spot_now, perp_now)
             open_notional += p.quantity * p.spot_entry_price
+            open_funding += p.funding_income_accrued
+        # Funding on already-closed positions is part of total_realized_pnl (added below);
+        # open positions' accrued funding is tracked separately so it can be treated as
+        # liquid cash for the free-balance calc — this is what makes "auto-reinvest" work.
+        closed_funding = db.scalar(select(func.coalesce(func.sum(Position.funding_income_accrued), 0.0)).where(Position.status == 'closed', Position.mode == mode)) or 0.0
         capital_in = db.scalar(select(func.coalesce(func.sum(CapitalFlow.amount_usdt), 0.0)).where(CapitalFlow.mode == mode)) or 0.0
-        total_equity = cfg.paper_starting_equity + capital_in + realized + unrealized + earn.cumulative_yield_usdt
-        free = max(0.0, total_equity - earn.deployed_usdt - open_notional)
+        total_equity = (cfg.paper_starting_equity + capital_in + realized + unrealized
+                        + open_funding + closed_funding + earn.cumulative_yield_usdt)
+        free = max(0.0, total_equity - earn.deployed_usdt - open_notional - unrealized)
         return total_equity, free
     bals = gateway.safe_balances()
     if bals is None:
@@ -245,6 +276,10 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
             cfg = get_strategy_config(db)
             mstate = get_mode_state(db, mode)
             earn = get_earn_state(db, mode)
+
+            # Paper-mode funding income accrual on open positions (live is auto-credited
+            # by Binance into the futures wallet, which our equity calc already sees).
+            _accrue_paper_funding(db, mode)
 
             # Earn upkeep: accrue paper-mode interest or fetch the live deployed balance.
             if cfg.earn_enabled:
@@ -394,6 +429,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                             funding_interval_hours=c.funding_interval_hours,
                             spot_entry_price=float(s.get('price') or 0),
                             perp_entry_price=float(f.get('price') or 0),
+                            last_funding_accrual_ts=datetime.utcnow(),
                         )
                         db.add(pos)
                         db.flush()

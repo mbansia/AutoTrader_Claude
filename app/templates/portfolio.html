@@ -8,10 +8,11 @@
 <div class="kpi-grid">
   <div class="kpi"><div class="label">Current equity</div><div class="value">{{ '%.2f' % current_equity }} USDT</div><div class="sub">{{ equity_source }}</div></div>
   <div class="kpi"><div class="label">Net capital injected</div><div class="value">{{ '%.2f' % net_capital }} USDT</div></div>
-  <div class="kpi"><div class="label">Realized PnL</div><div class="value {{ 'good' if realized_pnl >= 0 else 'bad' }}">{{ '%+.2f' % realized_pnl }}</div></div>
-  <div class="kpi"><div class="label">Unrealized PnL</div><div class="value {{ 'good' if unrealized_pnl >= 0 else 'bad' }}">{{ '%+.2f' % unrealized_pnl }}</div></div>
+  <div class="kpi"><div class="label">Trade PnL</div><div class="value {{ 'good' if trade_pnl >= 0 else 'bad' }}">{{ '%+.2f' % trade_pnl }}</div><div class="sub">closed legs</div></div>
+  <div class="kpi"><div class="label">Funding earned</div><div class="value {{ 'good' if funding_income >= 0 else 'bad' }}">{{ '%+.2f' % funding_income }}</div><div class="sub">accrued + paid out</div></div>
+  <div class="kpi"><div class="label">Unrealized PnL</div><div class="value {{ 'good' if unrealized_pnl >= 0 else 'bad' }}">{{ '%+.2f' % unrealized_pnl }}</div><div class="sub">MTM on opens</div></div>
   <div class="kpi"><div class="label">Total PnL</div><div class="value {{ 'good' if total_pnl >= 0 else 'bad' }}">{{ '%+.2f' % total_pnl }}</div></div>
-  <div class="kpi"><div class="label">XIRR (annualized)</div><div class="value {{ 'good' if (xirr_value or 0) >= 0 else 'bad' }}">{{ '%.2f%%' % (xirr_value * 100) if xirr_value is not none else '—' }}</div></div>
+  <div class="kpi"><div class="label">XIRR (compounded)</div><div class="value {{ 'good' if (xirr_value or 0) >= 0 else 'bad' }}">{{ '%.2f%%' % (xirr_value * 100) if xirr_value is not none else '—' }}</div></div>
 </div>
 
 <div class="card">
@@ -54,7 +55,7 @@
   <h3>Per-position PnL breakdown</h3>
   {% if breakdown %}
   <table>
-    <thead><tr><th>Symbol</th><th>Status</th><th class="num">Qty</th><th>Opened</th><th>Closed</th><th class="num">Realized</th><th class="num">Unrealized</th></tr></thead>
+    <thead><tr><th>Symbol</th><th>Status</th><th class="num">Qty</th><th>Opened</th><th>Closed</th><th class="num">Trade PnL</th><th class="num">Funding</th><th class="num">Realized total</th><th class="num">Unrealized</th></tr></thead>
     <tbody>
     {% for b in breakdown %}
       <tr>
@@ -63,6 +64,8 @@
         <td class="num">{{ '%.6f' % b.quantity }}</td>
         <td class="muted">{{ b.opened_at }}</td>
         <td class="muted">{{ b.closed_at or '—' }}</td>
+        <td class="num {{ 'good' if b.trade_pnl >= 0 else 'bad' }}">{{ '%+.4f' % b.trade_pnl }}</td>
+        <td class="num {{ 'good' if b.funding_income >= 0 else 'bad' }}">{{ '%+.4f' % b.funding_income }}</td>
         <td class="num {{ 'good' if b.realized >= 0 else 'bad' }}">{{ '%+.4f' % b.realized }}</td>
         <td class="num {{ 'good' if b.unrealized >= 0 else 'bad' }}">{{ '%+.4f' % b.unrealized }}</td>
       </tr>

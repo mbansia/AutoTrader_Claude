@@ -28,6 +28,11 @@ class Position(Base):
     spot_entry_price: Mapped[float] = mapped_column(Float, default=0.0)
     perp_entry_price: Mapped[float] = mapped_column(Float, default=0.0)
     funding_interval_hours: Mapped[float] = mapped_column(Float, default=8.0)
+    # Funding payments collected on this position so far. Paper mode accrues
+    # synthetically each cycle; live mode reads off the futures wallet (we don't
+    # attribute per-position in live for v1, so this stays at 0 there).
+    funding_income_accrued: Mapped[float] = mapped_column(Float, default=0.0)
+    last_funding_accrual_ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
