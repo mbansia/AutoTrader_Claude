@@ -1,0 +1,99 @@
+{% extends 'base.html' %}
+{% block title %}Dashboard · Funding Arb{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>Dashboard</h2>
+  <div class="actions">
+    <form action="/run-once" method="post" style="display:inline">
+      <button class="btn" type="submit">Run one cycle</button>
+    </form>
+    <form action="/mode" method="post" style="display:inline">
+      <input type="hidden" name="mode" value="{{ 'paper' if not state.paper_mode else 'live' }}">
+      {% if state.paper_mode %}
+        <input name="confirm" placeholder="Type LIVE" style="background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 8px;border-radius:6px;">
+        <button class="btn btn-danger" type="submit">Switch to LIVE</button>
+      {% else %}
+        <button class="btn btn-primary" type="submit">Switch to PAPER</button>
+      {% endif %}
+    </form>
+  </div>
+</div>
+
+{% if balances_error %}
+<div class="alert alert-error">Live balances unavailable: {{ balances_error }}. Showing computed equity from local DB.</div>
+{% endif %}
+
+<div class="kpi-grid">
+  <div class="kpi">
+    <div class="label">Current equity</div>
+    <div class="value">{{ '%.2f' % current_equity }} <span class="muted" style="font-size:14px">USDT</span></div>
+    <div class="sub">{{ equity_source }}</div>
+  </div>
+  <div class="kpi">
+    <div class="label">Net capital injected</div>
+    <div class="value">{{ '%.2f' % net_capital }} <span class="muted" style="font-size:14px">USDT</span></div>
+    <div class="sub">{{ flow_count }} flow(s) recorded</div>
+  </div>
+  <div class="kpi">
+    <div class="label">Total PnL</div>
+    <div class="value {{ 'good' if total_pnl >= 0 else 'bad' }}">{{ '%+.2f' % total_pnl }} USDT</div>
+    <div class="sub">realized {{ '%+.2f' % realized_pnl }} · unrealized {{ '%+.2f' % unrealized_pnl }}</div>
+  </div>
+  <div class="kpi">
+    <div class="label">XIRR (annualized)</div>
+    <div class="value {{ 'good' if (xirr_value or 0) >= 0 else 'bad' }}">{{ '%.2f%%' % (xirr_value * 100) if xirr_value is not none else '—' }}</div>
+    <div class="sub">over {{ flow_count }} flow(s)</div>
+  </div>
+  <div class="kpi">
+    <div class="label">Open positions</div>
+    <div class="value">{{ open_count }} / {{ cfg.max_open_positions }}</div>
+    <div class="sub">{{ trades_today }} trade(s) today / {{ cfg.max_trades_per_day }} cap</div>
+  </div>
+</div>
+
+<div class="card">
+  <h3>Equity curve (last 60 snapshots)</h3>
+  <div class="body">
+    {% if equity_points %}
+    <svg class="equity-spark" viewBox="0 0 600 110" preserveAspectRatio="none">
+      <polyline fill="none" stroke="#38bdf8" stroke-width="2" points="{{ equity_polyline }}" />
+    </svg>
+    <div class="row-flex muted" style="font-size:12px;margin-top:6px;">
+      <span>{{ equity_points[0].ts }} · {{ '%.2f' % equity_points[0].equity_usdt }}</span>
+      <span class="spacer"></span>
+      <span>{{ equity_points[-1].ts }} · {{ '%.2f' % equity_points[-1].equity_usdt }}</span>
+    </div>
+    {% else %}
+    <div class="empty">No equity snapshots yet — run the worker or hit "Run one cycle".</div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <h3>Latest scan</h3>
+  <div class="body">
+    {% if latest_scan %}
+      <div class="row-flex muted" style="font-size:12px;margin-bottom:10px;">
+        <span>{{ latest_scan.ts }}</span>
+        <span class="tag">total {{ latest_scan.candidates_total }}</span>
+        <span class="tag good">passing {{ latest_scan.candidates_passing }}</span>
+        <span class="tag">action: {{ latest_scan.action }}</span>
+      </div>
+      {% if latest_scan_top %}
+      <table>
+        <thead><tr><th>Symbol</th><th class="num">Funding rate</th><th class="num">24h Volume</th></tr></thead>
+        <tbody>
+        {% for c in latest_scan_top %}
+          <tr><td class="mono">{{ c.perp }}</td><td class="num">{{ '%.4f%%' % (c.fr * 100) }}</td><td class="num">{{ '{:,.0f}'.format(c.qv) }}</td></tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <div class="empty">No passing candidates in latest scan.</div>
+      {% endif %}
+    {% else %}
+      <div class="empty">No scans recorded yet.</div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,83 @@
+{% extends 'base.html' %}
+{% block title %}Configuration · Funding Arb{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>Configuration</h2>
+</div>
+
+{% if saved %}<div class="alert alert-info">Configuration saved. Changes apply on the next bot cycle.</div>{% endif %}
+
+<form action="/config" method="post">
+<div class="card">
+  <h3>Strategy thresholds</h3>
+  <div class="body">
+    <div class="form-grid">
+      <div class="form-row"><label>Entry funding threshold (decimal)</label>
+        <input type="number" step="0.00001" name="entry_funding_threshold" value="{{ '%.5f' % cfg.entry_funding_threshold }}">
+        <span class="hint">e.g. 0.0002 = 0.02% per funding interval</span></div>
+      <div class="form-row"><label>Exit funding threshold (decimal)</label>
+        <input type="number" step="0.00001" name="exit_funding_threshold" value="{{ '%.5f' % cfg.exit_funding_threshold }}">
+        <span class="hint">close when current funding falls below this</span></div>
+      <div class="form-row"><label>Min 24h quote volume (USDT)</label>
+        <input type="number" step="1" name="min_24h_quote_volume" value="{{ cfg.min_24h_quote_volume }}"></div>
+      <div class="form-row"><label>Stop-loss (decimal, negative)</label>
+        <input type="number" step="0.001" name="stop_loss_pct" value="{{ '%.4f' % cfg.stop_loss_pct }}">
+        <span class="hint">close when MTM PnL/notional ≤ this. Set 0 to disable.</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h3>Sizing &amp; limits</h3>
+  <div class="body">
+    <div class="form-grid">
+      <div class="form-row"><label>Max open positions</label>
+        <input type="number" step="1" name="max_open_positions" value="{{ cfg.max_open_positions }}"></div>
+      <div class="form-row"><label>Max trades per day</label>
+        <input type="number" step="1" name="max_trades_per_day" value="{{ cfg.max_trades_per_day }}"></div>
+      <div class="form-row"><label>Min position notional (USDT)</label>
+        <input type="number" step="0.01" name="min_symbol_notional" value="{{ cfg.min_symbol_notional }}"></div>
+      <div class="form-row"><label>Max position notional (USDT)</label>
+        <input type="number" step="0.01" name="max_position_notional" value="{{ cfg.max_position_notional }}"></div>
+      <div class="form-row"><label>Max hold (hours)</label>
+        <input type="number" step="1" name="max_hold_hours" value="{{ cfg.max_hold_hours }}"></div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h3>Loop &amp; paper-mode tuning</h3>
+  <div class="body">
+    <div class="form-grid">
+      <div class="form-row"><label>Loop interval (seconds, min 5)</label>
+        <input type="number" step="1" name="loop_seconds" value="{{ cfg.loop_seconds }}"></div>
+      <div class="form-row"><label>Paper slippage (bps)</label>
+        <input type="number" step="0.1" name="paper_slippage_bps" value="{{ cfg.paper_slippage_bps }}"></div>
+      <div class="form-row"><label>Paper taker fee (bps)</label>
+        <input type="number" step="0.1" name="paper_fee_bps" value="{{ cfg.paper_fee_bps }}"></div>
+      <div class="form-row"><label>Paper starting equity (USDT)</label>
+        <input type="number" step="1" name="paper_starting_equity" value="{{ cfg.paper_starting_equity }}"></div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h3>Kill switches</h3>
+  <div class="body">
+    <div class="form-grid">
+      <div class="form-row"><label>Entry enabled</label>
+        <select name="entry_enabled"><option value="1" {{ 'selected' if cfg.entry_enabled }}>yes</option><option value="0" {{ 'selected' if not cfg.entry_enabled }}>no</option></select>
+        <span class="hint">disable to stop opening new positions while keeping exits running</span></div>
+      <div class="form-row"><label>Exit enabled</label>
+        <select name="exit_enabled"><option value="1" {{ 'selected' if cfg.exit_enabled }}>yes</option><option value="0" {{ 'selected' if not cfg.exit_enabled }}>no</option></select>
+        <span class="hint">disable only to investigate; positions won't close automatically</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="row-flex" style="margin-top:14px;">
+  <button type="submit" class="btn btn-primary">Save configuration</button>
+  <span class="muted">Last updated: {{ cfg.updated_at }}</span>
+</div>
+</form>
+{% endblock %}

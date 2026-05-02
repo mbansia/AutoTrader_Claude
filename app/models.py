@@ -66,3 +66,55 @@ class RuntimeState(Base):
     paper_mode: Mapped[bool] = mapped_column(Boolean, default=True)
     maintenance_mode: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class StrategyConfig(Base):
+    __tablename__ = 'strategy_config'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    entry_funding_threshold: Mapped[float] = mapped_column(Float, default=0.0002)
+    exit_funding_threshold: Mapped[float] = mapped_column(Float, default=0.00005)
+    max_hold_hours: Mapped[int] = mapped_column(Integer, default=72)
+    max_open_positions: Mapped[int] = mapped_column(Integer, default=1)
+    max_trades_per_day: Mapped[int] = mapped_column(Integer, default=8)
+    max_position_notional: Mapped[float] = mapped_column(Float, default=10.0)
+    min_symbol_notional: Mapped[float] = mapped_column(Float, default=5.0)
+    min_24h_quote_volume: Mapped[float] = mapped_column(Float, default=100000.0)
+    stop_loss_pct: Mapped[float] = mapped_column(Float, default=-0.02)
+    paper_slippage_bps: Mapped[float] = mapped_column(Float, default=5.0)
+    paper_fee_bps: Mapped[float] = mapped_column(Float, default=4.0)
+    loop_seconds: Mapped[int] = mapped_column(Integer, default=30)
+    paper_starting_equity: Mapped[float] = mapped_column(Float, default=1000.0)
+    entry_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    exit_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class BalanceSnapshot(Base):
+    __tablename__ = 'balance_snapshots'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    spot_usdt: Mapped[float] = mapped_column(Float, default=0.0)
+    futures_usdt: Mapped[float] = mapped_column(Float, default=0.0)
+    total_usdt: Mapped[float] = mapped_column(Float, default=0.0)
+    source: Mapped[str] = mapped_column(String(16), default='live')
+
+
+class CapitalFlow(Base):
+    __tablename__ = 'capital_flows'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    amount_usdt: Mapped[float] = mapped_column(Float)
+    kind: Mapped[str] = mapped_column(String(16), default='deposit')
+    detected_by: Mapped[str] = mapped_column(String(16), default='auto')
+    note: Mapped[str] = mapped_column(Text, default='')
+
+
+class ScanResult(Base):
+    __tablename__ = 'scan_results'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    candidates_total: Mapped[int] = mapped_column(Integer, default=0)
+    candidates_passing: Mapped[int] = mapped_column(Integer, default=0)
+    top_candidates: Mapped[str] = mapped_column(Text, default='[]')
+    action: Mapped[str] = mapped_column(String(64), default='')
+    note: Mapped[str] = mapped_column(Text, default='')

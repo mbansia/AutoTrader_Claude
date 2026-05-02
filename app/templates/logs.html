@@ -1,0 +1,87 @@
+{% extends 'base.html' %}
+{% block title %}Logs · Funding Arb{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>Logs &amp; Scans</h2>
+</div>
+
+<div class="card">
+  <h3>Scan history (last 50)</h3>
+  {% if scans %}
+  <table>
+    <thead><tr><th>Time</th><th class="num">Total</th><th class="num">Passing</th><th>Action</th><th>Top candidate</th><th>Note</th></tr></thead>
+    <tbody>
+      {% for s in scans %}
+      <tr>
+        <td class="muted mono">{{ s.ts }}</td>
+        <td class="num">{{ s.candidates_total }}</td>
+        <td class="num">{{ s.candidates_passing }}</td>
+        <td><span class="tag {{ 'good' if 'opened' in s.action else '' }}">{{ s.action }}</span></td>
+        <td class="mono">{{ s.top_candidate_label }}</td>
+        <td class="muted">{{ s.note }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">No scans recorded yet — start the worker.</div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h3>Bot events (last 100)</h3>
+  {% if events %}
+  <div>
+    {% for e in events %}
+      <div class="log-line">
+        <span class="muted mono">{{ e.ts }}</span>
+        <span class="lvl lvl-{{ e.level }}">{{ e.level }}</span>
+        <span>{{ e.message }}</span>
+      </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty">No events recorded.</div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h3>Rejected candidates (last 50)</h3>
+  {% if rejected %}
+  <table>
+    <thead><tr><th>Time</th><th>Symbol</th><th>Reason</th><th class="num">Funding rate</th></tr></thead>
+    <tbody>
+    {% for r in rejected %}
+      <tr><td class="muted mono">{{ r.ts }}</td><td class="mono">{{ r.symbol }}</td><td>{{ r.reason }}</td><td class="num">{{ '%.4f%%' % (r.funding_rate * 100) }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">Nothing rejected yet.</div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h3>Recent trades (last 30)</h3>
+  {% if trades %}
+  <table>
+    <thead><tr><th>Time</th><th>Symbol</th><th>Venue</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Fee</th></tr></thead>
+    <tbody>
+    {% for t in trades %}
+      <tr>
+        <td class="muted mono">{{ t.ts }}</td>
+        <td class="mono">{{ t.symbol }}</td>
+        <td>{{ t.venue }}</td>
+        <td><span class="tag {{ 'good' if t.side == 'buy' else 'bad' }}">{{ t.side }}</span></td>
+        <td class="num">{{ '%.6f' % t.quantity }}</td>
+        <td class="num">{{ '%.6f' % t.price }}</td>
+        <td class="num">{{ '%.4f' % t.fee }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">No trades yet.</div>
+  {% endif %}
+</div>
+{% endblock %}
