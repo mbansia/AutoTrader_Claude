@@ -48,6 +48,20 @@
 </div>
 
 <div class="card">
+  <h3>Wallet auto-transfer</h3>
+  <div class="body">
+    <div class="form-grid">
+      <div class="form-row"><label>Auto-transfer USDT spot ⇄ futures</label>
+        <select name="auto_transfer_enabled">
+          <option value="1" {{ 'selected' if cfg.auto_transfer_enabled }}>yes</option>
+          <option value="0" {{ 'selected' if not cfg.auto_transfer_enabled }}>no</option>
+        </select>
+        <span class="hint">Live only. Before opening, moves USDT spot→futures so the perp leg has margin. After all positions close, drains leftover USDT futures→spot so Earn can sweep it. Requires "Permits Universal Transfer" on the API key.</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
   <h3>Earn (idle USDT sweep)</h3>
   <div class="body">
     <div class="form-grid">

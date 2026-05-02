@@ -55,3 +55,5 @@ def run_schema_migrations() -> None:
     # Per-position funding-income tracking.
     _add_column_if_missing('positions', 'funding_income_accrued', 'FLOAT NOT NULL DEFAULT 0.0')
     _add_column_if_missing('positions', 'last_funding_accrual_ts', "DATETIME NOT NULL DEFAULT '1970-01-01 00:00:00'")
+    # Auto-transfer USDT between spot and futures wallets.
+    _add_column_if_missing('strategy_config', 'auto_transfer_enabled', 'BOOLEAN NOT NULL DEFAULT 1')

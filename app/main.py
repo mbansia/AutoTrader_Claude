@@ -587,6 +587,7 @@ def save_config(
     earn_enabled: int = Form(...),
     earn_idle_threshold_usdt: float = Form(...),
     earn_paper_apr: float = Form(...),
+    auto_transfer_enabled: int = Form(...),
     _: None = Depends(auth),
 ):
     with SessionLocal() as db:
@@ -611,6 +612,7 @@ def save_config(
         cfg.earn_enabled = bool(earn_enabled)
         cfg.earn_idle_threshold_usdt = earn_idle_threshold_usdt
         cfg.earn_paper_apr = earn_paper_apr
+        cfg.auto_transfer_enabled = bool(auto_transfer_enabled)
         db.commit()
     return RedirectResponse(url='/config?saved=1', status_code=303)
 

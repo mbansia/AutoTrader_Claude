@@ -331,9 +331,10 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                 else:
                     _refresh_live_earn_balance(gateway, earn)
 
-            # Live short-circuit: if entries are off, no positions, and no earn deployed,
-            # skip the API hits entirely. With earn enabled we still want to refresh balances.
-            if mode == MODE_LIVE and not mstate.entry_enabled and not mstate.maintenance_mode and not cfg.earn_enabled:
+            # Live short-circuit: if entries are off, no positions, and no earn or
+            # auto-transfer to do, skip the API hits entirely.
+            if (mode == MODE_LIVE and not mstate.entry_enabled and not mstate.maintenance_mode
+                    and not cfg.earn_enabled and not cfg.auto_transfer_enabled):
                 open_count = db.scalar(select(func.count(Position.id)).where(Position.status == 'open', Position.mode == mode)) or 0
                 if open_count == 0:
                     return
@@ -423,6 +424,15 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                     db.add(RejectedCandidate(mode=mode, symbol=sym, reason=reason, funding_rate=apr))
 
                 total_equity, free = _compute_equity_and_free(db, gateway, mode, cfg, earn)
+                # Pull per-wallet free balances so we can act on each leg's constraint
+                # individually (live only — paper has a single pool).
+                if mode == MODE_LIVE:
+                    bals = gateway.safe_balances() or {}
+                    spot_free = float((bals.get('spot', {}).get('USDT') or {}).get('free') or 0)
+                    fut_free = float((bals.get('futures', {}).get('USDT') or {}).get('free') or 0)
+                else:
+                    spot_free = fut_free = free
+
                 if total_equity <= 0:
                     scan_action = 'balances_unavailable'
                     scan_note = 'safe_balances() returned None or paper equity = 0'
@@ -433,20 +443,36 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                     for c in passing[:5]:
                         if db.scalar(select(Position).where(Position.perp_symbol == c.perp_symbol, Position.status == 'open', Position.mode == mode)):
                             continue
-                        # If free is short of what we want, redeem from earn first.
-                        if cfg.earn_enabled and free < desired_notional and earn.deployed_usdt > 0:
-                            need = min(desired_notional - free, earn.deployed_usdt)
+                        # Step 1: redeem from Earn into spot if the spot leg is short.
+                        if cfg.earn_enabled and spot_free < desired_notional and earn.deployed_usdt > 0:
+                            need = min(desired_notional - spot_free, earn.deployed_usdt)
                             ok, err = gateway.earn_redeem(need, paper)
                             if ok:
                                 earn.deployed_usdt -= need
-                                free += need
+                                spot_free += need
                                 log_event(db, f'Redeemed {need:.2f} USDT from earn before opening {c.perp_symbol}', mode=mode)
                             else:
                                 earn.last_error = err
                                 log_event(db, f'Earn redeem failed for {c.perp_symbol}: {err}', mode=mode, level='WARN')
-                        sized_notional = min(free * 0.97, desired_notional)
+                        # Step 2: live-only — transfer USDT spot→futures so the perp leg has margin.
+                        # Conservative target: full notional (works at any leverage). We only transfer
+                        # what spot can spare beyond its own desired_notional to keep the spot buy fundable.
+                        if mode == MODE_LIVE and cfg.auto_transfer_enabled and fut_free < desired_notional and spot_free > desired_notional:
+                            transfer = min(desired_notional - fut_free, spot_free - desired_notional)
+                            if transfer > 0.5:
+                                ok, err = gateway.transfer_spot_to_futures(transfer, paper)
+                                if ok:
+                                    spot_free -= transfer
+                                    fut_free += transfer
+                                    log_event(db, f'Auto-transferred {transfer:.2f} USDT spot→futures for {c.perp_symbol} margin', mode=mode)
+                                else:
+                                    log_event(db, f'spot→futures transfer failed: {err}', mode=mode, level='WARN')
+                        # Step 3: size based on the binding constraint across both legs.
+                        free_for_arb = min(spot_free, fut_free)
+                        sized_notional = min(free_for_arb * 0.97, desired_notional)
                         if sized_notional < min_notional:
-                            db.add(RejectedCandidate(mode=mode, symbol=c.perp_symbol, reason=f'below min position pct ({sized_notional:.2f} < {min_notional:.2f} USDT)', funding_rate=c.funding_apr))
+                            reason = f'below min position pct ({sized_notional:.2f} < {min_notional:.2f} USDT; spot_free={spot_free:.2f} fut_free={fut_free:.2f})'
+                            db.add(RejectedCandidate(mode=mode, symbol=c.perp_symbol, reason=reason, funding_rate=c.funding_apr))
                             scan_action = 'below_min_pct'
                             continue
                         spot_px = gateway.safe_price(c.spot_symbol) or 0
@@ -530,6 +556,22 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                 action=scan_action,
                 note=scan_note,
             ))
+
+            # If everything is flat in live mode, drain leftover USDT out of the futures
+            # wallet back to spot so the Earn sweep below can pick it up. Only safe to
+            # drain when there are no open positions (otherwise we'd starve their margin).
+            if mode == MODE_LIVE and cfg.auto_transfer_enabled:
+                still_open = db.scalar(select(func.count(Position.id)).where(Position.status == 'open', Position.mode == mode)) or 0
+                if still_open == 0:
+                    bals_after = gateway.safe_balances() or {}
+                    fut_free_now = float((bals_after.get('futures', {}).get('USDT') or {}).get('free') or 0)
+                    if fut_free_now > 1.0:
+                        amt = max(0.0, fut_free_now - 0.10)
+                        ok, err = gateway.transfer_futures_to_spot(amt, paper)
+                        if ok:
+                            log_event(db, f'Auto-transferred {amt:.2f} USDT futures→spot (no open positions)', mode=mode)
+                        else:
+                            log_event(db, f'futures→spot transfer failed: {err}', mode=mode, level='WARN')
 
             # Sweep any remaining idle USDT into Earn after entries are done.
             if cfg.earn_enabled:

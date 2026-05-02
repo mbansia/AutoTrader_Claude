@@ -234,3 +234,32 @@ class BinanceGateway:
         if resp is None:
             return False, 'sapi method not available in ccxt'
         return bool(resp.get('success', True)), ''
+
+    # ─── Universal transfer (spot ⇄ USDM-futures) ────────────────────────
+    # Binance keeps spot and futures wallets separate; an arb bot needs USDT in
+    # both. The universal transfer SAPI moves USDT between them instantly.
+
+    def _universal_transfer(self, transfer_type: str, amount_usdt: float) -> tuple[bool, str]:
+        for name in ('sapiPostAssetTransfer', 'sapi_post_asset_transfer'):
+            fn = getattr(self.spot, name, None)
+            if callable(fn):
+                try:
+                    fn({'type': transfer_type, 'asset': 'USDT', 'amount': f'{amount_usdt:.2f}'})
+                    return True, ''
+                except Exception as e:
+                    return False, str(e)
+        return False, 'sapiPostAssetTransfer not available in this ccxt build'
+
+    def transfer_spot_to_futures(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        if paper_mode:
+            return True, 'paper'
+        if amount_usdt <= 0:
+            return True, 'noop'
+        return self._universal_transfer('MAIN_UMFUTURE', amount_usdt)
+
+    def transfer_futures_to_spot(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        if paper_mode:
+            return True, 'paper'
+        if amount_usdt <= 0:
+            return True, 'noop'
+        return self._universal_transfer('UMFUTURE_MAIN', amount_usdt)

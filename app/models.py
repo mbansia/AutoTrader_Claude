@@ -128,6 +128,9 @@ class StrategyConfig(Base):
     earn_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     earn_idle_threshold_usdt: Mapped[float] = mapped_column(Float, default=1.0)
     earn_paper_apr: Mapped[float] = mapped_column(Float, default=0.05)
+    # Live-only: auto-move USDT spot↔futures so the perp leg always has margin
+    # and idle USDT ends up back in spot for Earn sweeping.
+    auto_transfer_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
