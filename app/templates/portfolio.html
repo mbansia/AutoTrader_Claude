@@ -16,6 +16,37 @@
 </div>
 
 <div class="card">
+  <h3>Equity composition</h3>
+  <div class="body">
+    {% if breakdown_donut %}
+    <div class="composition-grid">
+      <svg viewBox="0 0 200 200" class="equity-donut" aria-label="Equity composition donut chart">
+        {{ breakdown_donut | safe }}
+        <circle cx="100" cy="100" r="50" fill="var(--panel)"/>
+        <text x="100" y="96" text-anchor="middle" class="donut-total">{{ '%.2f' % current_equity }}</text>
+        <text x="100" y="115" text-anchor="middle" class="donut-sub">USDT total</text>
+      </svg>
+      <ul class="legend">
+        {% set total = breakdown_items|sum(attribute='value') %}
+        {% for it in breakdown_items %}
+          {% if it.value > 0 %}
+          <li>
+            <span class="swatch" style="background:{{ it.color }}"></span>
+            <span class="legend-label">{{ it.label }}</span>
+            <span class="legend-value mono">{{ '%.2f' % it.value }} USDT</span>
+            <span class="legend-pct muted">{{ '%.1f%%' % (it.value / total * 100 if total > 0 else 0) }}</span>
+          </li>
+          {% endif %}
+        {% endfor %}
+      </ul>
+    </div>
+    {% else %}
+    <div class="empty">No equity data yet — run the worker.</div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card">
   <h3>Capital flows</h3>
   <div class="body">
     <form action="/capital-flow" method="post" class="row-flex" style="margin-bottom:14px;">

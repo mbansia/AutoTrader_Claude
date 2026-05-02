@@ -154,27 +154,54 @@ def record_trade(db, position_id: int | None, mode: str, symbol: str, venue: str
 
 
 def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyConfig, reason: str) -> None:
+    """Close both legs of a position. Wrap each call so a single Binance error
+    (insufficient balance, market halted, etc.) doesn't crash the entire cycle.
+    If one leg fails to close, the position stays open and check_hedge will
+    retry on the next cycle."""
     paper = (p.mode == MODE_PAPER)
-    s = gateway.close_spot(p.spot_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-    f = gateway.close_perp(p.perp_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-    record_trade(db, p.id, p.mode, p.spot_symbol, 'spot', 'sell', p.quantity, s)
-    record_trade(db, p.id, p.mode, p.perp_symbol, 'futures', 'buy', p.quantity, f)
-    p.status = 'closed'
-    p.closed_at = datetime.utcnow()
-    log_event(db, f'Closed {p.perp_symbol} ({reason}); realized={position_realized_pnl(db, p):+.4f}', mode=p.mode)
+    spot_ok = perp_ok = False
+    try:
+        s = gateway.close_spot(p.spot_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+        record_trade(db, p.id, p.mode, p.spot_symbol, 'spot', 'sell', p.quantity, s)
+        spot_ok = True
+    except Exception as e:
+        log_event(db, f'Failed to close spot leg of {p.perp_symbol}: {str(e)[:140]} (will retry next cycle)', mode=p.mode, level='ERROR')
+    try:
+        f = gateway.close_perp(p.perp_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+        record_trade(db, p.id, p.mode, p.perp_symbol, 'futures', 'buy', p.quantity, f)
+        perp_ok = True
+    except Exception as e:
+        log_event(db, f'Failed to close perp leg of {p.perp_symbol}: {str(e)[:140]} (will retry next cycle)', mode=p.mode, level='ERROR')
+    if spot_ok and perp_ok:
+        p.status = 'closed'
+        p.closed_at = datetime.utcnow()
+        log_event(db, f'Closed {p.perp_symbol} ({reason}); realized={position_realized_pnl(db, p):+.4f}', mode=p.mode)
+    elif spot_ok or perp_ok:
+        # Partial close — surface clearly. Hedge check will recover on the next cycle.
+        log_event(db, f'PARTIAL CLOSE on {p.perp_symbol}: {("spot only" if spot_ok else "perp only")} closed; other leg will retry next cycle', mode=p.mode, level='ERROR')
 
 
 def _close_naked_leg(db, gateway: BinanceGateway, p: Position, cfg: StrategyConfig, surviving_leg: str | None, reason: str) -> None:
     paper = (p.mode == MODE_PAPER)
-    if surviving_leg == 'spot':
-        s = gateway.close_spot(p.spot_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-        record_trade(db, p.id, p.mode, p.spot_symbol, 'spot', 'sell', p.quantity, s)
-    elif surviving_leg == 'perp':
-        f = gateway.close_perp(p.perp_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-        record_trade(db, p.id, p.mode, p.perp_symbol, 'futures', 'buy', p.quantity, f)
-    p.status = 'closed'
-    p.closed_at = datetime.utcnow()
-    log_event(db, f'Closed naked leg on {p.perp_symbol}: {reason}; flattened {surviving_leg or "no surviving leg"}', mode=p.mode, level='ERROR')
+    closed_ok = False
+    try:
+        if surviving_leg == 'spot':
+            s = gateway.close_spot(p.spot_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+            record_trade(db, p.id, p.mode, p.spot_symbol, 'spot', 'sell', p.quantity, s)
+            closed_ok = True
+        elif surviving_leg == 'perp':
+            f = gateway.close_perp(p.perp_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+            record_trade(db, p.id, p.mode, p.perp_symbol, 'futures', 'buy', p.quantity, f)
+            closed_ok = True
+        else:
+            closed_ok = True  # no surviving leg to close
+    except Exception as e:
+        log_event(db, f'Failed to flatten naked {surviving_leg} leg of {p.perp_symbol}: {str(e)[:140]} (will retry)', mode=p.mode, level='ERROR')
+        return
+    if closed_ok:
+        p.status = 'closed'
+        p.closed_at = datetime.utcnow()
+        log_event(db, f'Closed naked leg on {p.perp_symbol}: {reason}; flattened {surviving_leg or "no surviving leg"}', mode=p.mode, level='ERROR')
 
 
 def manual_close(db, gateway: BinanceGateway, p: Position, cfg: StrategyConfig) -> None:
@@ -229,23 +256,22 @@ def _compute_equity_and_free(db, gateway: BinanceGateway, mode: str, cfg: Strate
     fut_total = float((bals['futures'].get('USDT') or {}).get('total') or 0)
     spot_free = float((bals['spot'].get('USDT') or {}).get('free') or 0)
     fut_free = float((bals['futures'].get('USDT') or {}).get('free') or 0)
-    # IMPORTANT: spot.USDT.total only counts USDT — the base assets the bot bought
-    # on the spot leg (SOL, ETH etc.) live in their own balance entries. Without
-    # adding them back as USDT-equivalent, equity appears to drop by the full
-    # position notional every time we open a trade. Walk our tracked positions
-    # and price each held base back into USDT.
+    # IMPORTANT: spot.USDT.total only counts USDT — the base assets the bot
+    # bought on the spot leg (SOL, ETH, etc.) live in their own balance
+    # entries. Without adding them back as USDT-equivalent, equity appears
+    # to drop by the full position notional every time we open a trade.
+    # Walk every non-USDT spot balance and price it via the spot ticker.
     spot_assets_value = 0.0
-    open_ps = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all()
-    seen_assets: set[str] = set()
-    for p in open_ps:
-        base = p.spot_symbol.split('/')[0]
-        if base in seen_assets:
+    spot_balances = bals.get('spot', {}) or {}
+    META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
+    for asset, bal in spot_balances.items():
+        if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
             continue
-        seen_assets.add(base)
-        qty = float((bals['spot'].get(base) or {}).get('total') or 0)
-        if qty > 0:
-            px = gateway.safe_price(p.spot_symbol) or p.spot_entry_price or 0
-            spot_assets_value += qty * px
+        qty = float(bal.get('total') or 0)
+        if qty <= 0:
+            continue
+        px = gateway.safe_price(f'{asset}/USDT') or 0
+        spot_assets_value += qty * px
     total_equity = spot_total + fut_total + spot_assets_value + earn.deployed_usdt
     return total_equity, min(spot_free, fut_free)
 
@@ -330,6 +356,30 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                     _accrue_paper_yield(earn, cfg.earn_paper_apr)
                 else:
                     _refresh_live_earn_balance(gateway, earn)
+
+            # Live: rehydrate any perp positions Binance shows but our DB doesn't.
+            # Cheap (one auth call), keeps the dashboard in sync if the user opened
+            # something outside the bot or if DB rows got out of step.
+            if mode == MODE_LIVE:
+                try:
+                    for raw in gateway.open_perp_positions_raw():
+                        sym = raw.get('symbol')
+                        pos_amt = abs(float(raw.get('contracts') or raw.get('info', {}).get('positionAmt') or 0))
+                        if not sym or pos_amt == 0:
+                            continue
+                        existing = db.scalar(select(Position).where(Position.perp_symbol == sym, Position.status == 'open', Position.mode == MODE_LIVE))
+                        if existing:
+                            continue
+                        base = sym.split('/')[0]
+                        db.add(Position(
+                            mode=MODE_LIVE, symbol=base,
+                            spot_symbol=f'{base}/USDT', perp_symbol=sym,
+                            quantity=pos_amt, entry_funding_rate=0.0,
+                            last_funding_accrual_ts=datetime.utcnow(),
+                        ))
+                        log_event(db, f'Rehydrated orphan position {sym} qty={pos_amt}', mode=MODE_LIVE, level='WARN')
+                except Exception as e:
+                    log_event(db, f'Reconcile failed: {str(e)[:120]}', mode=MODE_LIVE, level='WARN')
 
             # Live short-circuit: if entries are off, no positions, and no earn or
             # auto-transfer to do, skip the API hits entirely.

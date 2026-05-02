@@ -47,6 +47,84 @@ def total_funding_income(db, mode: str | None = None, status: str | None = None)
     return float(db.scalar(stmt) or 0.0)
 
 
+def equity_breakdown(db, gateway, mode: str, earn_deployed: float) -> list[dict]:
+    """Return a per-component slice of total equity for the donut chart.
+    Each item: {label, value, color}. Designed for both paper and live."""
+    from app.models import Position, MODE_LIVE
+    PALETTE = {
+        'spot_usdt': '#38bdf8',
+        'fut_usdt': '#fbbf24',
+        'spot_assets': '#818cf8',
+        'earn': '#4ade80',
+        'free_cash': '#38bdf8',
+        'in_positions': '#818cf8',
+    }
+    items: list[dict] = []
+    if mode == MODE_LIVE:
+        bals = gateway.safe_balances() or {}
+        spot_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
+        fut_usdt = float((bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
+        # Walk every non-USDT spot asset; price each.
+        spot_assets = 0.0
+        META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
+        for asset, bal in (bals.get('spot') or {}).items():
+            if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+                continue
+            qty = float(bal.get('total') or 0)
+            if qty <= 0:
+                continue
+            px = gateway.safe_price(f'{asset}/USDT') or 0
+            spot_assets += qty * px
+        items.append({'label': 'Spot USDT', 'value': spot_usdt, 'color': PALETTE['spot_usdt']})
+        items.append({'label': 'Futures USDT', 'value': fut_usdt, 'color': PALETTE['fut_usdt']})
+        items.append({'label': 'Spot assets', 'value': spot_assets, 'color': PALETTE['spot_assets']})
+        items.append({'label': 'In Earn', 'value': earn_deployed, 'color': PALETTE['earn']})
+    else:
+        open_ps = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all()
+        in_positions = sum(p.quantity * p.spot_entry_price for p in open_ps)
+        unrealized = 0.0
+        for p in open_ps:
+            spot_now = gateway.safe_price(p.spot_symbol) or p.spot_entry_price or 0
+            perp_now = gateway.safe_price(p.perp_symbol, perp=True) or p.perp_entry_price or 0
+            unrealized += position_unrealized_pnl(p, spot_now, perp_now)
+        # Free cash for paper = total_equity - earn - in_positions - unrealized.
+        # Caller computes total_equity separately; we expose the raw components.
+        # We don't include realized + funding in items because they're already
+        # rolled into "free cash" in paper accounting.
+        items.append({'label': 'In positions', 'value': max(0.0, in_positions), 'color': PALETTE['in_positions']})
+        items.append({'label': 'In Earn', 'value': earn_deployed, 'color': PALETTE['earn']})
+        # 'Free cash' computed by caller and added so totals match.
+    return items
+
+
+def equity_donut_svg(items: list[dict], cx: int = 100, cy: int = 100, r: int = 80) -> str:
+    """Render an SVG donut chart. Returns inner-path markup; caller wraps in <svg>."""
+    import math
+    total = sum(max(0.0, i['value']) for i in items)
+    if total <= 0:
+        return ''
+    paths: list[str] = []
+    angle = -math.pi / 2  # start at 12 o'clock
+    for it in items:
+        v = max(0.0, it['value'])
+        if v <= 0:
+            continue
+        frac = v / total
+        if frac >= 0.999:  # single full slice — render as a circle to avoid path math edge cases
+            paths.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="{it["color"]}"/>')
+            break
+        sweep = frac * 2 * math.pi
+        x1 = cx + r * math.cos(angle)
+        y1 = cy + r * math.sin(angle)
+        angle += sweep
+        x2 = cx + r * math.cos(angle)
+        y2 = cy + r * math.sin(angle)
+        large_arc = 1 if sweep > math.pi else 0
+        d = f'M {cx},{cy} L {x1:.2f},{y1:.2f} A {r},{r} 0 {large_arc},1 {x2:.2f},{y2:.2f} Z'
+        paths.append(f'<path d="{d}" fill="{it["color"]}"/>')
+    return ''.join(paths)
+
+
 def net_capital_in(db, mode: str | None = None) -> float:
     stmt = select(CapitalFlow)
     if mode is not None:

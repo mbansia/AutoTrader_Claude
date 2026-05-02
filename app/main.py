@@ -26,6 +26,8 @@ from app.config import settings
 from app.db import Base, SessionLocal, engine, run_schema_migrations
 from app.exchange import BinanceGateway, annualize_rate
 from app.finance import (
+    equity_breakdown,
+    equity_donut_svg,
     net_capital_in,
     portfolio_xirr,
     position_realized_pnl,
@@ -140,14 +142,18 @@ def _fmt_age(delta: timedelta) -> str:
     return f'{seconds // 86400}d{(seconds % 86400) // 3600}h'
 
 
-def _current_equity(db, mode: str) -> tuple[float, str]:
+def _current_equity(db, mode: str) -> tuple[float, str, bool]:
+    """Returns (equity, source_label_html, is_stale). Stale = no snapshot in last 5 minutes."""
+    now = datetime.utcnow()
     snap = db.scalar(select(BalanceSnapshot).where(BalanceSnapshot.source == mode).order_by(desc(BalanceSnapshot.id)).limit(1))
     if snap:
-        return snap.total_usdt, f'snapshot {snap.source} @ {_fmt_ts(snap.ts)}'
+        stale = (now - snap.ts).total_seconds() > 300
+        return snap.total_usdt, f'snapshot {snap.source} @ {_fmt_ts(snap.ts)}', stale
     eq = db.scalar(select(EquityCurve).where(EquityCurve.mode == mode).order_by(desc(EquityCurve.id)).limit(1))
     if eq:
-        return eq.equity_usdt, f'equity_curve @ {_fmt_ts(eq.ts)}'
-    return 0.0, 'no data yet'
+        stale = (now - eq.ts).total_seconds() > 300
+        return eq.equity_usdt, f'equity_curve @ {_fmt_ts(eq.ts)}', stale
+    return 0.0, 'no data yet', True
 
 
 def _unrealized_for_open(db, gateway: BinanceGateway, mode: str) -> float:
@@ -289,7 +295,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             if 'apr' not in c:
                 c['apr'] = annualize_rate(c.get('fr', 0.0), c.get('interval_h', 8.0))
 
-        current_equity, equity_source = _current_equity(db, v)
+        current_equity, equity_source, equity_stale = _current_equity(db, v)
         balances_error = None
         if v == MODE_LIVE:
             bals = gw.safe_balances()
@@ -317,6 +323,22 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             'cumulative_yield': earn.cumulative_yield_usdt,
             'last_error': earn.last_error,
         }
+
+        breakdown_items = equity_breakdown(db, gw, v, earn.deployed_usdt)
+        if v == MODE_PAPER:
+            tracked = sum(max(0.0, i['value']) for i in breakdown_items)
+            free_cash = max(0.0, current_equity - tracked)
+            breakdown_items.insert(0, {'label': 'Free cash', 'value': free_cash, 'color': '#38bdf8'})
+        ctx['breakdown_items'] = breakdown_items
+        ctx['breakdown_donut'] = equity_donut_svg(breakdown_items)
+        ctx['equity_stale'] = equity_stale
+        # Surface the actual deployable free balances so the user can see what the bot sees.
+        if v == MODE_LIVE:
+            bals_for_display = gw.safe_balances() or {}
+            ctx['live_spot_free'] = float((bals_for_display.get('spot', {}).get('USDT') or {}).get('free') or 0)
+            ctx['live_fut_free'] = float((bals_for_display.get('futures', {}).get('USDT') or {}).get('free') or 0)
+        else:
+            ctx['live_spot_free'] = ctx['live_fut_free'] = None
 
         ctx.update({
             'current_equity': current_equity,
@@ -441,7 +463,7 @@ def portfolio_page(request: Request, view: str | None = None, view_cookie: str |
         cfg = get_strategy_config(db)
         ctx['cfg'] = cfg
         gw = BinanceGateway()
-        current_equity, equity_source = _current_equity(db, v)
+        current_equity, equity_source, equity_stale = _current_equity(db, v)
         trade_realized = total_realized_pnl(db, mode=v)
         funding_income = total_funding_income(db, mode=v)
         realized = trade_realized + funding_income
@@ -475,6 +497,13 @@ def portfolio_page(request: Request, view: str | None = None, view_cookie: str |
                 'unrealized': unreal,
             })
 
+        earn = get_earn_state(db, v)
+        breakdown_items = equity_breakdown(db, gw, v, earn.deployed_usdt)
+        if v == MODE_PAPER:
+            tracked = sum(max(0.0, i['value']) for i in breakdown_items)
+            free_cash = max(0.0, current_equity - tracked)
+            breakdown_items.insert(0, {'label': 'Free cash', 'value': free_cash, 'color': '#38bdf8'})
+
         ctx.update({
             'current_equity': current_equity,
             'equity_source': equity_source,
@@ -487,6 +516,8 @@ def portfolio_page(request: Request, view: str | None = None, view_cookie: str |
             'xirr_value': xirr_value,
             'flows': [{'id': f.id, 'ts': _fmt_ts(f.ts), 'amount_usdt': f.amount_usdt, 'kind': f.kind, 'detected_by': f.detected_by, 'note': f.note} for f in flows],
             'breakdown': breakdown,
+            'breakdown_items': breakdown_items,
+            'breakdown_donut': equity_donut_svg(breakdown_items),
         })
     response = templates.TemplateResponse(request, 'portfolio.html', ctx)
     response.set_cookie('view', v, max_age=60 * 60 * 24 * 365, httponly=False)
