@@ -48,7 +48,7 @@
 </div>
 
 <div class="card">
-  <h3>Wallet auto-transfer</h3>
+  <h3>Wallet auto-transfer &amp; rebalance</h3>
   <div class="body">
     <div class="form-grid">
       <div class="form-row"><label>Auto-transfer USDT spot ⇄ futures</label>
@@ -56,7 +56,13 @@
           <option value="1" {{ 'selected' if cfg.auto_transfer_enabled }}>yes</option>
           <option value="0" {{ 'selected' if not cfg.auto_transfer_enabled }}>no</option>
         </select>
-        <span class="hint">Live only. Before opening, moves USDT spot→futures so the perp leg has margin. After all positions close, drains leftover USDT futures→spot so Earn can sweep it. Requires "Permits Universal Transfer" on the API key.</span></div>
+        <span class="hint">Live only. Continuously rebalances spot.free ≈ futures.free each cycle, redeems from earn for spot needs, drains futures back when positions close. Requires "Permits Universal Transfer" on the API key.</span></div>
+      <div class="form-row"><label>Rebalance threshold (USDT)</label>
+        <input type="number" step="0.1" name="auto_rebalance_threshold" value="{{ cfg.auto_rebalance_threshold }}">
+        <span class="hint">Only move if |spot.free − fut.free| exceeds this. Avoids ping-pong on dust.</span></div>
+      <div class="form-row"><label>Perp leverage</label>
+        <input type="number" step="1" name="perp_leverage" value="{{ cfg.perp_leverage }}">
+        <span class="hint">Bot configures CROSS margin + this leverage on every perp before opening. <strong>1 is the only safe choice for an arb hedge</strong> — keeps perp margin == spot notional and avoids "Margin is insufficient" close errors.</span></div>
     </div>
   </div>
 </div>
@@ -77,6 +83,12 @@
       <div class="form-row"><label>Paper APR (decimal)</label>
         <input type="number" step="0.001" name="earn_paper_apr" value="{{ '%.4f' % cfg.earn_paper_apr }}">
         <span class="hint">simulated yield rate for paper mode. 0.05 = 5% APR. Live mode reads the real Binance balance instead.</span></div>
+      <div class="form-row"><label>Subscribe spot leg to Earn</label>
+        <select name="earn_subscribe_spot_assets">
+          <option value="1" {{ 'selected' if cfg.earn_subscribe_spot_assets }}>yes</option>
+          <option value="0" {{ 'selected' if not cfg.earn_subscribe_spot_assets }}>no</option>
+        </select>
+        <span class="hint">Opt-in. After buying SOL/ETH/etc. on the spot leg, also subscribes that asset to Binance Simple Earn Flexible (immediately redeemable). Auto-redeems before close. Skips silently if no flexible product exists for the asset.</span></div>
     </div>
   </div>
 </div>

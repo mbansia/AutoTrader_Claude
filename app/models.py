@@ -131,6 +131,16 @@ class StrategyConfig(Base):
     # Live-only: auto-move USDT spot↔futures so the perp leg always has margin
     # and idle USDT ends up back in spot for Earn sweeping.
     auto_transfer_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Continuous spot ↔ futures rebalance: keep both wallets' free balances near
+    # equal each cycle. Threshold is the minimum imbalance (USDT) before we move.
+    auto_rebalance_threshold: Mapped[float] = mapped_column(Float, default=1.0)
+    # Subscribe base assets (SOL, ETH, etc.) to Binance Simple Earn Flexible after
+    # the spot buy fills. Default off — opt-in because not every asset has a
+    # flexible product and redeem-on-close is one extra failure mode.
+    earn_subscribe_spot_assets: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Leverage for the perp leg. 1x is the only safe choice for a hedge — keeps
+    # the perp's used margin equal to its notional, matching the spot leg.
+    perp_leverage: Mapped[int] = mapped_column(Integer, default=1)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 

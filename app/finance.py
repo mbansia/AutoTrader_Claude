@@ -35,6 +35,23 @@ def total_realized_pnl(db, mode: str | None = None) -> float:
     return sum(position_realized_pnl(db, p) for p in closed)
 
 
+def effective_position_apy(funding_apy: float, leverage: int = 1) -> float:
+    """Funding is paid on the perp notional only. The arb deploys equal capital
+    on the spot leg (which earns nothing). True yield rate on the *total* capital
+    deployed (= spot_notional + perp_margin) is funding_apy × perp_notional /
+    (spot_notional + perp_margin).
+
+    For 1x cross margin: perp_margin == perp_notional == spot_notional, so
+    effective APY = funding_apy / 2. For higher leverage, perp_margin shrinks
+    and effective APY approaches funding_apy."""
+    if leverage <= 0:
+        leverage = 1
+    # Both legs measured at the same notional; perp_margin = notional / leverage.
+    # capital_deployed = notional + notional/leverage = notional * (1 + 1/leverage)
+    # earning_share = notional / capital_deployed = leverage / (leverage + 1)
+    return funding_apy * (leverage / (leverage + 1.0))
+
+
 def total_funding_income(db, mode: str | None = None, status: str | None = None) -> float:
     """Sum of funding payments (accrued in paper, would-be auto-credited in live).
     Pass status='open' or 'closed' to scope; default is all."""

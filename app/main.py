@@ -26,6 +26,7 @@ from app.config import settings
 from app.db import Base, SessionLocal, engine, run_schema_migrations
 from app.exchange import BinanceGateway, annualize_rate
 from app.finance import (
+    effective_position_apy,
     equity_breakdown,
     equity_donut_svg,
     net_capital_in,
@@ -294,6 +295,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         for c in latest_scan_top:
             if 'apr' not in c:
                 c['apr'] = annualize_rate(c.get('fr', 0.0), c.get('interval_h', 8.0))
+            c['effective_apy'] = effective_position_apy(c['apr'], cfg.perp_leverage or 1)
 
         current_equity, equity_source, equity_stale = _current_equity(db, v)
         balances_error = None
@@ -403,6 +405,7 @@ def positions_page(request: Request, view: str | None = None, view_cookie: str |
                 'basis_now_bps': basis_bps(spot_now, perp_now) if (spot_now and perp_now) else 0.0,
                 'entry_funding_apy': annualize_rate(p.entry_funding_rate, interval_h),
                 'last_funding_apy': annualize_rate(p.last_funding_rate, interval_h),
+                'effective_apy': effective_position_apy(annualize_rate(p.last_funding_rate, interval_h), cfg.perp_leverage or 1),
                 'interval_hours': interval_h,
                 'opened_at': _fmt_ts(p.opened_at),
                 'age': _fmt_age(datetime.utcnow() - p.opened_at),
@@ -565,7 +568,8 @@ def logs_page(request: Request, view: str | None = None, view_cookie: str | None
                     apy = top[0].get('apr')  # legacy field name; the value is now compounded APY
                     if apy is None:
                         apy = annualize_rate(top[0].get('fr', 0.0), top[0].get('interval_h', 8.0))
-                    top_label = f"{top[0]['perp']} @ {apy*100:.2f}% APY"
+                    eff = effective_position_apy(apy, ctx['cfg'].perp_leverage or 1)
+                    top_label = f"{top[0]['perp']} @ {apy*100:.2f}% funding APY ({eff*100:.2f}% effective)"
             except Exception:
                 pass
             scans.append({'ts': _fmt_ts(s.ts), 'candidates_total': s.candidates_total, 'candidates_passing': s.candidates_passing, 'action': s.action, 'top_candidate_label': top_label, 'note': s.note})
@@ -619,6 +623,9 @@ def save_config(
     earn_idle_threshold_usdt: float = Form(...),
     earn_paper_apr: float = Form(...),
     auto_transfer_enabled: int = Form(...),
+    auto_rebalance_threshold: float = Form(1.0),
+    earn_subscribe_spot_assets: int = Form(0),
+    perp_leverage: int = Form(1),
     _: None = Depends(auth),
 ):
     with SessionLocal() as db:
@@ -644,6 +651,9 @@ def save_config(
         cfg.earn_idle_threshold_usdt = earn_idle_threshold_usdt
         cfg.earn_paper_apr = earn_paper_apr
         cfg.auto_transfer_enabled = bool(auto_transfer_enabled)
+        cfg.auto_rebalance_threshold = max(0.20, auto_rebalance_threshold)
+        cfg.earn_subscribe_spot_assets = bool(earn_subscribe_spot_assets)
+        cfg.perp_leverage = max(1, perp_leverage)
         db.commit()
     return RedirectResponse(url='/config?saved=1', status_code=303)
 

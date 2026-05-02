@@ -145,6 +145,36 @@ class BinanceGateway:
             return []
         return [p for p in positions if abs(float(p.get('contracts') or p.get('info', {}).get('positionAmt') or 0)) > 0]
 
+    # ─── Margin mode + leverage configuration ───────────────────────────────
+    # For a delta-neutral arb, CROSS margin at 1x is the right setup:
+    #  - CROSS shares margin across positions, avoiding single-leg liquidation
+    #    risk on tiny price moves while the spot leg backs the perp short.
+    #  - 1x leverage means the perp uses its full notional as margin, matching
+    #    what we hold on the spot leg — keeps both legs symmetrically capitalized
+    #    and prevents "Margin is insufficient" close failures from leverage drift.
+    # Both calls are idempotent on Binance — repeating them when already-set is
+    # cheap and safe.
+
+    def configure_perp_for_arb(self, symbol: str) -> tuple[bool, str]:
+        margin_ok = leverage_ok = True
+        margin_err = leverage_err = ''
+        try:
+            self.futures.set_margin_mode('cross', symbol)
+        except Exception as e:
+            msg = str(e)
+            # Binance returns "No need to change margin type" if it's already CROSS — that's fine.
+            if 'No need to change' not in msg and 'no need to change' not in msg:
+                margin_ok, margin_err = False, msg
+        try:
+            self.futures.set_leverage(1, symbol)
+        except Exception as e:
+            msg = str(e)
+            if 'No need to change' not in msg and 'no need to change' not in msg:
+                leverage_ok, leverage_err = False, msg
+        if margin_ok and leverage_ok:
+            return True, ''
+        return False, '; '.join(filter(None, [margin_err, leverage_err]))
+
     # ─── Binance Simple Earn (Flexible USDT) ─────────────────────────────────
     # ccxt method names vary across versions; we probe a small set and call
     # the first that exists. All methods degrade gracefully — if the API key
@@ -152,7 +182,7 @@ class BinanceGateway:
     # changes, we return None / an error string and the caller leaves money
     # in the spot wallet.
 
-    _earn_product_id_cache: str | None = None
+    _earn_product_id_cache: dict[str, str] = {}
 
     def _call_sapi(self, candidates: tuple[str, ...], params: dict | None = None):
         for name in candidates:
@@ -161,35 +191,40 @@ class BinanceGateway:
                 return fn(params or {})
         return None
 
-    def earn_product_id_usdt(self) -> str | None:
-        if self._earn_product_id_cache:
-            return self._earn_product_id_cache
+    def earn_product_id(self, asset: str) -> str | None:
+        cached = self._earn_product_id_cache.get(asset)
+        if cached:
+            return cached
         try:
             resp = self._call_sapi((
                 'sapiV1GetSimpleEarnFlexibleList',
                 'sapi_v1_get_simple_earn_flexible_list',
                 'sapiGetSimpleEarnFlexibleList',
-            ), {'asset': 'USDT'})
+            ), {'asset': asset})
         except Exception:
             return None
         if not resp:
             return None
         rows = resp.get('rows') or resp.get('data') or []
         for r in rows:
-            if r.get('asset') == 'USDT':
+            if r.get('asset') == asset:
                 pid = r.get('productId') or r.get('id')
                 if pid:
-                    self._earn_product_id_cache = str(pid)
-                    return self._earn_product_id_cache
+                    self._earn_product_id_cache[asset] = str(pid)
+                    return str(pid)
         return None
 
-    def earn_balance_usdt(self) -> tuple[float | None, str]:
+    # Backwards-compat alias used by callers that only deal with USDT.
+    def earn_product_id_usdt(self) -> str | None:
+        return self.earn_product_id('USDT')
+
+    def earn_balance(self, asset: str = 'USDT') -> tuple[float | None, str]:
         try:
             resp = self._call_sapi((
                 'sapiV1GetSimpleEarnFlexiblePosition',
                 'sapi_v1_get_simple_earn_flexible_position',
                 'sapiGetSimpleEarnFlexiblePosition',
-            ), {'asset': 'USDT'})
+            ), {'asset': asset})
         except Exception as e:
             return None, str(e)
         if resp is None:
@@ -199,45 +234,62 @@ class BinanceGateway:
             total += float(r.get('totalAmount') or 0)
         return total, ''
 
-    def earn_subscribe(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+    def earn_balance_usdt(self) -> tuple[float | None, str]:
+        return self.earn_balance('USDT')
+
+    def earn_subscribe_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:
+        """Subscribe `amount` of `asset` to Binance Simple Earn Flexible. Asset can be
+        USDT or any base coin that has a flexible product (Binance offers flexible
+        for most major listings). Caller must pre-format `amount` to the asset's
+        precision; here we use 6 decimals as a conservative cap."""
         if paper_mode:
             return True, 'paper'
-        pid = self.earn_product_id_usdt()
+        if amount <= 0:
+            return False, 'zero amount'
+        pid = self.earn_product_id(asset)
         if not pid:
-            return False, 'no flexible USDT product id'
+            return False, f'no flexible product for {asset}'
         try:
             resp = self._call_sapi((
                 'sapiV1PostSimpleEarnFlexibleSubscribe',
                 'sapi_v1_post_simple_earn_flexible_subscribe',
                 'sapiPostSimpleEarnFlexibleSubscribe',
-            ), {'productId': pid, 'amount': f'{amount_usdt:.2f}'})
+            ), {'productId': pid, 'amount': f'{amount:.6f}'})
         except Exception as e:
             return False, str(e)
         if resp is None:
             return False, 'sapi method not available in ccxt'
         return bool(resp.get('success', True)), ''
 
-    def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+    def earn_redeem_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:
         if paper_mode:
             return True, 'paper'
-        # Binance flexible USDT redeem has a minimum amount; sending 0.00 returns
-        # an "amount malformed" -1102 error. Skip clearly-too-small calls.
-        if amount_usdt < 0.10:
-            return False, f'amount {amount_usdt:.4f} below redeem minimum'
-        pid = self.earn_product_id_usdt()
+        if amount <= 0:
+            return False, 'zero amount'
+        # Binance returns -1102 when amount string is "0.00" — skip clearly-tiny calls.
+        if asset == 'USDT' and amount < 0.10:
+            return False, f'amount {amount:.4f} below USDT redeem minimum'
+        pid = self.earn_product_id(asset)
         if not pid:
-            return False, 'no flexible USDT product id'
+            return False, f'no flexible product for {asset}'
         try:
             resp = self._call_sapi((
                 'sapiV1PostSimpleEarnFlexibleRedeem',
                 'sapi_v1_post_simple_earn_flexible_redeem',
                 'sapiPostSimpleEarnFlexibleRedeem',
-            ), {'productId': pid, 'amount': f'{amount_usdt:.4f}', 'destAccount': 'SPOT'})
+            ), {'productId': pid, 'amount': f'{amount:.6f}', 'destAccount': 'SPOT'})
         except Exception as e:
             return False, str(e)
         if resp is None:
             return False, 'sapi method not available in ccxt'
         return bool(resp.get('success', True)), ''
+
+    # Convenience wrappers for the existing USDT-only callers.
+    def earn_subscribe(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        return self.earn_subscribe_asset('USDT', amount_usdt, paper_mode)
+
+    def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        return self.earn_redeem_asset('USDT', amount_usdt, paper_mode)
 
     # ─── Universal transfer (spot ⇄ USDM-futures) ────────────────────────
     # Binance keeps spot and futures wallets separate; an arb bot needs USDT in
