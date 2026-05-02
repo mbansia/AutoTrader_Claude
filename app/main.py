@@ -3,11 +3,6 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from sqlalchemy import desc, select
 
-from app.bot import get_runtime_state, get_strategy_config, run_loop
-from app.config import settings
-from app.db import Base, SessionLocal, engine
-from app.exchange import BinanceGateway
-from app.models import BotEvent, EquityCurve, Position, RejectedCandidate, RuntimeState, Trade
 from app.bot import get_runtime_state, run_loop
 from app.config import settings
 from app.db import Base, SessionLocal, engine

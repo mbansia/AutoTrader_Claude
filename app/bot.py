@@ -15,6 +15,7 @@ from app.config import (
     MAX_POSITION_NOTIONAL,
     MAX_TRADES_PER_DAY,
     MIN_SYMBOL_NOTIONAL,
+    STOP_LOSS_PCT,
     settings,
 )
 from app.db import SessionLocal
@@ -74,15 +75,33 @@ def run_loop() -> None:
                 return
 
             open_positions = db.scalars(select(Position).where(Position.status == 'open')).all()
+            current_funding = gateway.futures.fetch_funding_rates() if open_positions else {}
             for p in open_positions:
+                row = current_funding.get(p.perp_symbol) or {}
+                fr = row.get('fundingRate')
+                if fr is not None:
+                    p.last_funding_rate = float(fr)
                 age = datetime.utcnow() - p.opened_at
-                if p.last_funding_rate < EXIT_FUNDING_THRESHOLD or age > timedelta(hours=MAX_HOLD_HOURS):
+                exit_reason = None
+                if p.last_funding_rate < EXIT_FUNDING_THRESHOLD:
+                    exit_reason = 'funding_below_threshold'
+                elif age > timedelta(hours=MAX_HOLD_HOURS):
+                    exit_reason = 'max_hold'
+                elif p.spot_entry_price > 0 and p.perp_entry_price > 0:
+                    spot_now = gateway.price(p.spot_symbol)
+                    perp_now = gateway.perp_price(p.perp_symbol)
+                    pnl = (spot_now - p.spot_entry_price) * p.quantity + (p.perp_entry_price - perp_now) * p.quantity
+                    notional = p.spot_entry_price * p.quantity
+                    if notional > 0 and pnl / notional <= STOP_LOSS_PCT:
+                        exit_reason = 'stop_loss'
+                if exit_reason:
                     s = gateway.close_spot(p.spot_symbol, p.quantity, paper_mode)
                     f = gateway.close_perp(p.perp_symbol, p.quantity, paper_mode)
                     record_trade(db, p.id, p.spot_symbol, 'spot', 'sell', p.quantity, s)
                     record_trade(db, p.id, p.perp_symbol, 'futures', 'buy', p.quantity, f)
                     p.status = 'closed'
                     p.closed_at = datetime.utcnow()
+                    log_event(db, f'Closed {p.perp_symbol} ({exit_reason})')
 
             daily_trades = db.scalar(select(func.count(Trade.id)).where(Trade.ts >= datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0))) or 0
             if len(open_positions) < MAX_OPEN_POSITIONS and daily_trades < MAX_TRADES_PER_DAY:
@@ -99,7 +118,7 @@ def run_loop() -> None:
                     qty = min(notional, MAX_POSITION_NOTIONAL) / max(0.0001, gateway.price(c.spot_symbol))
                     s = gateway.create_spot_buy(c.spot_symbol, qty, paper_mode)
                     f = gateway.create_perp_short(c.perp_symbol, qty, paper_mode)
-                    pos = Position(symbol=c.spot_symbol.split('/')[0], spot_symbol=c.spot_symbol, perp_symbol=c.perp_symbol, quantity=qty, entry_funding_rate=c.funding_rate, last_funding_rate=c.funding_rate)
+                    pos = Position(symbol=c.spot_symbol.split('/')[0], spot_symbol=c.spot_symbol, perp_symbol=c.perp_symbol, quantity=qty, entry_funding_rate=c.funding_rate, last_funding_rate=c.funding_rate, spot_entry_price=float(s.get('price') or 0), perp_entry_price=float(f.get('price') or 0))
                     db.add(pos)
                     db.flush()
                     record_trade(db, pos.id, c.spot_symbol, 'spot', 'buy', qty, s)

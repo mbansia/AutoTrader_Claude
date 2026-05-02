@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import ccxt
 
-from app.config import ENTRY_FUNDING_THRESHOLD, MIN_24H_QUOTE_VOLUME, settings
+from app.config import ENTRY_FUNDING_THRESHOLD, MIN_24H_QUOTE_VOLUME, PAPER_FEE_BPS, PAPER_SLIPPAGE_BPS, settings
 
 
 @dataclass
@@ -46,9 +46,16 @@ class BinanceGateway:
     def price(self, symbol: str) -> float:
         return float(self.spot.fetch_ticker(symbol)['last'])
 
+    def perp_price(self, symbol: str) -> float:
+        return float(self.futures.fetch_ticker(symbol)['last'])
+
     def _market_order(self, venue: str, symbol: str, side: str, amount: float, paper_mode: bool):
         if paper_mode:
-            return {'id': 'paper', 'symbol': symbol, 'side': side, 'amount': amount, 'venue': venue, 'status': 'closed', 'price': self.price(symbol.split(':')[0] if ':' in symbol else symbol), 'fee': {'cost': 0.0}}
+            mid = self.perp_price(symbol) if venue == 'futures' else self.price(symbol)
+            slip = PAPER_SLIPPAGE_BPS / 10000.0
+            fill_price = mid * (1 + slip) if side == 'buy' else mid * (1 - slip)
+            fee_cost = fill_price * amount * (PAPER_FEE_BPS / 10000.0)
+            return {'id': 'paper', 'symbol': symbol, 'side': side, 'amount': amount, 'venue': venue, 'status': 'closed', 'price': fill_price, 'fee': {'cost': fee_cost}}
         if venue == 'spot':
             return self.spot.create_order(symbol, 'market', side, amount)
         return self.futures.create_order(symbol, 'market', side, amount)
