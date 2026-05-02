@@ -4,7 +4,23 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>{% block title %}Funding Arb{% endblock %}</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="stylesheet" href="/static/style.css">
+  <script>
+    // Apply persisted theme before paint to avoid flash.
+    (function() {
+      try {
+        var t = localStorage.getItem('theme');
+        if (t === 'light' || t === 'dark') {
+          document.documentElement.setAttribute('data-theme', t);
+        } else {
+          document.documentElement.setAttribute('data-theme', window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+        }
+      } catch (e) {
+        document.documentElement.setAttribute('data-theme', 'dark');
+      }
+    })();
+  </script>
 </head>
 <body class="view-{{ view }}">
 <div class="app">
@@ -12,11 +28,11 @@
     <h1>Funding Arb</h1>
     <div class="subtitle">Binance · Spot/Perp</div>
     <div class="view-tabs">
-      <form action="/view/paper" method="post" style="margin:0">
+      <form action="/view/paper" method="post">
         <button type="submit" class="view-tab {{ 'active' if view == 'paper' }}">PAPER</button>
       </form>
-      <form action="/view/live" method="post" style="margin:0">
-        <button type="submit" class="view-tab {{ 'active' if view == 'live' }} live">LIVE</button>
+      <form action="/view/live" method="post">
+        <button type="submit" class="view-tab live {{ 'active' if view == 'live' }}">LIVE</button>
       </form>
     </div>
     {% set ms = paper_state if view == 'paper' else live_state %}
@@ -32,24 +48,32 @@
       <li><a href="/config" class="{{ 'active' if active=='config' }}">Configuration</a></li>
       <li><a href="/safety" class="{{ 'active' if active=='safety' }}">Safety &amp; Rules</a></li>
     </ul>
+    <div class="sidebar-footer">
+      <span class="muted" style="font-size:11px;">v0.1</span>
+      <button type="button" class="theme-toggle" id="theme-toggle" aria-label="Toggle theme">
+        <span id="theme-toggle-icon">🌙</span>
+        <span id="theme-toggle-label">Dark</span>
+      </button>
+    </div>
   </aside>
   <main class="main">
     <div class="view-banner view-banner-{{ view }}">
-      <strong>{{ 'PAPER' if view == 'paper' else 'LIVE' }}</strong> view —
-      {% if view == 'paper' %}
-        synthetic fills with modeled slippage and fees. No real funds at risk.
-      {% else %}
-        real money on Binance. Every entry, exit and balance is live.
-      {% endif %}
-      <span class="spacer"></span>
-      <form action="/mode/{{ view }}/stop" method="post" style="display:inline;margin:0">
+      <span class="banner-text">
+        <strong>{{ 'PAPER' if view == 'paper' else 'LIVE' }}</strong> view —
+        {% if view == 'paper' %}
+          synthetic fills with modeled slippage and fees. No real funds at risk.
+        {% else %}
+          real money on Binance. Every entry, exit and balance is live.
+        {% endif %}
+      </span>
+      <form action="/mode/{{ view }}/stop" method="post">
         <button type="submit" class="btn btn-warn" {{ 'disabled' if not ms.entry_enabled }}>STOP</button>
       </form>
-      <form action="/mode/{{ view }}/exit-all-stop" method="post" style="display:inline;margin:0" onsubmit="return confirm('Market-close every {{ view }} position and disable entries?');">
+      <form action="/mode/{{ view }}/exit-all-stop" method="post" onsubmit="return confirm('Market-close every {{ view }} position and disable entries?');">
         <button type="submit" class="btn btn-danger">EXIT ALL &amp; STOP</button>
       </form>
       {% if not ms.entry_enabled or ms.maintenance_mode %}
-      <form action="/mode/{{ view }}/start" method="post" style="display:inline;margin:0">
+      <form action="/mode/{{ view }}/start" method="post">
         <button type="submit" class="btn btn-primary">RESUME</button>
       </form>
       {% endif %}
@@ -57,5 +81,25 @@
     {% block content %}{% endblock %}
   </main>
 </div>
+<script>
+  (function() {
+    var btn = document.getElementById('theme-toggle');
+    var icon = document.getElementById('theme-toggle-icon');
+    var label = document.getElementById('theme-toggle-label');
+    function render() {
+      var t = document.documentElement.getAttribute('data-theme') || 'dark';
+      icon.textContent = t === 'light' ? '☀' : '🌙';
+      label.textContent = t === 'light' ? 'Light' : 'Dark';
+    }
+    render();
+    btn.addEventListener('click', function() {
+      var current = document.documentElement.getAttribute('data-theme') || 'dark';
+      var next = current === 'light' ? 'dark' : 'light';
+      document.documentElement.setAttribute('data-theme', next);
+      try { localStorage.setItem('theme', next); } catch (e) {}
+      render();
+    });
+  })();
+</script>
 </body>
 </html>
