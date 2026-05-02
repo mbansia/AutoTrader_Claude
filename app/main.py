@@ -358,10 +358,19 @@ def positions_page(request: Request, view: str | None = None, view_cookie: str |
             spot_now = gw.safe_price(p.spot_symbol) or 0.0
             perp_now = gw.safe_price(p.perp_symbol, perp=True) or 0.0
             interval_h = p.funding_interval_hours or 8.0
+            # Per-leg breakdown for the expandable detail panel.
+            entry_trades = db.scalars(select(Trade).where(Trade.position_id == p.id, Trade.side == 'buy', Trade.venue == 'spot')).all() + \
+                           db.scalars(select(Trade).where(Trade.position_id == p.id, Trade.side == 'sell', Trade.venue == 'futures')).all()
+            spot_entry_trade = next((t for t in entry_trades if t.venue == 'spot'), None)
+            perp_entry_trade = next((t for t in entry_trades if t.venue == 'futures'), None)
+            spot_leg_pnl = (spot_now - p.spot_entry_price) * p.quantity if spot_now else 0.0
+            perp_leg_pnl = (p.perp_entry_price - perp_now) * p.quantity if perp_now else 0.0
             rows.append({
                 'id': p.id,
                 'symbol': p.symbol,
                 'quantity': p.quantity,
+                'spot_symbol': p.spot_symbol,
+                'perp_symbol': p.perp_symbol,
                 'spot_entry': p.spot_entry_price,
                 'spot_now': spot_now,
                 'perp_entry': p.perp_entry_price,
@@ -373,9 +382,37 @@ def positions_page(request: Request, view: str | None = None, view_cookie: str |
                 'entry_funding_apy': annualize_rate(p.entry_funding_rate, interval_h),
                 'last_funding_apy': annualize_rate(p.last_funding_rate, interval_h),
                 'interval_hours': interval_h,
+                'opened_at': _fmt_ts(p.opened_at),
                 'age': _fmt_age(datetime.utcnow() - p.opened_at),
                 'unrealized_pnl': position_unrealized_pnl(p, spot_now, perp_now) if (spot_now and perp_now) else 0.0,
                 'funding_income': p.funding_income_accrued,
+                'spot_leg': {
+                    'symbol': p.spot_symbol,
+                    'side': 'long',
+                    'qty': p.quantity,
+                    'entry_price': p.spot_entry_price,
+                    'now_price': spot_now,
+                    'notional_entry': p.quantity * p.spot_entry_price,
+                    'notional_now': p.quantity * spot_now if spot_now else 0.0,
+                    'fee_paid': float(spot_entry_trade.fee) if spot_entry_trade else 0.0,
+                    'mtm_pnl': spot_leg_pnl,
+                    'entry_ts': _fmt_ts(spot_entry_trade.ts) if spot_entry_trade else _fmt_ts(p.opened_at),
+                },
+                'perp_leg': {
+                    'symbol': p.perp_symbol,
+                    'side': 'short',
+                    'qty': p.quantity,
+                    'entry_price': p.perp_entry_price,
+                    'now_price': perp_now,
+                    'notional_entry': p.quantity * p.perp_entry_price,
+                    'notional_now': p.quantity * perp_now if perp_now else 0.0,
+                    'fee_paid': float(perp_entry_trade.fee) if perp_entry_trade else 0.0,
+                    'mtm_pnl': perp_leg_pnl,
+                    'funding_income': p.funding_income_accrued,
+                    'last_funding_apy': annualize_rate(p.last_funding_rate, interval_h),
+                    'interval_hours': interval_h,
+                    'entry_ts': _fmt_ts(perp_entry_trade.ts) if perp_entry_trade else _fmt_ts(p.opened_at),
+                },
             })
 
         closed_rows = db.scalars(select(Position).where(Position.status == 'closed', Position.mode == v).order_by(desc(Position.id)).limit(20)).all()
@@ -422,10 +459,14 @@ def portfolio_page(request: Request, view: str | None = None, view_cookie: str |
                 perp_now = gw.safe_price(p.perp_symbol, perp=True) or 0.0
                 if spot_now and perp_now:
                     unreal = position_unrealized_pnl(p, spot_now, perp_now)
+            spot_now_for_breakdown = gw.safe_price(p.spot_symbol) if p.status == 'open' else None
+            ref_price = spot_now_for_breakdown or p.spot_entry_price or 0.0
             breakdown.append({
                 'symbol': p.symbol,
                 'status': p.status,
                 'quantity': p.quantity,
+                'notional_entry': p.quantity * p.spot_entry_price,
+                'notional_now': p.quantity * ref_price,
                 'opened_at': _fmt_ts(p.opened_at),
                 'closed_at': _fmt_ts(p.closed_at) if p.closed_at else None,
                 'trade_pnl': position_realized_pnl(db, p),

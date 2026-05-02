@@ -55,13 +55,15 @@
   <h3>Per-position PnL breakdown</h3>
   {% if breakdown %}
   <table>
-    <thead><tr><th>Symbol</th><th>Status</th><th class="num">Qty</th><th>Opened</th><th>Closed</th><th class="num">Trade PnL</th><th class="num">Funding</th><th class="num">Realized total</th><th class="num">Unrealized</th></tr></thead>
+    <thead><tr><th>Symbol</th><th>Status</th><th class="num">Qty</th><th class="num">Notional entry</th><th class="num">Notional now</th><th>Opened</th><th>Closed</th><th class="num">Trade PnL</th><th class="num">Funding</th><th class="num">Realized total</th><th class="num">Unrealized</th></tr></thead>
     <tbody>
     {% for b in breakdown %}
       <tr>
         <td class="mono">{{ b.symbol }}</td>
         <td><span class="tag {{ 'good' if b.status == 'open' else '' }}">{{ b.status }}</span></td>
         <td class="num">{{ '%.6f' % b.quantity }}</td>
+        <td class="num">{{ '%.2f' % b.notional_entry }}</td>
+        <td class="num">{{ '%.2f' % b.notional_now }}</td>
         <td class="muted">{{ b.opened_at }}</td>
         <td class="muted">{{ b.closed_at or '—' }}</td>
         <td class="num {{ 'good' if b.trade_pnl >= 0 else 'bad' }}">{{ '%+.4f' % b.trade_pnl }}</td>

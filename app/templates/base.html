@@ -115,6 +115,16 @@
     }
     document.querySelectorAll('time[data-utc]').forEach(localize);
   })();
+
+  // Toggle the detail row underneath a position row.
+  function togglePositionDetail(id, btn) {
+    var detail = document.getElementById('detail-' + id);
+    if (!detail) return;
+    var willShow = detail.hasAttribute('hidden');
+    if (willShow) { detail.removeAttribute('hidden'); } else { detail.setAttribute('hidden', ''); }
+    btn.textContent = willShow ? '▼' : '▶';
+    btn.setAttribute('aria-expanded', willShow ? 'true' : 'false');
+  }
 </script>
 </body>
 </html>

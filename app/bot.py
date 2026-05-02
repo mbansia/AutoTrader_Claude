@@ -229,22 +229,38 @@ def _compute_equity_and_free(db, gateway: BinanceGateway, mode: str, cfg: Strate
     fut_total = float((bals['futures'].get('USDT') or {}).get('total') or 0)
     spot_free = float((bals['spot'].get('USDT') or {}).get('free') or 0)
     fut_free = float((bals['futures'].get('USDT') or {}).get('free') or 0)
-    total_equity = spot_total + fut_total + earn.deployed_usdt
+    # IMPORTANT: spot.USDT.total only counts USDT — the base assets the bot bought
+    # on the spot leg (SOL, ETH etc.) live in their own balance entries. Without
+    # adding them back as USDT-equivalent, equity appears to drop by the full
+    # position notional every time we open a trade. Walk our tracked positions
+    # and price each held base back into USDT.
+    spot_assets_value = 0.0
+    open_ps = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all()
+    seen_assets: set[str] = set()
+    for p in open_ps:
+        base = p.spot_symbol.split('/')[0]
+        if base in seen_assets:
+            continue
+        seen_assets.add(base)
+        qty = float((bals['spot'].get(base) or {}).get('total') or 0)
+        if qty > 0:
+            px = gateway.safe_price(p.spot_symbol) or p.spot_entry_price or 0
+            spot_assets_value += qty * px
+    total_equity = spot_total + fut_total + spot_assets_value + earn.deployed_usdt
     return total_equity, min(spot_free, fut_free)
 
 
 def _take_balance_snapshot(db, gateway: BinanceGateway, mode: str, cfg: StrategyConfig, earn: EarnState) -> BalanceSnapshot:
+    # Both modes share the live/paper-aware equity calc which already includes
+    # spot asset values for tracked positions in live mode.
+    total_equity, _ = _compute_equity_and_free(db, gateway, mode, cfg, earn)
     if mode == MODE_LIVE:
         bals = gateway.safe_balances()
-        if bals is not None:
-            spot = float((bals['spot'].get('USDT') or {}).get('total') or 0)
-            fut = float((bals['futures'].get('USDT') or {}).get('total') or 0)
-            snap = BalanceSnapshot(spot_usdt=spot, futures_usdt=fut, total_usdt=spot + fut + earn.deployed_usdt, source=MODE_LIVE)
-            db.add(snap)
-            db.flush()
-            return snap
-    total_equity, _ = _compute_equity_and_free(db, gateway, mode, cfg, earn)
-    snap = BalanceSnapshot(spot_usdt=total_equity, futures_usdt=0.0, total_usdt=total_equity, source=mode)
+        spot = float((bals['spot'].get('USDT') or {}).get('total') or 0) if bals else 0.0
+        fut = float((bals['futures'].get('USDT') or {}).get('total') or 0) if bals else 0.0
+        snap = BalanceSnapshot(spot_usdt=spot, futures_usdt=fut, total_usdt=total_equity, source=MODE_LIVE)
+    else:
+        snap = BalanceSnapshot(spot_usdt=total_equity, futures_usdt=0.0, total_usdt=total_equity, source=mode)
     db.add(snap)
     db.flush()
     return snap
