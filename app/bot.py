@@ -459,8 +459,19 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                             scan_action = 'basis_too_wide'
                             continue
                         qty = sized_notional / max(0.0001, spot_px)
-                        s = gateway.create_spot_buy(c.spot_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-                        f = gateway.create_perp_short(c.perp_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+                        # Place spot buy first. If it fails (insufficient balance, min-notional,
+                        # market down), skip the candidate and continue scanning.
+                        try:
+                            s = gateway.create_spot_buy(c.spot_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+                        except Exception as e:
+                            err = str(e)[:140]
+                            log_event(db, f'Spot buy failed for {c.spot_symbol}: {err}', mode=mode, level='ERROR')
+                            db.add(RejectedCandidate(mode=mode, symbol=c.perp_symbol, reason=f'spot_buy_error: {err[:80]}', funding_rate=c.funding_apr))
+                            scan_action = 'spot_buy_error'
+                            continue
+
+                        # Spot succeeded. Persist the half-built position immediately so the
+                        # rollback path (or next-cycle hedge check) has a row to attach to.
                         pos = Position(
                             mode=mode,
                             symbol=c.spot_symbol.split('/')[0],
@@ -471,15 +482,37 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                             last_funding_rate=c.funding_rate,
                             funding_interval_hours=c.funding_interval_hours,
                             spot_entry_price=float(s.get('price') or 0),
-                            perp_entry_price=float(f.get('price') or 0),
+                            perp_entry_price=0.0,
                             last_funding_accrual_ts=datetime.utcnow(),
                         )
                         db.add(pos)
                         db.flush()
                         record_trade(db, pos.id, mode, c.spot_symbol, 'spot', 'buy', qty, s)
+
+                        # Now the perp short. If it fails, immediately flatten the spot leg —
+                        # otherwise we're left holding naked SOL/ETH/etc. with no hedge.
+                        try:
+                            f = gateway.create_perp_short(c.perp_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+                        except Exception as e:
+                            err = str(e)[:140]
+                            log_event(db, f'Perp short failed for {c.perp_symbol} after spot bought: {err} — rolling back spot leg', mode=mode, level='ERROR')
+                            try:
+                                rev = gateway.close_spot(c.spot_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+                                record_trade(db, pos.id, mode, c.spot_symbol, 'spot', 'sell', qty, rev)
+                                pos.status = 'closed'
+                                pos.closed_at = datetime.utcnow()
+                                log_event(db, f'Rolled back spot leg of {c.perp_symbol}; loss ≈ entry+exit fees + slippage', mode=mode)
+                            except Exception as e2:
+                                log_event(db, f'CRITICAL: spot rollback failed: {str(e2)[:140]}. {c.spot_symbol} is naked-long; hedge check will retry next cycle.', mode=mode, level='ERROR')
+                            db.add(RejectedCandidate(mode=mode, symbol=c.perp_symbol, reason=f'perp_short_error: {err[:80]}', funding_rate=c.funding_apr))
+                            scan_action = 'perp_short_error'
+                            continue
+
+                        # Both legs filled — finalize.
+                        pos.perp_entry_price = float(f.get('price') or 0)
                         record_trade(db, pos.id, mode, c.perp_symbol, 'futures', 'sell', qty, f)
                         scan_action = f'opened {c.perp_symbol}'
-                        log_event(db, f'Opened {c.perp_symbol} qty={qty:.6f} apr={c.funding_apr:.2%}', mode=mode)
+                        log_event(db, f'Opened {c.perp_symbol} qty={qty:.6f} apy={c.funding_apr:.2%}', mode=mode)
                         break
             else:
                 if not mstate.entry_enabled:
