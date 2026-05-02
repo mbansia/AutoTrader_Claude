@@ -6,6 +6,32 @@
 </div>
 
 <div class="card">
+  <h3>Binance API key — outbound IP</h3>
+  <div class="body">
+    {% if outbound_ip %}
+      <p class="muted" style="margin:0 0 10px;">Paste this into Binance → API Management → your key → "Edit restrictions" → trusted-IP list. The bot resolves this through a public lookup service and caches it for an hour.</p>
+      <div class="row-flex" style="gap:10px;">
+        <code id="outbound-ip" class="mono" style="background:var(--panel-2);padding:8px 14px;border-radius:6px;font-size:15px;border:1px solid var(--border-strong);">{{ outbound_ip }}</code>
+        <button type="button" class="btn" onclick="navigator.clipboard.writeText('{{ outbound_ip }}'); this.textContent='Copied'; setTimeout(()=>{this.textContent='Copy'}, 1200);">Copy</button>
+        <form action="/safety" method="get" style="display:inline">
+          <input type="hidden" name="refresh_ip" value="1">
+          <button type="submit" class="btn">Refresh</button>
+        </form>
+      </div>
+    {% else %}
+      <div class="alert alert-error">
+        Couldn't determine outbound IP{% if outbound_ip_error %}: <span class="mono">{{ outbound_ip_error|truncate(120) }}</span>{% endif %}.
+        Try clicking refresh, or run <code class="mono">curl -s https://api.ipify.org</code> from your Coolify Terminal tab.
+      </div>
+      <form action="/safety" method="get" style="display:inline">
+        <input type="hidden" name="refresh_ip" value="1">
+        <button type="submit" class="btn">Retry</button>
+      </form>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card">
   <h3>Per-mode runtime state</h3>
   <table>
     <thead><tr><th>Mode</th><th>Entries</th><th>Exits</th><th>Maintenance</th></tr></thead>

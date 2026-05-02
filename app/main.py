@@ -49,6 +49,7 @@ from app.models import (
     ScanResult,
     Trade,
 )
+from app.network import get_outbound_ip
 from app.safety import basis_bps
 
 app = FastAPI(title='Funding Arb Bot')
@@ -574,10 +575,13 @@ def save_config(
 
 
 @app.get('/safety', response_class=HTMLResponse)
-def safety_page(request: Request, view: str | None = None, view_cookie: str | None = Cookie(default=None, alias='view'), _: None = Depends(auth)):
+def safety_page(request: Request, view: str | None = None, refresh_ip: int = 0, view_cookie: str | None = Cookie(default=None, alias='view'), _: None = Depends(auth)):
     v = _resolve_view(view, view_cookie)
+    outbound_ip, ip_error = get_outbound_ip(force=bool(refresh_ip))
     with SessionLocal() as db:
         ctx = _shared_ctx(request, v, db)
         ctx['active'] = 'safety'
         ctx['cfg'] = get_strategy_config(db)
+        ctx['outbound_ip'] = outbound_ip
+        ctx['outbound_ip_error'] = ip_error
     return templates.TemplateResponse(request, 'safety.html', ctx)
