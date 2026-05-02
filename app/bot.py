@@ -40,6 +40,10 @@ CAPITAL_FLOW_THRESHOLD_USDT = 50.0
 # Module-level dedup so we only log "live API down" once per outage instead of every cycle.
 _LIVE_API_UNHEALTHY_LOGGED = False
 
+# Per-position close error dedup. Same (position_id, leg, error_msg) tuple suppresses
+# a duplicate ERROR row on consecutive cycles. Cleared when the close succeeds.
+_CLOSE_ERROR_CACHE: dict[tuple[int, str], str] = {}
+
 
 def log_event(db, message: str, mode: str = MODE_PAPER, level: str = 'INFO'):
     db.add(BotEvent(mode=mode, level=level, message=message))
@@ -153,28 +157,59 @@ def record_trade(db, position_id: int | None, mode: str, symbol: str, venue: str
     db.add(Trade(mode=mode, position_id=position_id, symbol=symbol, venue=venue, side=side, quantity=qty, price=float(order.get('price') or 0), fee=float((order.get('fee') or {}).get('cost') or 0)))
 
 
+def _log_close_error(db, p: Position, leg: str, err: str) -> None:
+    """Record a close-leg error, but only if it's different from the last one we
+    logged for this (position, leg). Stops the same 'Margin is insufficient'
+    line from spamming the Logs tab on every cycle."""
+    key = (p.id, leg)
+    snippet = err[:140]
+    if _CLOSE_ERROR_CACHE.get(key) == snippet:
+        return  # already logged this exact error for this leg
+    _CLOSE_ERROR_CACHE[key] = snippet
+    log_event(db, f'Failed to close {leg} leg of {p.perp_symbol}: {snippet} (will retry next cycle)', mode=p.mode, level='ERROR')
+
+
+def _try_fund_close_margin(gateway: BinanceGateway, cfg: StrategyConfig) -> None:
+    """Closing a perp short requires a tiny bit of free margin in the futures wallet
+    (for the close-side fee + any unrealized PnL slippage). If futures.free is dust,
+    transfer a small buffer from spot so the close goes through."""
+    if not cfg.auto_transfer_enabled:
+        return
+    bals = gateway.safe_balances() or {}
+    fut_free = float((bals.get('futures', {}).get('USDT') or {}).get('free') or 0)
+    spot_free = float((bals.get('spot', {}).get('USDT') or {}).get('free') or 0)
+    if fut_free >= 1.0 or spot_free <= 0.5:
+        return
+    transfer = min(2.0, max(0.5, spot_free - 0.1))
+    gateway.transfer_spot_to_futures(transfer, False)
+
+
 def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyConfig, reason: str) -> None:
     """Close both legs of a position. Wrap each call so a single Binance error
     (insufficient balance, market halted, etc.) doesn't crash the entire cycle.
     If one leg fails to close, the position stays open and check_hedge will
-    retry on the next cycle."""
+    retry on the next cycle. Errors are deduped per (position, leg)."""
     paper = (p.mode == MODE_PAPER)
+    if not paper:
+        _try_fund_close_margin(gateway, cfg)
     spot_ok = perp_ok = False
     try:
         s = gateway.close_spot(p.spot_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
         record_trade(db, p.id, p.mode, p.spot_symbol, 'spot', 'sell', p.quantity, s)
         spot_ok = True
     except Exception as e:
-        log_event(db, f'Failed to close spot leg of {p.perp_symbol}: {str(e)[:140]} (will retry next cycle)', mode=p.mode, level='ERROR')
+        _log_close_error(db, p, 'spot', str(e))
     try:
         f = gateway.close_perp(p.perp_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
         record_trade(db, p.id, p.mode, p.perp_symbol, 'futures', 'buy', p.quantity, f)
         perp_ok = True
     except Exception as e:
-        log_event(db, f'Failed to close perp leg of {p.perp_symbol}: {str(e)[:140]} (will retry next cycle)', mode=p.mode, level='ERROR')
+        _log_close_error(db, p, 'perp', str(e))
     if spot_ok and perp_ok:
         p.status = 'closed'
         p.closed_at = datetime.utcnow()
+        _CLOSE_ERROR_CACHE.pop((p.id, 'spot'), None)
+        _CLOSE_ERROR_CACHE.pop((p.id, 'perp'), None)
         log_event(db, f'Closed {p.perp_symbol} ({reason}); realized={position_realized_pnl(db, p):+.4f}', mode=p.mode)
     elif spot_ok or perp_ok:
         # Partial close — surface clearly. Hedge check will recover on the next cycle.
@@ -490,34 +525,36 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                     scan_action = 'no_fill'
                     desired_notional = cfg.max_position_pct * total_equity
                     min_notional = cfg.min_position_pct * total_equity
-                    for c in passing[:5]:
-                        if db.scalar(select(Position).where(Position.perp_symbol == c.perp_symbol, Position.status == 'open', Position.mode == mode)):
-                            continue
-                        # Step 1: redeem from Earn into spot if the spot leg is short.
-                        if cfg.earn_enabled and spot_free < desired_notional and earn.deployed_usdt > 0:
-                            need = min(desired_notional - spot_free, earn.deployed_usdt)
+
+                    # Top up spot from Earn (once per cycle, not per candidate).
+                    if cfg.earn_enabled and spot_free < desired_notional and earn.deployed_usdt > 0.10:
+                        need = min(desired_notional - spot_free, earn.deployed_usdt)
+                        if need >= 0.10:
                             ok, err = gateway.earn_redeem(need, paper)
                             if ok:
                                 earn.deployed_usdt -= need
                                 spot_free += need
-                                log_event(db, f'Redeemed {need:.2f} USDT from earn before opening {c.perp_symbol}', mode=mode)
+                                log_event(db, f'Redeemed {need:.4f} USDT from earn before opening', mode=mode)
                             else:
                                 earn.last_error = err
-                                log_event(db, f'Earn redeem failed for {c.perp_symbol}: {err}', mode=mode, level='WARN')
-                        # Step 2: live-only — transfer USDT spot→futures so the perp leg has margin.
-                        # Conservative target: full notional (works at any leverage). We only transfer
-                        # what spot can spare beyond its own desired_notional to keep the spot buy fundable.
-                        if mode == MODE_LIVE and cfg.auto_transfer_enabled and fut_free < desired_notional and spot_free > desired_notional:
-                            transfer = min(desired_notional - fut_free, spot_free - desired_notional)
-                            if transfer > 0.5:
-                                ok, err = gateway.transfer_spot_to_futures(transfer, paper)
-                                if ok:
-                                    spot_free -= transfer
-                                    fut_free += transfer
-                                    log_event(db, f'Auto-transferred {transfer:.2f} USDT spot→futures for {c.perp_symbol} margin', mode=mode)
-                                else:
-                                    log_event(db, f'spot→futures transfer failed: {err}', mode=mode, level='WARN')
-                        # Step 3: size based on the binding constraint across both legs.
+                                log_event(db, f'Earn redeem failed: {err}', mode=mode, level='WARN')
+
+                    # Transfer spot→futures so the perp leg has margin (once per cycle).
+                    if mode == MODE_LIVE and cfg.auto_transfer_enabled and fut_free < desired_notional and spot_free > desired_notional:
+                        transfer = min(desired_notional - fut_free, spot_free - desired_notional)
+                        if transfer > 0.5:
+                            ok, err = gateway.transfer_spot_to_futures(transfer, paper)
+                            if ok:
+                                spot_free -= transfer
+                                fut_free += transfer
+                                log_event(db, f'Auto-transferred {transfer:.2f} USDT spot→futures for perp margin', mode=mode)
+                            else:
+                                log_event(db, f'spot→futures transfer failed: {err}', mode=mode, level='WARN')
+
+                    for c in passing[:5]:
+                        if db.scalar(select(Position).where(Position.perp_symbol == c.perp_symbol, Position.status == 'open', Position.mode == mode)):
+                            continue
+                        # Size based on the binding constraint across both legs.
                         free_for_arb = min(spot_free, fut_free)
                         sized_notional = min(free_for_arb * 0.97, desired_notional)
                         if sized_notional < min_notional:

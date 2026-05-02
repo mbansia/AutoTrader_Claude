@@ -220,6 +220,10 @@ class BinanceGateway:
     def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
         if paper_mode:
             return True, 'paper'
+        # Binance flexible USDT redeem has a minimum amount; sending 0.00 returns
+        # an "amount malformed" -1102 error. Skip clearly-too-small calls.
+        if amount_usdt < 0.10:
+            return False, f'amount {amount_usdt:.4f} below redeem minimum'
         pid = self.earn_product_id_usdt()
         if not pid:
             return False, 'no flexible USDT product id'
@@ -228,7 +232,7 @@ class BinanceGateway:
                 'sapiV1PostSimpleEarnFlexibleRedeem',
                 'sapi_v1_post_simple_earn_flexible_redeem',
                 'sapiPostSimpleEarnFlexibleRedeem',
-            ), {'productId': pid, 'amount': f'{amount_usdt:.2f}', 'destAccount': 'SPOT'})
+            ), {'productId': pid, 'amount': f'{amount_usdt:.4f}', 'destAccount': 'SPOT'})
         except Exception as e:
             return False, str(e)
         if resp is None:

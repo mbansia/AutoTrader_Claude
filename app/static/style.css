@@ -399,7 +399,8 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
   transition: background 120ms ease, color 120ms ease;
 }
 .row-toggle:hover { background: var(--panel-2); color: var(--text); }
-tr.position-detail > td { background: var(--bg); padding: 16px 20px; }
+.table-wrapper { width: 100%; overflow-x: auto; }
+.position-detail-panel { padding: 16px 18px; border-top: 1px solid var(--border); background: var(--bg); }
 .leg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
 .leg-card {
   background: var(--panel);
