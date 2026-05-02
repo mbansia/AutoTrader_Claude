@@ -100,6 +100,21 @@
       render();
     });
   })();
+
+  // Convert every <time data-utc="..."> on the page to the browser's local time.
+  (function() {
+    var pad = function(n) { return String(n).padStart(2, '0'); };
+    function localize(el) {
+      var iso = el.getAttribute('data-utc');
+      if (!iso) return;
+      var d = new Date(iso);
+      if (isNaN(d.getTime())) return;
+      el.textContent = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+                       ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+      el.title = iso + ' (UTC)';
+    }
+    document.querySelectorAll('time[data-utc]').forEach(localize);
+  })();
 </script>
 </body>
 </html>

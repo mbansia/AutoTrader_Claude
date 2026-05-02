@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from markupsafe import Markup
 from sqlalchemy import desc, func, select
 
 from app.bot import (
@@ -111,10 +112,16 @@ def root():
     return RedirectResponse(url='/dashboard', status_code=303)
 
 
-def _fmt_ts(dt: datetime | None) -> str:
+def _fmt_ts(dt: datetime | None):
+    """Render a UTC datetime as a <time data-utc> element so client-side JS can
+    swap it for the browser's local time. The UTC fallback text is what
+    JS-disabled clients see; modern browsers will replace .textContent on load.
+    """
     if dt is None:
-        return '—'
-    return dt.strftime('%Y-%m-%d %H:%M:%S')
+        return Markup('—')
+    iso = dt.replace(microsecond=0).isoformat() + 'Z'
+    fallback = dt.strftime('%Y-%m-%d %H:%M:%S') + ' UTC'
+    return Markup(f'<time data-utc="{iso}">{fallback}</time>')
 
 
 def _fmt_age(delta: timedelta) -> str:
