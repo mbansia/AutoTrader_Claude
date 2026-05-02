@@ -6,15 +6,22 @@
 </div>
 
 <div class="card">
-  <h3>Live runtime state</h3>
+  <h3>Per-mode runtime state</h3>
   <table>
+    <thead><tr><th>Mode</th><th>Entries</th><th>Exits</th><th>Maintenance</th></tr></thead>
     <tbody>
-      <tr><th>Trading mode</th><td><span class="tag {{ 'good' if state.paper_mode else 'bad' }}">{{ 'PAPER' if state.paper_mode else 'LIVE' }}</span></td></tr>
-      <tr><th>Maintenance mode</th><td><span class="tag {{ 'warn' if state.maintenance_mode else 'good' }}">{{ 'ON — closing all positions then exiting' if state.maintenance_mode else 'off' }}</span></td></tr>
-      <tr><th>Entry switch</th><td><span class="tag {{ 'good' if cfg.entry_enabled else 'bad' }}">{{ 'enabled' if cfg.entry_enabled else 'DISABLED' }}</span></td></tr>
-      <tr><th>Exit switch</th><td><span class="tag {{ 'good' if cfg.exit_enabled else 'bad' }}">{{ 'enabled' if cfg.exit_enabled else 'DISABLED' }}</span></td></tr>
-      <tr><th>Hedge check</th><td><span class="tag {{ 'good' if cfg.enforce_hedge_check else 'warn' }}">{{ 'enabled' if cfg.enforce_hedge_check else 'OFF' }}</span></td></tr>
-      <tr><th>Delisting check</th><td><span class="tag {{ 'good' if cfg.delisting_check else 'warn' }}">{{ 'enabled' if cfg.delisting_check else 'OFF' }}</span></td></tr>
+      <tr>
+        <th>PAPER</th>
+        <td><span class="tag {{ 'good' if paper_state.entry_enabled else 'bad' }}">{{ 'enabled' if paper_state.entry_enabled else 'OFF' }}</span></td>
+        <td><span class="tag {{ 'good' if paper_state.exit_enabled else 'bad' }}">{{ 'enabled' if paper_state.exit_enabled else 'OFF' }}</span></td>
+        <td><span class="tag {{ 'warn' if paper_state.maintenance_mode else 'good' }}">{{ 'ON' if paper_state.maintenance_mode else 'off' }}</span></td>
+      </tr>
+      <tr>
+        <th>LIVE</th>
+        <td><span class="tag {{ 'good' if live_state.entry_enabled else 'bad' }}">{{ 'enabled' if live_state.entry_enabled else 'OFF' }}</span></td>
+        <td><span class="tag {{ 'good' if live_state.exit_enabled else 'bad' }}">{{ 'enabled' if live_state.exit_enabled else 'OFF' }}</span></td>
+        <td><span class="tag {{ 'warn' if live_state.maintenance_mode else 'good' }}">{{ 'ON' if live_state.maintenance_mode else 'off' }}</span></td>
+      </tr>
     </tbody>
   </table>
 </div>

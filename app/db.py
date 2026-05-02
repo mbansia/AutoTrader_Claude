@@ -43,3 +43,6 @@ def run_schema_migrations() -> None:
     _add_column_if_missing('strategy_config', 'max_exit_basis_bps', 'FLOAT NOT NULL DEFAULT 5.0')
     _add_column_if_missing('strategy_config', 'enforce_hedge_check', 'BOOLEAN NOT NULL DEFAULT 1')
     _add_column_if_missing('strategy_config', 'delisting_check', 'BOOLEAN NOT NULL DEFAULT 1')
+    # Mode tagging — added when paper/live data was segregated.
+    for table in ('positions', 'trades', 'equity_curve', 'rejected_candidates', 'bot_events', 'capital_flows', 'scan_results'):
+        _add_column_if_missing(table, 'mode', "VARCHAR(8) NOT NULL DEFAULT 'paper'")

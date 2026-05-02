@@ -6,9 +6,17 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db import Base
 
 
+# Bot trading-mode tag attached to every per-row record so paper and live data
+# never mix in the dashboard. Values: 'paper' | 'live'.
+MODE_PAPER = 'paper'
+MODE_LIVE = 'live'
+ALL_MODES = (MODE_PAPER, MODE_LIVE)
+
+
 class Position(Base):
     __tablename__ = 'positions'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mode: Mapped[str] = mapped_column(String(8), default=MODE_PAPER, index=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
     spot_symbol: Mapped[str] = mapped_column(String(32))
     perp_symbol: Mapped[str] = mapped_column(String(32))
@@ -26,6 +34,7 @@ class Position(Base):
 class Trade(Base):
     __tablename__ = 'trades'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mode: Mapped[str] = mapped_column(String(8), default=MODE_PAPER, index=True)
     position_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
     venue: Mapped[str] = mapped_column(String(16))
@@ -39,6 +48,7 @@ class Trade(Base):
 class EquityCurve(Base):
     __tablename__ = 'equity_curve'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mode: Mapped[str] = mapped_column(String(8), default=MODE_PAPER, index=True)
     ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     equity_usdt: Mapped[float] = mapped_column(Float)
 
@@ -46,6 +56,7 @@ class EquityCurve(Base):
 class RejectedCandidate(Base):
     __tablename__ = 'rejected_candidates'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mode: Mapped[str] = mapped_column(String(8), default=MODE_PAPER, index=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
     reason: Mapped[str] = mapped_column(Text)
     funding_rate: Mapped[float] = mapped_column(Float, default=0.0)
@@ -55,12 +66,25 @@ class RejectedCandidate(Base):
 class BotEvent(Base):
     __tablename__ = 'bot_events'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mode: Mapped[str] = mapped_column(String(8), default=MODE_PAPER, index=True)
     level: Mapped[str] = mapped_column(String(16), default='INFO')
     message: Mapped[str] = mapped_column(Text)
     ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     requires_action: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class ModeState(Base):
+    """Per-mode kill-switch / maintenance state. Two rows: 'paper' and 'live'."""
+    __tablename__ = 'mode_state'
+    mode: Mapped[str] = mapped_column(String(8), primary_key=True)
+    entry_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    exit_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    maintenance_mode: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# Legacy single-row "active mode" table. Retained so existing DBs don't break,
+# but the bot no longer reads paper_mode for routing — both modes run.
 class RuntimeState(Base):
     __tablename__ = 'runtime_state'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -72,9 +96,6 @@ class RuntimeState(Base):
 class StrategyConfig(Base):
     __tablename__ = 'strategy_config'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    # Funding-rate thresholds are stored as annualized decimals (APR).
-    # 0.20 = 20% APR. The bot annualizes each candidate's period rate using
-    # its funding interval (4h or 8h on Binance) before comparing.
     entry_funding_threshold: Mapped[float] = mapped_column(Float, default=0.20)
     exit_funding_threshold: Mapped[float] = mapped_column(Float, default=0.05)
     max_hold_hours: Mapped[int] = mapped_column(Integer, default=72)
@@ -104,12 +125,14 @@ class BalanceSnapshot(Base):
     spot_usdt: Mapped[float] = mapped_column(Float, default=0.0)
     futures_usdt: Mapped[float] = mapped_column(Float, default=0.0)
     total_usdt: Mapped[float] = mapped_column(Float, default=0.0)
-    source: Mapped[str] = mapped_column(String(16), default='live')
+    # 'paper' or 'live' — predates the formal `mode` convention; kept compatible.
+    source: Mapped[str] = mapped_column(String(16), default=MODE_PAPER, index=True)
 
 
 class CapitalFlow(Base):
     __tablename__ = 'capital_flows'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mode: Mapped[str] = mapped_column(String(8), default=MODE_PAPER, index=True)
     ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     amount_usdt: Mapped[float] = mapped_column(Float)
     kind: Mapped[str] = mapped_column(String(16), default='deposit')
@@ -120,6 +143,7 @@ class CapitalFlow(Base):
 class ScanResult(Base):
     __tablename__ = 'scan_results'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mode: Mapped[str] = mapped_column(String(8), default=MODE_PAPER, index=True)
     ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     candidates_total: Mapped[int] = mapped_column(Integer, default=0)
     candidates_passing: Mapped[int] = mapped_column(Integer, default=0)

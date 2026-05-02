@@ -6,13 +6,24 @@
   <title>{% block title %}Funding Arb{% endblock %}</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body class="view-{{ view }}">
 <div class="app">
   <aside class="sidebar">
     <h1>Funding Arb</h1>
     <div class="subtitle">Binance · Spot/Perp</div>
-    <span class="mode-pill {{ 'paper' if state.paper_mode else 'live' }}">{{ 'PAPER' if state.paper_mode else 'LIVE' }}</span>
-    {% if state.maintenance_mode %}<span class="mode-pill warn" style="background:#451a03;color:#fbbf24;">MAINTENANCE</span>{% endif %}
+    <div class="view-tabs">
+      <form action="/view/paper" method="post" style="margin:0">
+        <button type="submit" class="view-tab {{ 'active' if view == 'paper' }}">PAPER</button>
+      </form>
+      <form action="/view/live" method="post" style="margin:0">
+        <button type="submit" class="view-tab {{ 'active' if view == 'live' }} live">LIVE</button>
+      </form>
+    </div>
+    {% set ms = paper_state if view == 'paper' else live_state %}
+    <div class="mode-status">
+      <span class="tag {{ 'good' if ms.entry_enabled else 'bad' }}">entries {{ 'on' if ms.entry_enabled else 'off' }}</span>
+      {% if ms.maintenance_mode %}<span class="tag warn">maintenance</span>{% endif %}
+    </div>
     <ul class="nav">
       <li><a href="/dashboard" class="{{ 'active' if active=='dashboard' }}">Dashboard</a></li>
       <li><a href="/positions" class="{{ 'active' if active=='positions' }}">Open positions</a></li>
@@ -23,6 +34,26 @@
     </ul>
   </aside>
   <main class="main">
+    <div class="view-banner view-banner-{{ view }}">
+      <strong>{{ 'PAPER' if view == 'paper' else 'LIVE' }}</strong> view —
+      {% if view == 'paper' %}
+        synthetic fills with modeled slippage and fees. No real funds at risk.
+      {% else %}
+        real money on Binance. Every entry, exit and balance is live.
+      {% endif %}
+      <span class="spacer"></span>
+      <form action="/mode/{{ view }}/stop" method="post" style="display:inline;margin:0">
+        <button type="submit" class="btn btn-warn" {{ 'disabled' if not ms.entry_enabled }}>STOP</button>
+      </form>
+      <form action="/mode/{{ view }}/exit-all-stop" method="post" style="display:inline;margin:0" onsubmit="return confirm('Market-close every {{ view }} position and disable entries?');">
+        <button type="submit" class="btn btn-danger">EXIT ALL &amp; STOP</button>
+      </form>
+      {% if not ms.entry_enabled or ms.maintenance_mode %}
+      <form action="/mode/{{ view }}/start" method="post" style="display:inline;margin:0">
+        <button type="submit" class="btn btn-primary">RESUME</button>
+      </form>
+      {% endif %}
+    </div>
     {% block content %}{% endblock %}
   </main>
 </div>

@@ -7,15 +7,6 @@
     <form action="/run-once" method="post" style="display:inline">
       <button class="btn" type="submit">Run one cycle</button>
     </form>
-    <form action="/mode" method="post" style="display:inline">
-      <input type="hidden" name="mode" value="{{ 'paper' if not state.paper_mode else 'live' }}">
-      {% if state.paper_mode %}
-        <input name="confirm" placeholder="Type LIVE" style="background:var(--panel-2);color:var(--text);border:1px solid var(--border);padding:6px 8px;border-radius:6px;">
-        <button class="btn btn-danger" type="submit">Switch to LIVE</button>
-      {% else %}
-        <button class="btn btn-primary" type="submit">Switch to PAPER</button>
-      {% endif %}
-    </form>
   </div>
 </div>
 
@@ -61,7 +52,7 @@
 </div>
 
 <div class="card">
-  <h3>Equity curve (last 60 snapshots)</h3>
+  <h3>Equity curve ({{ view|upper }}, last 60 snapshots)</h3>
   <div class="body">
     {% if equity_points %}
     <svg class="equity-spark" viewBox="0 0 600 110" preserveAspectRatio="none">
@@ -101,7 +92,7 @@
       <div class="empty">No passing candidates in latest scan.</div>
       {% endif %}
     {% else %}
-      <div class="empty">No scans recorded yet.</div>
+      <div class="empty">No scans recorded for {{ view|upper }} yet.</div>
     {% endif %}
   </div>
 </div>

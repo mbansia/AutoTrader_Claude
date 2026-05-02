@@ -82,16 +82,9 @@
 </div>
 
 <div class="card">
-  <h3>Kill switches</h3>
-  <div class="body">
-    <div class="form-grid">
-      <div class="form-row"><label>Entry enabled</label>
-        <select name="entry_enabled"><option value="1" {{ 'selected' if cfg.entry_enabled }}>yes</option><option value="0" {{ 'selected' if not cfg.entry_enabled }}>no</option></select>
-        <span class="hint">disable to stop opening new positions while keeping exits running</span></div>
-      <div class="form-row"><label>Exit enabled</label>
-        <select name="exit_enabled"><option value="1" {{ 'selected' if cfg.exit_enabled }}>yes</option><option value="0" {{ 'selected' if not cfg.exit_enabled }}>no</option></select>
-        <span class="hint">disable only to investigate; positions won't close automatically</span></div>
-    </div>
+  <h3>Per-mode kill switches</h3>
+  <div class="body muted" style="font-size:13px;">
+    Use the <strong>STOP</strong> and <strong>EXIT ALL &amp; STOP</strong> buttons in the header (above) to toggle entries and force-close per mode. They persist on the per-mode state row, independent of strategy parameters.
   </div>
 </div>
 

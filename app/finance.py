@@ -26,13 +26,19 @@ def position_unrealized_pnl(position: Position, spot_now: float, perp_now: float
     return spot_leg + perp_leg
 
 
-def total_realized_pnl(db) -> float:
-    closed = db.scalars(select(Position).where(Position.status == 'closed')).all()
+def total_realized_pnl(db, mode: str | None = None) -> float:
+    stmt = select(Position).where(Position.status == 'closed')
+    if mode is not None:
+        stmt = stmt.where(Position.mode == mode)
+    closed = db.scalars(stmt).all()
     return sum(position_realized_pnl(db, p) for p in closed)
 
 
-def net_capital_in(db) -> float:
-    flows = db.scalars(select(CapitalFlow)).all()
+def net_capital_in(db, mode: str | None = None) -> float:
+    stmt = select(CapitalFlow)
+    if mode is not None:
+        stmt = stmt.where(CapitalFlow.mode == mode)
+    flows = db.scalars(stmt).all()
     return sum(f.amount_usdt for f in flows)
 
 
@@ -72,9 +78,12 @@ def xirr(flows: Iterable[tuple[datetime, float]], guess: float = 0.1, max_iter: 
     return None
 
 
-def portfolio_xirr(db, current_equity: float, now: datetime | None = None) -> float | None:
+def portfolio_xirr(db, current_equity: float, mode: str | None = None, now: datetime | None = None) -> float | None:
     now = now or datetime.utcnow()
-    flows = db.scalars(select(CapitalFlow)).all()
+    stmt = select(CapitalFlow)
+    if mode is not None:
+        stmt = stmt.where(CapitalFlow.mode == mode)
+    flows = db.scalars(stmt).all()
     cf: list[tuple[datetime, float]] = []
     for f in flows:
         cf.append((f.ts, -f.amount_usdt))
