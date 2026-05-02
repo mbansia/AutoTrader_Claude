@@ -19,7 +19,7 @@ from app.config import (
 )
 from app.db import SessionLocal
 from app.exchange import BinanceGateway
-from app.models import BotEvent, EquityCurve, Position, RejectedCandidate, RuntimeState, StrategyConfig, Trade
+from app.models import BotEvent, EquityCurve, Position, RejectedCandidate, RuntimeState, Trade
 
 
 def log_event(db, message: str, level: str = 'INFO'):
@@ -37,15 +37,6 @@ def get_runtime_state(db) -> RuntimeState:
 
 def record_trade(db, position_id: int | None, symbol: str, venue: str, side: str, qty: float, order: dict):
     db.add(Trade(position_id=position_id, symbol=symbol, venue=venue, side=side, quantity=qty, price=float(order.get('price') or 0), fee=float((order.get('fee') or {}).get('cost') or 0)))
-
-
-def get_strategy_config(db) -> StrategyConfig:
-    cfg = db.scalar(select(StrategyConfig).where(StrategyConfig.id == 1))
-    if cfg is None:
-        cfg = StrategyConfig(id=1)
-        db.add(cfg)
-        db.flush()
-    return cfg
 
 
 def reconcile_positions(gateway: BinanceGateway) -> None:

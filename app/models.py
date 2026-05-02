@@ -66,18 +66,3 @@ class RuntimeState(Base):
     paper_mode: Mapped[bool] = mapped_column(Boolean, default=True)
     maintenance_mode: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-
-
-class StrategyConfig(Base):
-    __tablename__ = 'strategy_config'
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    min_yield: Mapped[float] = mapped_column(Float, default=0.0002)
-    exit_yield: Mapped[float] = mapped_column(Float, default=0.00005)
-    min_volume: Mapped[float] = mapped_column(Float, default=100000.0)
-    max_hold_hours: Mapped[int] = mapped_column(Integer, default=72)
-    max_open_positions: Mapped[int] = mapped_column(Integer, default=1)
-    max_trades_per_day: Mapped[int] = mapped_column(Integer, default=8)
-    max_position_notional: Mapped[float] = mapped_column(Float, default=10.0)
-    min_symbol_notional: Mapped[float] = mapped_column(Float, default=5.0)
-    injected_capital_usdt: Mapped[float] = mapped_column(Float, default=20.0)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
