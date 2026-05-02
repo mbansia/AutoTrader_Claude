@@ -17,6 +17,7 @@ from app.models import (
     BalanceSnapshot,
     BotEvent,
     CapitalFlow,
+    EarnState,
     EquityCurve,
     ModeState,
     Position,
@@ -58,6 +59,44 @@ def get_mode_state(db, mode: str) -> ModeState:
         db.add(state)
         db.flush()
     return state
+
+
+def get_earn_state(db, mode: str) -> EarnState:
+    state = db.scalar(select(EarnState).where(EarnState.mode == mode))
+    if state is None:
+        state = EarnState(mode=mode, deployed_usdt=0.0, cumulative_yield_usdt=0.0)
+        db.add(state)
+        db.flush()
+    return state
+
+
+def _accrue_paper_yield(earn: EarnState, apr: float) -> None:
+    """For paper mode only — compound interest at the configured APR over the elapsed wall time."""
+    now = datetime.utcnow()
+    elapsed = (now - earn.last_accrual_ts).total_seconds()
+    if elapsed <= 0 or earn.deployed_usdt <= 0 or apr <= 0:
+        earn.last_accrual_ts = now
+        return
+    rate_per_second = apr / (365.0 * 24 * 3600)
+    yield_amt = earn.deployed_usdt * rate_per_second * elapsed
+    earn.deployed_usdt += yield_amt
+    earn.cumulative_yield_usdt += yield_amt
+    earn.last_accrual_ts = now
+
+
+def _refresh_live_earn_balance(gateway: BinanceGateway, earn: EarnState) -> None:
+    bal, err = gateway.earn_balance_usdt()
+    if bal is not None:
+        # Compute realized yield since last refresh (deposits/redeems make this approximate
+        # but still useful as a directional indicator).
+        delta = bal - earn.deployed_usdt
+        if delta > 0:
+            earn.cumulative_yield_usdt += delta
+        earn.deployed_usdt = bal
+        earn.last_error = ''
+    elif err:
+        earn.last_error = err
+    earn.last_accrual_ts = datetime.utcnow()
 
 
 _LEGACY_PERIOD_SENTINEL = 0.005
@@ -130,28 +169,48 @@ def reconcile_positions(gateway: BinanceGateway) -> None:
         db.commit()
 
 
-def _take_balance_snapshot(db, gateway: BinanceGateway, mode: str, cfg: StrategyConfig) -> BalanceSnapshot:
+def _compute_equity_and_free(db, gateway: BinanceGateway, mode: str, cfg: StrategyConfig, earn: EarnState) -> tuple[float, float]:
+    """Total portfolio equity in USDT and the amount currently free for opening a position.
+    For paper, free = total − earn_deployed − sum(open spot notionals). For live, free is the
+    smaller of spot.free and futures.free since both legs of an arb need margin; earn money
+    sits in a separate Binance wallet so it's already excluded from spot.free."""
+    if mode == MODE_PAPER:
+        realized = total_realized_pnl(db, mode=mode)
+        open_ps = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all()
+        unrealized = 0.0
+        open_notional = 0.0
+        for p in open_ps:
+            spot_now = gateway.safe_price(p.spot_symbol) or p.spot_entry_price or 0
+            perp_now = gateway.safe_price(p.perp_symbol, perp=True) or p.perp_entry_price or 0
+            unrealized += position_unrealized_pnl(p, spot_now, perp_now)
+            open_notional += p.quantity * p.spot_entry_price
+        capital_in = db.scalar(select(func.coalesce(func.sum(CapitalFlow.amount_usdt), 0.0)).where(CapitalFlow.mode == mode)) or 0.0
+        total_equity = cfg.paper_starting_equity + capital_in + realized + unrealized + earn.cumulative_yield_usdt
+        free = max(0.0, total_equity - earn.deployed_usdt - open_notional)
+        return total_equity, free
+    bals = gateway.safe_balances()
+    if bals is None:
+        return 0.0, 0.0
+    spot_total = float((bals['spot'].get('USDT') or {}).get('total') or 0)
+    fut_total = float((bals['futures'].get('USDT') or {}).get('total') or 0)
+    spot_free = float((bals['spot'].get('USDT') or {}).get('free') or 0)
+    fut_free = float((bals['futures'].get('USDT') or {}).get('free') or 0)
+    total_equity = spot_total + fut_total + earn.deployed_usdt
+    return total_equity, min(spot_free, fut_free)
+
+
+def _take_balance_snapshot(db, gateway: BinanceGateway, mode: str, cfg: StrategyConfig, earn: EarnState) -> BalanceSnapshot:
     if mode == MODE_LIVE:
         bals = gateway.safe_balances()
         if bals is not None:
             spot = float((bals['spot'].get('USDT') or {}).get('total') or 0)
             fut = float((bals['futures'].get('USDT') or {}).get('total') or 0)
-            snap = BalanceSnapshot(spot_usdt=spot, futures_usdt=fut, total_usdt=spot + fut, source=MODE_LIVE)
+            snap = BalanceSnapshot(spot_usdt=spot, futures_usdt=fut, total_usdt=spot + fut + earn.deployed_usdt, source=MODE_LIVE)
             db.add(snap)
             db.flush()
             return snap
-    realized = total_realized_pnl(db, mode=mode)
-    open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all()
-    unrealized = 0.0
-    for p in open_positions:
-        spot_now = gateway.safe_price(p.spot_symbol) or p.spot_entry_price or 0
-        perp_now = gateway.safe_price(p.perp_symbol, perp=True) or p.perp_entry_price or 0
-        unrealized += position_unrealized_pnl(p, spot_now, perp_now)
-    capital_in = db.scalar(select(func.coalesce(func.sum(CapitalFlow.amount_usdt), 0.0)).where(CapitalFlow.mode == mode)) or 0.0
-    starting = cfg.paper_starting_equity if mode == MODE_PAPER else 0.0
-    base_equity = (capital_in or 0.0) + starting
-    total = base_equity + realized + unrealized
-    snap = BalanceSnapshot(spot_usdt=total, futures_usdt=0.0, total_usdt=total, source=mode)
+    total_equity, _ = _compute_equity_and_free(db, gateway, mode, cfg, earn)
+    snap = BalanceSnapshot(spot_usdt=total_equity, futures_usdt=0.0, total_usdt=total_equity, source=mode)
     db.add(snap)
     db.flush()
     return snap
@@ -185,9 +244,18 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
         with SessionLocal() as db:
             cfg = get_strategy_config(db)
             mstate = get_mode_state(db, mode)
+            earn = get_earn_state(db, mode)
 
-            # Live short-circuit: if entries are off and there's nothing open, skip the API hits entirely.
-            if mode == MODE_LIVE and not mstate.entry_enabled and not mstate.maintenance_mode:
+            # Earn upkeep: accrue paper-mode interest or fetch the live deployed balance.
+            if cfg.earn_enabled:
+                if paper:
+                    _accrue_paper_yield(earn, cfg.earn_paper_apr)
+                else:
+                    _refresh_live_earn_balance(gateway, earn)
+
+            # Live short-circuit: if entries are off, no positions, and no earn deployed,
+            # skip the API hits entirely. With earn enabled we still want to refresh balances.
+            if mode == MODE_LIVE and not mstate.entry_enabled and not mstate.maintenance_mode and not cfg.earn_enabled:
                 open_count = db.scalar(select(func.count(Position.id)).where(Position.status == 'open', Position.mode == mode)) or 0
                 if open_count == 0:
                     return
@@ -276,25 +344,32 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                 for sym, reason, apr in rejected_scan[:20]:
                     db.add(RejectedCandidate(mode=mode, symbol=sym, reason=reason, funding_rate=apr))
 
-                bals = gateway.safe_balances() if not paper else None
-                if not paper and bals is None:
+                total_equity, free = _compute_equity_and_free(db, gateway, mode, cfg, earn)
+                if total_equity <= 0:
                     scan_action = 'balances_unavailable'
-                    scan_note = 'safe_balances() returned None'
+                    scan_note = 'safe_balances() returned None or paper equity = 0'
                 else:
                     scan_action = 'no_fill'
+                    desired_notional = cfg.max_position_pct * total_equity
+                    min_notional = cfg.min_position_pct * total_equity
                     for c in passing[:5]:
                         if db.scalar(select(Position).where(Position.perp_symbol == c.perp_symbol, Position.status == 'open', Position.mode == mode)):
                             continue
-                        if paper:
-                            cap_in = db.scalar(select(func.coalesce(func.sum(CapitalFlow.amount_usdt), 0.0)).where(CapitalFlow.mode == mode)) or 0.0
-                            free_spot = free_fut = (cap_in + cfg.paper_starting_equity) / 2.0
-                        else:
-                            free_spot = float((bals['spot'].get('USDT') or {}).get('free') or 0)
-                            free_fut = float((bals['futures'].get('USDT') or {}).get('free') or 0)
-                        notional = min(free_spot, free_fut) * 0.97
-                        if notional < cfg.min_symbol_notional:
-                            db.add(RejectedCandidate(mode=mode, symbol=c.perp_symbol, reason='below min notional', funding_rate=c.funding_apr))
-                            scan_action = 'below_min_notional'
+                        # If free is short of what we want, redeem from earn first.
+                        if cfg.earn_enabled and free < desired_notional and earn.deployed_usdt > 0:
+                            need = min(desired_notional - free, earn.deployed_usdt)
+                            ok, err = gateway.earn_redeem(need, paper)
+                            if ok:
+                                earn.deployed_usdt -= need
+                                free += need
+                                log_event(db, f'Redeemed {need:.2f} USDT from earn before opening {c.perp_symbol}', mode=mode)
+                            else:
+                                earn.last_error = err
+                                log_event(db, f'Earn redeem failed for {c.perp_symbol}: {err}', mode=mode, level='WARN')
+                        sized_notional = min(free * 0.97, desired_notional)
+                        if sized_notional < min_notional:
+                            db.add(RejectedCandidate(mode=mode, symbol=c.perp_symbol, reason=f'below min position pct ({sized_notional:.2f} < {min_notional:.2f} USDT)', funding_rate=c.funding_apr))
+                            scan_action = 'below_min_pct'
                             continue
                         spot_px = gateway.safe_price(c.spot_symbol) or 0
                         perp_px = gateway.safe_price(c.perp_symbol, perp=True) or 0
@@ -305,7 +380,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                             db.add(RejectedCandidate(mode=mode, symbol=c.perp_symbol, reason=f'basis_too_wide ({entry_bps:+.1f}bps > ±{cfg.max_entry_basis_bps:.1f})', funding_rate=c.funding_apr))
                             scan_action = 'basis_too_wide'
                             continue
-                        qty = min(notional, cfg.max_position_notional) / max(0.0001, spot_px)
+                        qty = sized_notional / max(0.0001, spot_px)
                         s = gateway.create_spot_buy(c.spot_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
                         f = gateway.create_perp_short(c.perp_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
                         pos = Position(
@@ -344,8 +419,21 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                 note=scan_note,
             ))
 
+            # Sweep any remaining idle USDT into Earn after entries are done.
+            if cfg.earn_enabled:
+                _, free_after = _compute_equity_and_free(db, gateway, mode, cfg, earn)
+                if free_after > cfg.earn_idle_threshold_usdt:
+                    sweep = max(0.0, free_after - 0.10)  # leave a small buffer for rounding/fees
+                    ok, err = gateway.earn_subscribe(sweep, paper)
+                    if ok:
+                        earn.deployed_usdt += sweep
+                        log_event(db, f'Swept {sweep:.2f} USDT idle to earn', mode=mode)
+                    else:
+                        earn.last_error = err
+                        log_event(db, f'Earn subscribe failed: {err}', mode=mode, level='WARN')
+
             prev_snap = db.scalar(select(BalanceSnapshot).where(BalanceSnapshot.source == mode).order_by(BalanceSnapshot.id.desc()).limit(1))
-            snap = _take_balance_snapshot(db, gateway, mode, cfg)
+            snap = _take_balance_snapshot(db, gateway, mode, cfg, earn)
             _detect_capital_flow(db, prev_snap, snap, mode)
             db.add(EquityCurve(mode=mode, equity_usdt=snap.total_usdt))
             db.commit()

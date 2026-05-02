@@ -14,6 +14,7 @@ from markupsafe import Markup
 from sqlalchemy import desc, func, select
 
 from app.bot import (
+    get_earn_state,
     get_mode_state,
     get_runtime_state,
     get_strategy_config,
@@ -38,6 +39,7 @@ from app.models import (
     BalanceSnapshot,
     BotEvent,
     CapitalFlow,
+    EarnState,
     EquityCurve,
     ModeState,
     Position,
@@ -91,6 +93,7 @@ def startup() -> None:
         get_strategy_config(db)
         for m in ALL_MODES:
             get_mode_state(db, m)
+            get_earn_state(db, m)
         db.commit()
     if os.environ.get('BOT_WORKER_ENABLED', '1') not in ('0', 'false', 'False', ''):
         _start_worker()
@@ -303,6 +306,14 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         last_cycle_ts = latest_scan.ts if latest_scan else (equity_points[-1].ts if equity_points else None)
         last_cycle_age = _fmt_age(datetime.utcnow() - last_cycle_ts) if last_cycle_ts else None
 
+        earn = get_earn_state(db, v)
+        ctx['earn'] = {
+            'enabled': cfg.earn_enabled,
+            'deployed': earn.deployed_usdt,
+            'cumulative_yield': earn.cumulative_yield_usdt,
+            'last_error': earn.last_error,
+        }
+
         ctx.update({
             'current_equity': current_equity,
             'equity_source': equity_source,
@@ -506,8 +517,8 @@ def save_config(
     stop_loss_pct: float = Form(...),
     max_open_positions: int = Form(...),
     max_trades_per_day: int = Form(...),
-    min_symbol_notional: float = Form(...),
-    max_position_notional: float = Form(...),
+    min_position_pct: float = Form(...),
+    max_position_pct: float = Form(...),
     max_hold_hours: int = Form(...),
     loop_seconds: int = Form(...),
     paper_slippage_bps: float = Form(...),
@@ -517,6 +528,9 @@ def save_config(
     max_exit_basis_bps: float = Form(...),
     enforce_hedge_check: int = Form(...),
     delisting_check: int = Form(...),
+    earn_enabled: int = Form(...),
+    earn_idle_threshold_usdt: float = Form(...),
+    earn_paper_apr: float = Form(...),
     _: None = Depends(auth),
 ):
     with SessionLocal() as db:
@@ -527,8 +541,8 @@ def save_config(
         cfg.stop_loss_pct = stop_loss_pct
         cfg.max_open_positions = max_open_positions
         cfg.max_trades_per_day = max_trades_per_day
-        cfg.min_symbol_notional = min_symbol_notional
-        cfg.max_position_notional = max_position_notional
+        cfg.min_position_pct = min_position_pct
+        cfg.max_position_pct = max_position_pct
         cfg.max_hold_hours = max_hold_hours
         cfg.loop_seconds = max(5, loop_seconds)
         cfg.paper_slippage_bps = paper_slippage_bps
@@ -538,6 +552,9 @@ def save_config(
         cfg.max_exit_basis_bps = max_exit_basis_bps
         cfg.enforce_hedge_check = bool(enforce_hedge_check)
         cfg.delisting_check = bool(delisting_check)
+        cfg.earn_enabled = bool(earn_enabled)
+        cfg.earn_idle_threshold_usdt = earn_idle_threshold_usdt
+        cfg.earn_paper_apr = earn_paper_apr
         db.commit()
     return RedirectResponse(url='/config?saved=1', status_code=303)
 

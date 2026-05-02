@@ -35,12 +35,34 @@
         <input type="number" step="1" name="max_open_positions" value="{{ cfg.max_open_positions }}"></div>
       <div class="form-row"><label>Max trades per day</label>
         <input type="number" step="1" name="max_trades_per_day" value="{{ cfg.max_trades_per_day }}"></div>
-      <div class="form-row"><label>Min position notional (USDT)</label>
-        <input type="number" step="0.01" name="min_symbol_notional" value="{{ cfg.min_symbol_notional }}"></div>
-      <div class="form-row"><label>Max position notional (USDT)</label>
-        <input type="number" step="0.01" name="max_position_notional" value="{{ cfg.max_position_notional }}"></div>
+      <div class="form-row"><label>Min position size (% of equity, decimal)</label>
+        <input type="number" step="0.001" name="min_position_pct" value="{{ '%.4f' % cfg.min_position_pct }}">
+        <span class="hint">skip candidates whose available size is below this fraction of total portfolio. 0.005 = 0.5%.</span></div>
+      <div class="form-row"><label>Max position size (% of equity, decimal)</label>
+        <input type="number" step="0.001" name="max_position_pct" value="{{ '%.4f' % cfg.max_position_pct }}">
+        <span class="hint">cap a single open position at this fraction of total portfolio. 0.10 = 10%.</span></div>
       <div class="form-row"><label>Max hold (hours)</label>
         <input type="number" step="1" name="max_hold_hours" value="{{ cfg.max_hold_hours }}"></div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h3>Earn (idle USDT sweep)</h3>
+  <div class="body">
+    <div class="form-grid">
+      <div class="form-row"><label>Earn enabled</label>
+        <select name="earn_enabled">
+          <option value="1" {{ 'selected' if cfg.earn_enabled }}>yes</option>
+          <option value="0" {{ 'selected' if not cfg.earn_enabled }}>no</option>
+        </select>
+        <span class="hint">when on, idle USDT is swept into Binance Simple Earn (Flexible USDT) after each cycle. The bot redeems automatically before opening a position. Live mode requires API key Earn permission.</span></div>
+      <div class="form-row"><label>Idle threshold (USDT)</label>
+        <input type="number" step="0.1" name="earn_idle_threshold_usdt" value="{{ cfg.earn_idle_threshold_usdt }}">
+        <span class="hint">only sweep when idle USDT exceeds this floor. Avoids sweeping dust.</span></div>
+      <div class="form-row"><label>Paper APR (decimal)</label>
+        <input type="number" step="0.001" name="earn_paper_apr" value="{{ '%.4f' % cfg.earn_paper_apr }}">
+        <span class="hint">simulated yield rate for paper mode. 0.05 = 5% APR. Live mode reads the real Binance balance instead.</span></div>
     </div>
   </div>
 </div>

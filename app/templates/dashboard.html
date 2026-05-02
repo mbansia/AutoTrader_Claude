@@ -49,6 +49,13 @@
     <div class="value">{{ open_count }} / {{ cfg.max_open_positions }}</div>
     <div class="sub">{{ trades_today }} trade(s) today / {{ cfg.max_trades_per_day }} cap</div>
   </div>
+  {% if earn.enabled or earn.deployed > 0 %}
+  <div class="kpi">
+    <div class="label">In Earn (USDT)</div>
+    <div class="value">{{ '%.2f' % earn.deployed }}</div>
+    <div class="sub">cumulative yield {{ '%+.4f' % earn.cumulative_yield }} USDT{% if earn.last_error %} · <span class="bad">{{ earn.last_error|truncate(40) }}</span>{% endif %}</div>
+  </div>
+  {% endif %}
 </div>
 
 <div class="card">

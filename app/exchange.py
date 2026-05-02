@@ -131,3 +131,93 @@ class BinanceGateway:
         except Exception:
             return []
         return [p for p in positions if abs(float(p.get('contracts') or p.get('info', {}).get('positionAmt') or 0)) > 0]
+
+    # ─── Binance Simple Earn (Flexible USDT) ─────────────────────────────────
+    # ccxt method names vary across versions; we probe a small set and call
+    # the first that exists. All methods degrade gracefully — if the API key
+    # lacks the Earn permission, the network is down, or the SAPI shape
+    # changes, we return None / an error string and the caller leaves money
+    # in the spot wallet.
+
+    _earn_product_id_cache: str | None = None
+
+    def _call_sapi(self, candidates: tuple[str, ...], params: dict | None = None):
+        for name in candidates:
+            fn = getattr(self.spot, name, None)
+            if callable(fn):
+                return fn(params or {})
+        return None
+
+    def earn_product_id_usdt(self) -> str | None:
+        if self._earn_product_id_cache:
+            return self._earn_product_id_cache
+        try:
+            resp = self._call_sapi((
+                'sapiV1GetSimpleEarnFlexibleList',
+                'sapi_v1_get_simple_earn_flexible_list',
+                'sapiGetSimpleEarnFlexibleList',
+            ), {'asset': 'USDT'})
+        except Exception:
+            return None
+        if not resp:
+            return None
+        rows = resp.get('rows') or resp.get('data') or []
+        for r in rows:
+            if r.get('asset') == 'USDT':
+                pid = r.get('productId') or r.get('id')
+                if pid:
+                    self._earn_product_id_cache = str(pid)
+                    return self._earn_product_id_cache
+        return None
+
+    def earn_balance_usdt(self) -> tuple[float | None, str]:
+        try:
+            resp = self._call_sapi((
+                'sapiV1GetSimpleEarnFlexiblePosition',
+                'sapi_v1_get_simple_earn_flexible_position',
+                'sapiGetSimpleEarnFlexiblePosition',
+            ), {'asset': 'USDT'})
+        except Exception as e:
+            return None, str(e)
+        if resp is None:
+            return None, 'sapi method not available in ccxt'
+        total = 0.0
+        for r in resp.get('rows', []) or []:
+            total += float(r.get('totalAmount') or 0)
+        return total, ''
+
+    def earn_subscribe(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        if paper_mode:
+            return True, 'paper'
+        pid = self.earn_product_id_usdt()
+        if not pid:
+            return False, 'no flexible USDT product id'
+        try:
+            resp = self._call_sapi((
+                'sapiV1PostSimpleEarnFlexibleSubscribe',
+                'sapi_v1_post_simple_earn_flexible_subscribe',
+                'sapiPostSimpleEarnFlexibleSubscribe',
+            ), {'productId': pid, 'amount': f'{amount_usdt:.2f}'})
+        except Exception as e:
+            return False, str(e)
+        if resp is None:
+            return False, 'sapi method not available in ccxt'
+        return bool(resp.get('success', True)), ''
+
+    def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        if paper_mode:
+            return True, 'paper'
+        pid = self.earn_product_id_usdt()
+        if not pid:
+            return False, 'no flexible USDT product id'
+        try:
+            resp = self._call_sapi((
+                'sapiV1PostSimpleEarnFlexibleRedeem',
+                'sapi_v1_post_simple_earn_flexible_redeem',
+                'sapiPostSimpleEarnFlexibleRedeem',
+            ), {'productId': pid, 'amount': f'{amount_usdt:.2f}', 'destAccount': 'SPOT'})
+        except Exception as e:
+            return False, str(e)
+        if resp is None:
+            return False, 'sapi method not available in ccxt'
+        return bool(resp.get('success', True)), ''

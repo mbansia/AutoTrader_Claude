@@ -37,8 +37,9 @@
       <tr><th>Max hold</th><td class="num">{{ cfg.max_hold_hours }}h</td><td>Close after this elapsed time regardless of funding.</td></tr>
       <tr><th>Max open positions</th><td class="num">{{ cfg.max_open_positions }}</td><td>Hard cap on simultaneous arb pairs.</td></tr>
       <tr><th>Max trades per day</th><td class="num">{{ cfg.max_trades_per_day }}</td><td>Hard cap on trade rows recorded per UTC day.</td></tr>
-      <tr><th>Min position notional</th><td class="num">{{ '%.2f' % cfg.min_symbol_notional }} USDT</td><td>Skip candidates whose available notional is below this.</td></tr>
-      <tr><th>Max position notional</th><td class="num">{{ '%.2f' % cfg.max_position_notional }} USDT</td><td>Cap any single open at this size.</td></tr>
+      <tr><th>Min position size</th><td class="num">{{ '%.2f%%' % (cfg.min_position_pct * 100) }} of equity</td><td>Skip candidates whose available size is below this fraction of total portfolio.</td></tr>
+      <tr><th>Max position size</th><td class="num">{{ '%.2f%%' % (cfg.max_position_pct * 100) }} of equity</td><td>Cap any single open position at this fraction of total portfolio.</td></tr>
+      <tr><th>Earn sweep</th><td><span class="tag {{ 'good' if cfg.earn_enabled else 'warn' }}">{{ 'enabled' if cfg.earn_enabled else 'OFF' }}</span></td><td>{% if cfg.earn_enabled %}Idle USDT &gt; {{ '%.2f' % cfg.earn_idle_threshold_usdt }} swept into Binance Simple Earn each cycle; redeemed before entries. Paper APR {{ '%.2f%%' % (cfg.earn_paper_apr * 100) }}.{% else %}Disabled — idle USDT stays in spot wallet.{% endif %}</td></tr>
       <tr><th>Min 24h quote volume</th><td class="num">{{ '{:,.0f}'.format(cfg.min_24h_quote_volume) }} USDT</td><td>Liquidity filter on spot leg.</td></tr>
       <tr><th>Max entry basis</th><td class="num">±{{ '%.1f' % cfg.max_entry_basis_bps }} bps</td><td>Refuse to open when |perp − spot| / spot exceeds this — protects against entering during a dislocation.</td></tr>
       <tr><th>Max exit basis</th><td class="num">{{ '%.1f' % cfg.max_exit_basis_bps }} bps</td><td>Defer voluntary exits (funding decay, max hold) until basis is favorable. Stop-loss, naked-leg, delisting and maintenance bypass this gate.</td></tr>

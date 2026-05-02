@@ -101,8 +101,12 @@ class StrategyConfig(Base):
     max_hold_hours: Mapped[int] = mapped_column(Integer, default=72)
     max_open_positions: Mapped[int] = mapped_column(Integer, default=1)
     max_trades_per_day: Mapped[int] = mapped_column(Integer, default=8)
-    max_position_notional: Mapped[float] = mapped_column(Float, default=10.0)
-    min_symbol_notional: Mapped[float] = mapped_column(Float, default=5.0)
+    # Position sizing as a fraction of current portfolio equity (0.10 = 10%).
+    # The legacy USDT columns remain in the table for back-compat but are unused.
+    min_position_pct: Mapped[float] = mapped_column(Float, default=0.005)
+    max_position_pct: Mapped[float] = mapped_column(Float, default=0.10)
+    max_position_notional: Mapped[float] = mapped_column(Float, default=10.0)  # deprecated
+    min_symbol_notional: Mapped[float] = mapped_column(Float, default=5.0)     # deprecated
     min_24h_quote_volume: Mapped[float] = mapped_column(Float, default=100000.0)
     stop_loss_pct: Mapped[float] = mapped_column(Float, default=-0.02)
     paper_slippage_bps: Mapped[float] = mapped_column(Float, default=5.0)
@@ -115,6 +119,10 @@ class StrategyConfig(Base):
     max_exit_basis_bps: Mapped[float] = mapped_column(Float, default=5.0)
     enforce_hedge_check: Mapped[bool] = mapped_column(Boolean, default=True)
     delisting_check: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Earn / Binance Simple Earn Flexible USDT sweep.
+    earn_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    earn_idle_threshold_usdt: Mapped[float] = mapped_column(Float, default=1.0)
+    earn_paper_apr: Mapped[float] = mapped_column(Float, default=0.05)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
@@ -150,3 +158,14 @@ class ScanResult(Base):
     top_candidates: Mapped[str] = mapped_column(Text, default='[]')
     action: Mapped[str] = mapped_column(String(64), default='')
     note: Mapped[str] = mapped_column(Text, default='')
+
+
+class EarnState(Base):
+    """Per-mode tracking of USDT swept into Binance Simple Earn (or paper-simulated)."""
+    __tablename__ = 'earn_state'
+    mode: Mapped[str] = mapped_column(String(8), primary_key=True)
+    deployed_usdt: Mapped[float] = mapped_column(Float, default=0.0)
+    cumulative_yield_usdt: Mapped[float] = mapped_column(Float, default=0.0)
+    last_accrual_ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    last_error: Mapped[str] = mapped_column(Text, default='')
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
