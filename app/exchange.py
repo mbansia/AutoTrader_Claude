@@ -56,6 +56,7 @@ class BinanceGateway:
     def __init__(self) -> None:
         self.spot = ccxt.binance({'apiKey': settings.binance_api_key, 'secret': settings.binance_api_secret, 'enableRateLimit': True})
         self.futures = ccxt.binanceusdm({'apiKey': settings.binance_api_key, 'secret': settings.binance_api_secret, 'enableRateLimit': True})
+        self.last_balance_error: str = ''
 
     def load_markets(self) -> None:
         self.spot.load_markets()
@@ -95,8 +96,11 @@ class BinanceGateway:
 
     def safe_balances(self) -> dict | None:
         try:
-            return {'spot': self.spot.fetch_balance(), 'futures': self.futures.fetch_balance()}
-        except Exception:
+            result = {'spot': self.spot.fetch_balance(), 'futures': self.futures.fetch_balance()}
+            self.last_balance_error = ''
+            return result
+        except Exception as e:
+            self.last_balance_error = str(e)
             return None
 
     def price(self, symbol: str) -> float:

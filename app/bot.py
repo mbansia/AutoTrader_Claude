@@ -37,6 +37,9 @@ from app.safety import (
 
 CAPITAL_FLOW_THRESHOLD_USDT = 50.0
 
+# Module-level dedup so we only log "live API down" once per outage instead of every cycle.
+_LIVE_API_UNHEALTHY_LOGGED = False
+
 
 def log_event(db, message: str, mode: str = MODE_PAPER, level: str = 'INFO'):
     db.add(BotEvent(mode=mode, level=level, message=message))
@@ -280,6 +283,30 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
             # Paper-mode funding income accrual on open positions (live is auto-credited
             # by Binance into the futures wallet, which our equity calc already sees).
             _accrue_paper_funding(db, mode)
+
+            # Live API health probe — bail out cleanly if Binance is rejecting our auth.
+            # Without this, every unwrapped order call below hits -2015 and spams the log
+            # on every loop. We log once on transition to unhealthy and once on recovery.
+            global _LIVE_API_UNHEALTHY_LOGGED
+            if mode == MODE_LIVE:
+                bals_probe = gateway.safe_balances()
+                if bals_probe is None:
+                    if not _LIVE_API_UNHEALTHY_LOGGED:
+                        err = gateway.last_balance_error or 'unknown'
+                        log_event(
+                            db,
+                            f'Live API unreachable: {err}. Pausing live cycles. '
+                            f'Common -2015 causes: bad key/secret, IP not whitelisted on the key, '
+                            f'or missing Spot/Futures/Earn permission.',
+                            mode=MODE_LIVE,
+                            level='ERROR',
+                        )
+                        _LIVE_API_UNHEALTHY_LOGGED = True
+                    db.commit()
+                    return
+                elif _LIVE_API_UNHEALTHY_LOGGED:
+                    log_event(db, 'Live API recovered.', mode=MODE_LIVE, level='INFO')
+                    _LIVE_API_UNHEALTHY_LOGGED = False
 
             # Earn upkeep: accrue paper-mode interest or fetch the live deployed balance.
             if cfg.earn_enabled:
