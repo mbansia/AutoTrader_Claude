@@ -169,19 +169,26 @@ def _log_close_error(db, p: Position, leg: str, err: str) -> None:
     log_event(db, f'Failed to close {leg} leg of {p.perp_symbol}: {snippet} (will retry next cycle)', mode=p.mode, level='ERROR')
 
 
-def _try_fund_close_margin(gateway: BinanceGateway, cfg: StrategyConfig) -> None:
-    """Closing a perp short requires a tiny bit of free margin in the futures wallet
-    (for the close-side fee + any unrealized PnL slippage). If futures.free is dust,
-    transfer a small buffer from spot so the close goes through."""
+def _try_fund_close_margin(db, gateway: BinanceGateway, cfg: StrategyConfig, mode: str) -> None:
+    """Closing a perp short can need a sliver of free USDT in the futures wallet
+    for the close-side fee. If futures.free is dust, transfer a tiny buffer
+    from spot. Conservative on amount and frequency — it's easy to over-drain
+    spot if the close keeps failing for unrelated reasons (size mismatch,
+    market halted, etc.)."""
     if not cfg.auto_transfer_enabled:
         return
     bals = gateway.safe_balances() or {}
     fut_free = float((bals.get('futures', {}).get('USDT') or {}).get('free') or 0)
     spot_free = float((bals.get('spot', {}).get('USDT') or {}).get('free') or 0)
-    if fut_free >= 1.0 or spot_free <= 0.5:
+    # Only act when futures is genuinely dust AND spot has more than the buffer to spare.
+    if fut_free >= 0.20 or spot_free <= 0.30:
         return
-    transfer = min(2.0, max(0.5, spot_free - 0.1))
-    gateway.transfer_spot_to_futures(transfer, False)
+    transfer = min(0.50, max(0.20, spot_free - 0.20))
+    ok, err = gateway.transfer_spot_to_futures(transfer, False)
+    if ok:
+        log_event(db, f'Funded close margin: {transfer:.2f} USDT spot→futures (fut.free was {fut_free:.4f})', mode=mode)
+    else:
+        log_event(db, f'Close-margin top-up failed: {err}', mode=mode, level='WARN')
 
 
 def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyConfig, reason: str) -> None:
@@ -191,7 +198,7 @@ def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyCon
     retry on the next cycle. Errors are deduped per (position, leg)."""
     paper = (p.mode == MODE_PAPER)
     if not paper:
-        _try_fund_close_margin(gateway, cfg)
+        _try_fund_close_margin(db, gateway, cfg, p.mode)
     spot_ok = perp_ok = False
     try:
         s = gateway.close_spot(p.spot_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
