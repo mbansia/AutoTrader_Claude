@@ -19,6 +19,15 @@
   </div>
 </div>
 
+{% if worker_alive %}
+<div class="alert alert-info">Worker is running. Last cycle {{ last_cycle_age or '—' }} ago.</div>
+{% else %}
+<div class="alert alert-error" style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+  <span>Worker is <strong>not running</strong>{% if last_cycle_age %} (last cycle {{ last_cycle_age }} ago){% endif %} — no scans, no trades, no snapshots.</span>
+  <form action="/worker/start" method="post" style="display:inline"><button class="btn btn-primary" type="submit">Start worker</button></form>
+</div>
+{% endif %}
+
 {% if balances_error %}
 <div class="alert alert-error">Live balances unavailable: {{ balances_error }}. Showing computed equity from local DB.</div>
 {% endif %}

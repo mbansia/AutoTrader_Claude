@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 from datetime import datetime, timedelta
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, status
@@ -10,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import desc, func, select
 
-from app.bot import get_runtime_state, get_strategy_config, run_one_cycle
+from app.bot import get_runtime_state, get_strategy_config, run_loop, run_one_cycle
 from app.config import settings
 from app.db import Base, SessionLocal, engine
 from app.exchange import BinanceGateway
@@ -39,6 +41,24 @@ templates = Jinja2Templates(directory='app/templates')
 security = HTTPBasic()
 
 
+_worker_thread: threading.Thread | None = None
+_worker_lock = threading.Lock()
+
+
+def _worker_alive() -> bool:
+    return _worker_thread is not None and _worker_thread.is_alive()
+
+
+def _start_worker() -> bool:
+    global _worker_thread
+    with _worker_lock:
+        if _worker_thread is not None and _worker_thread.is_alive():
+            return False
+        _worker_thread = threading.Thread(target=run_loop, name='bot-worker', daemon=True)
+        _worker_thread.start()
+        return True
+
+
 def auth(creds: HTTPBasicCredentials = Depends(security)):
     if creds.username != settings.dashboard_user or creds.password != settings.dashboard_password:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, headers={'WWW-Authenticate': 'Basic'})
@@ -51,6 +71,14 @@ def startup() -> None:
         get_runtime_state(db)
         get_strategy_config(db)
         db.commit()
+    if os.environ.get('BOT_WORKER_ENABLED', '1') not in ('0', 'false', 'False', ''):
+        _start_worker()
+
+
+@app.post('/worker/start')
+def worker_start(_: None = Depends(auth)):
+    _start_worker()
+    return RedirectResponse(url='/dashboard', status_code=303)
 
 
 @app.get('/health')
@@ -162,6 +190,10 @@ def dashboard(request: Request, _: None = Depends(auth)):
         open_count = db.scalar(select(func.count(Position.id)).where(Position.status == 'open')) or 0
         trades_today_n = db.scalar(select(func.count(Trade.id)).where(Trade.ts >= datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0))) or 0
 
+        worker_alive = _worker_alive()
+        last_cycle_ts = latest_scan.ts if latest_scan else (equity_points[-1].ts if equity_points else None)
+        last_cycle_age = _fmt_age(datetime.utcnow() - last_cycle_ts) if last_cycle_ts else None
+
         ctx = {
             'request': request,
             'active': 'dashboard',
@@ -182,6 +214,8 @@ def dashboard(request: Request, _: None = Depends(auth)):
             'equity_polyline': equity_polyline,
             'latest_scan': {'ts': _fmt_ts(latest_scan.ts), 'candidates_total': latest_scan.candidates_total, 'candidates_passing': latest_scan.candidates_passing, 'action': latest_scan.action} if latest_scan else None,
             'latest_scan_top': latest_scan_top,
+            'worker_alive': worker_alive,
+            'last_cycle_age': last_cycle_age,
         }
     return templates.TemplateResponse(request, 'dashboard.html', ctx)
 
