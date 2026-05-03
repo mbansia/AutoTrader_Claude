@@ -626,6 +626,8 @@ def save_config(
     auto_rebalance_threshold: float = Form(1.0),
     earn_subscribe_spot_assets: int = Form(0),
     perp_leverage: int = Form(1),
+    min_order_book_depth_usdt: float = Form(500.0),
+    depth_band_bps: float = Form(10.0),
     _: None = Depends(auth),
 ):
     with SessionLocal() as db:
@@ -654,6 +656,8 @@ def save_config(
         cfg.auto_rebalance_threshold = max(0.20, auto_rebalance_threshold)
         cfg.earn_subscribe_spot_assets = bool(earn_subscribe_spot_assets)
         cfg.perp_leverage = max(1, perp_leverage)
+        cfg.min_order_book_depth_usdt = max(0.0, min_order_book_depth_usdt)
+        cfg.depth_band_bps = max(1.0, depth_band_bps)
         db.commit()
     return RedirectResponse(url='/config?saved=1', status_code=303)
 

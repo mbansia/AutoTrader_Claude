@@ -113,6 +113,11 @@ class StrategyConfig(Base):
     max_position_notional: Mapped[float] = mapped_column(Float, default=10.0)  # deprecated
     min_symbol_notional: Mapped[float] = mapped_column(Float, default=5.0)     # deprecated
     min_24h_quote_volume: Mapped[float] = mapped_column(Float, default=100000.0)
+    # Order-book depth liquidity filter. Reject any candidate where the smaller
+    # of (spot ask depth, perp bid depth) within ±depth_band_bps of mid is below
+    # this threshold. 0 disables the filter.
+    min_order_book_depth_usdt: Mapped[float] = mapped_column(Float, default=500.0)
+    depth_band_bps: Mapped[float] = mapped_column(Float, default=10.0)
     stop_loss_pct: Mapped[float] = mapped_column(Float, default=-0.02)
     paper_slippage_bps: Mapped[float] = mapped_column(Float, default=5.0)
     paper_fee_bps: Mapped[float] = mapped_column(Float, default=4.0)

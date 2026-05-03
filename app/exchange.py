@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 
 import ccxt
 
@@ -14,10 +15,28 @@ class Candidate:
     funding_rate: float
     funding_interval_hours: float
     quote_volume: float
+    spot_depth_usdt: float = 0.0
+    perp_depth_usdt: float = 0.0
+    spot_earn_apr: float = 0.0  # latest annualized rate on the asset's flexible earn product, if any
 
     @property
     def funding_apr(self) -> float:
         return annualize_rate(self.funding_rate, self.funding_interval_hours)
+
+    @property
+    def funding_apy(self) -> float:
+        # Same compounded value as funding_apr — kept for callers that prefer the explicit name.
+        return self.funding_apr
+
+    @property
+    def combined_apy(self) -> float:
+        """Funding APY (compounded) + spot Earn APR (Binance's reported flexible rate).
+        This is the headline yield used for ranking — it captures both legs' income."""
+        return self.funding_apr + self.spot_earn_apr
+
+    @property
+    def min_depth_usdt(self) -> float:
+        return min(self.spot_depth_usdt, self.perp_depth_usdt)
 
 
 def annualize_rate(period_rate: float, interval_hours: float) -> float:
@@ -62,7 +81,81 @@ class BinanceGateway:
         self.spot.load_markets()
         self.futures.load_markets()
 
-    def scan_funding(self, entry_apr_threshold: float, min_quote_volume: float) -> tuple[list[Candidate], int, list[tuple[str, str, float]]]:
+    def order_book_depth_usdt(self, symbol: str, side: str = 'ask', band_bps: float = 10.0, perp: bool = False) -> float:
+        """Sum of USDT-equivalent quantity on `side` of the book within `band_bps`
+        of mid. side='ask' for buying (we hit asks) — used for the spot leg open
+        and the perp short close. side='bid' for selling — used for the spot
+        close and the perp short open. Returns 0.0 on any error."""
+        try:
+            ex = self.futures if perp else self.spot
+            ob = ex.fetch_order_book(symbol, limit=50)
+        except Exception:
+            return 0.0
+        bids = ob.get('bids') or []
+        asks = ob.get('asks') or []
+        if not bids or not asks:
+            return 0.0
+        try:
+            mid = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+        except Exception:
+            return 0.0
+        if mid <= 0:
+            return 0.0
+        threshold = band_bps / 10000.0
+        if side == 'ask':
+            cutoff = mid * (1 + threshold)
+            levels = asks
+            within = lambda p: p <= cutoff
+        else:
+            cutoff = mid * (1 - threshold)
+            levels = bids
+            within = lambda p: p >= cutoff
+        total = 0.0
+        for lvl in levels:
+            try:
+                p, q = float(lvl[0]), float(lvl[1])
+            except Exception:
+                continue
+            if not within(p):
+                break
+            total += p * q
+        return total
+
+    _flexible_earn_apr_cache: dict[str, tuple[float, float]] = {}
+
+    def flexible_earn_apr(self, asset: str, ttl_seconds: float = 3600.0) -> float:
+        """Latest annualized rate (decimal) for the flexible Earn product on `asset`,
+        cached for an hour. Returns 0.0 if no product or the API isn't reachable —
+        caller can treat that as "no extra spot yield to count toward score."""
+        cached = self._flexible_earn_apr_cache.get(asset)
+        if cached:
+            rate, ts = cached
+            if time.time() - ts < ttl_seconds:
+                return rate
+        try:
+            resp = self._call_sapi((
+                'sapiV1GetSimpleEarnFlexibleList',
+                'sapi_v1_get_simple_earn_flexible_list',
+                'sapiGetSimpleEarnFlexibleList',
+            ), {'asset': asset})
+        except Exception:
+            self._flexible_earn_apr_cache[asset] = (0.0, time.time())
+            return 0.0
+        if not resp:
+            self._flexible_earn_apr_cache[asset] = (0.0, time.time())
+            return 0.0
+        for r in resp.get('rows', []) or resp.get('data', []) or []:
+            if r.get('asset') == asset:
+                try:
+                    rate = float(r.get('latestAnnualPercentageRate') or r.get('annualPercentageRate') or 0)
+                except Exception:
+                    rate = 0.0
+                self._flexible_earn_apr_cache[asset] = (rate, time.time())
+                return rate
+        self._flexible_earn_apr_cache[asset] = (0.0, time.time())
+        return 0.0
+
+    def scan_funding(self, entry_apr_threshold: float, min_quote_volume: float, min_depth_usdt: float = 0.0, depth_band_bps: float = 10.0, include_earn_apr: bool = False) -> tuple[list[Candidate], int, list[tuple[str, str, float]]]:
         rates = self.futures.fetch_funding_rates()
         passing: list[Candidate] = []
         rejected: list[tuple[str, str, float]] = []
@@ -90,8 +183,29 @@ class BinanceGateway:
             if qv < min_quote_volume:
                 rejected.append((symbol, f'volume<{min_quote_volume:.0f}', apr))
                 continue
-            passing.append(Candidate(spot_symbol=spot_symbol, perp_symbol=symbol, funding_rate=float(fr), funding_interval_hours=interval_h, quote_volume=qv))
-        passing.sort(key=lambda c: c.funding_apr, reverse=True)
+            spot_depth = perp_depth = 0.0
+            if min_depth_usdt > 0:
+                spot_depth = self.order_book_depth_usdt(spot_symbol, side='ask', band_bps=depth_band_bps, perp=False)
+                perp_depth = self.order_book_depth_usdt(symbol, side='bid', band_bps=depth_band_bps, perp=True)
+                tight = min(spot_depth, perp_depth)
+                if tight < min_depth_usdt:
+                    rejected.append((symbol, f'depth<{min_depth_usdt:.0f} (spot {spot_depth:.0f} / perp {perp_depth:.0f} @ ±{depth_band_bps:.0f}bps)', apr))
+                    continue
+            earn_apr = self.flexible_earn_apr(base) if include_earn_apr else 0.0
+            passing.append(Candidate(
+                spot_symbol=spot_symbol,
+                perp_symbol=symbol,
+                funding_rate=float(fr),
+                funding_interval_hours=interval_h,
+                quote_volume=qv,
+                spot_depth_usdt=spot_depth,
+                perp_depth_usdt=perp_depth,
+                spot_earn_apr=earn_apr,
+            ))
+        # Rank by total expected yield (funding APY + spot earn APR). Within
+        # ties this naturally prefers the side with deeper books because deeper
+        # markets tend to be the high-volume / low-friction names.
+        passing.sort(key=lambda c: (c.combined_apy, c.min_depth_usdt), reverse=True)
         return passing, total, rejected
 
     def safe_balances(self) -> dict | None:

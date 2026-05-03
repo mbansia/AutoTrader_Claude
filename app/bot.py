@@ -552,12 +552,28 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
 
             if mstate.entry_enabled and len(open_positions) < cfg.max_open_positions and daily_trades < cfg.max_trades_per_day:
                 try:
-                    passing, candidates_total, rejected_scan = gateway.scan_funding(cfg.entry_funding_threshold, cfg.min_24h_quote_volume)
+                    passing, candidates_total, rejected_scan = gateway.scan_funding(
+                        cfg.entry_funding_threshold,
+                        cfg.min_24h_quote_volume,
+                        min_depth_usdt=cfg.min_order_book_depth_usdt or 0.0,
+                        depth_band_bps=cfg.depth_band_bps or 10.0,
+                        include_earn_apr=bool(cfg.earn_subscribe_spot_assets),
+                    )
                 except Exception as e:
                     passing, candidates_total, rejected_scan = [], 0, []
                     log_event(db, f'scan_funding failed: {e}', mode=mode, level='ERROR')
                 candidates_passing = len(passing)
-                top_candidates_payload = [{'perp': c.perp_symbol, 'fr': c.funding_rate, 'apr': c.funding_apr, 'interval_h': c.funding_interval_hours, 'qv': c.quote_volume} for c in passing[:5]]
+                top_candidates_payload = [{
+                    'perp': c.perp_symbol,
+                    'fr': c.funding_rate,
+                    'apr': c.funding_apr,
+                    'interval_h': c.funding_interval_hours,
+                    'qv': c.quote_volume,
+                    'spot_depth': c.spot_depth_usdt,
+                    'perp_depth': c.perp_depth_usdt,
+                    'spot_earn_apr': c.spot_earn_apr,
+                    'combined_apy': c.combined_apy,
+                } for c in passing[:5]]
                 for sym, reason, apr in rejected_scan[:20]:
                     db.add(RejectedCandidate(mode=mode, symbol=sym, reason=reason, funding_rate=apr))
 
@@ -604,8 +620,16 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                             else:
                                 log_event(db, f'spot→futures transfer failed: {err}', mode=mode, level='WARN')
 
+                    # Diversity: skip any candidate whose base asset we already hold open
+                    # in this mode. Avoids piling more capital into the same name even
+                    # though the perp symbol formally matches; a clean default for the
+                    # max_open_positions > 1 case.
+                    held_bases = {p.spot_symbol.split('/')[0] for p in db.scalars(
+                        select(Position).where(Position.status == 'open', Position.mode == mode)
+                    ).all()}
                     for c in passing[:5]:
-                        if db.scalar(select(Position).where(Position.perp_symbol == c.perp_symbol, Position.status == 'open', Position.mode == mode)):
+                        base = c.spot_symbol.split('/')[0]
+                        if base in held_bases:
                             continue
                         # Size based on the binding constraint across both legs.
                         free_for_arb = min(spot_free, fut_free)
@@ -695,8 +719,9 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                         # Both legs filled — finalize.
                         pos.perp_entry_price = float(f.get('price') or 0)
                         record_trade(db, pos.id, mode, c.perp_symbol, 'futures', 'sell', qty, f)
+                        held_bases.add(base)
                         scan_action = f'opened {c.perp_symbol}'
-                        log_event(db, f'Opened {c.perp_symbol} qty={qty:.6f} apy={c.funding_apr:.2%}', mode=mode)
+                        log_event(db, f'Opened {c.perp_symbol} qty={qty:.6f} funding_apy={c.funding_apr:.2%} earn_apr={c.spot_earn_apr:.2%} combined={c.combined_apy:.2%} depth=${c.min_depth_usdt:.0f}', mode=mode)
                         break
             else:
                 if not mstate.entry_enabled:

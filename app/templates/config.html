@@ -20,6 +20,12 @@
         <span class="hint">close when current funding APY falls below this. 0.05 = 5% APY.</span></div>
       <div class="form-row"><label>Min 24h quote volume (USDT)</label>
         <input type="number" step="1" name="min_24h_quote_volume" value="{{ cfg.min_24h_quote_volume }}"></div>
+      <div class="form-row"><label>Min order-book depth (USDT)</label>
+        <input type="number" step="1" name="min_order_book_depth_usdt" value="{{ cfg.min_order_book_depth_usdt }}">
+        <span class="hint">Reject candidates where the smaller of (spot ask depth, perp bid depth) within the band below is less than this. 0 disables.</span></div>
+      <div class="form-row"><label>Depth band (± bps from mid)</label>
+        <input type="number" step="0.5" name="depth_band_bps" value="{{ cfg.depth_band_bps }}">
+        <span class="hint">How far from mid we sum depth. 10 bps captures the price range a market order would actually traverse for typical position sizes.</span></div>
       <div class="form-row"><label>Stop-loss (decimal, negative)</label>
         <input type="number" step="0.001" name="stop_loss_pct" value="{{ '%.4f' % cfg.stop_loss_pct }}">
         <span class="hint">close when MTM PnL/notional ≤ this. Set 0 to disable.</span></div>

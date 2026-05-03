@@ -100,10 +100,20 @@
       </div>
       {% if latest_scan_top %}
       <table>
-        <thead><tr><th>Symbol</th><th class="num">Funding APY</th><th class="num">Effective APY</th><th class="num">Interval</th><th class="num">24h Volume</th></tr></thead>
+        <thead><tr><th>Symbol</th><th class="num">Funding APY</th><th class="num">+ Earn APR</th><th class="num">Combined</th><th class="num">Effective</th><th class="num">Depth (min)</th><th class="num">Interval</th><th class="num">24h Volume</th></tr></thead>
         <tbody>
         {% for c in latest_scan_top %}
-          <tr><td class="mono">{{ c.perp }}</td><td class="num good">{{ '%.2f%%' % (c.apr * 100) }}</td><td class="num good">{{ '%.2f%%' % ((c.effective_apy or c.apr/2) * 100) }}</td><td class="num muted">{{ '%dh' % (c.interval_h or 8) }}</td><td class="num">{{ '{:,.0f}'.format(c.qv) }}</td></tr>
+          {% set depth_min = ((c.spot_depth or 0) if (c.spot_depth or 0) <= (c.perp_depth or 0) else (c.perp_depth or 0)) if c.spot_depth is defined and c.perp_depth is defined else 0 %}
+          <tr>
+            <td class="mono">{{ c.perp }}</td>
+            <td class="num good">{{ '%.2f%%' % (c.apr * 100) }}</td>
+            <td class="num">{{ '%.2f%%' % ((c.spot_earn_apr or 0) * 100) }}</td>
+            <td class="num good">{{ '%.2f%%' % ((c.combined_apy or c.apr) * 100) }}</td>
+            <td class="num good">{{ '%.2f%%' % ((c.effective_apy or c.apr/2) * 100) }}</td>
+            <td class="num">{{ '${:,.0f}'.format(depth_min) if depth_min else '—' }}</td>
+            <td class="num muted">{{ '%dh' % (c.interval_h or 8) }}</td>
+            <td class="num">{{ '{:,.0f}'.format(c.qv) }}</td>
+          </tr>
         {% endfor %}
         </tbody>
       </table>
