@@ -1,3 +1,43 @@
+"""Bot loop and per-cycle business logic.
+
+This module is the heart of the funding-rate arbitrage strategy. The
+top-level functions are:
+
+* :func:`run_loop` — long-running worker that calls :func:`run_one_cycle`
+  on a timer. Started as a daemon thread by ``app.main`` on FastAPI
+  startup (or by an external worker process).
+* :func:`run_one_cycle` — runs one pass for paper, live, or both. It
+  delegates each pass to :func:`run_one_cycle_for_mode`.
+* :func:`run_one_cycle_for_mode` — the actual cycle: maintenance →
+  reconcile → safety → exits → entry → rebalance → snapshot.
+
+Helper functions are grouped roughly by responsibility:
+
+* State accessors: :func:`get_runtime_state`, :func:`get_mode_state`,
+  :func:`get_strategy_config`, :func:`get_earn_state`.
+* Closing: :func:`_force_close_both`, :func:`_close_naked_leg`,
+  :func:`_ensure_close_readiness`, :func:`_actual_spot_qty`,
+  :func:`_actual_perp_qty`, :func:`manual_close`.
+* Capital provisioning: :func:`_rebalance_spot_fut`,
+  :func:`_take_balance_snapshot`.
+* Paper-mode simulation: :func:`_accrue_paper_yield`,
+  :func:`_accrue_paper_funding`.
+* Reconciliation: :func:`reconcile_positions` (orphan perp →
+  rehydrate), :func:`_reconcile_open_position_state` (DB open but
+  Binance flat → mark closed).
+
+Module-level state (intentional, called out explicitly):
+
+* :data:`_LIVE_API_UNHEALTHY_LOGGED` — single bool guarding the
+  "live API down" ERROR log so we only emit it once per outage
+  rather than every cycle. Reset on the next successful probe.
+* :data:`_CLOSE_ERROR_CACHE` — per ``(position_id, leg)`` cache of the
+  last error message, used to dedup close-failure logs across
+  cycles. Cleared on a successful close. Both are module-level
+  because they survive across ``run_one_cycle`` invocations within
+  the same Python process.
+"""
+
 from __future__ import annotations
 
 import json
@@ -8,7 +48,7 @@ from sqlalchemy import func, select
 
 from app.config import settings
 from app.db import SessionLocal
-from app.exchange import BinanceGateway, _interval_hours, annualize_rate
+from app.exchange import BINANCE_ERR_NO_EARN_POSITION, BinanceGateway, _interval_hours, annualize_rate
 from app.finance import position_realized_pnl, position_unrealized_pnl, total_realized_pnl
 from app.models import (
     ALL_MODES,
@@ -203,7 +243,7 @@ def _ensure_close_readiness(db, gateway: BinanceGateway, p: Position, cfg: Strat
             ok, err = gateway.earn_redeem_asset(base, deficit, False)
             if ok:
                 log_event(db, f'Pre-close: redeemed {deficit:.6f} {base} from Earn', mode=p.mode)
-            elif '-6053' in err or "doesn't exist" in err.lower() or 'no flexible product' in err.lower():
+            elif BINANCE_ERR_NO_EARN_POSITION in err or "doesn't exist" in err.lower() or 'no flexible product' in err.lower():
                 pass  # nothing was subscribed; close_spot will use whatever's already in spot
             else:
                 log_event(db, f'Pre-close: redeem {base} failed: {err[:120]}', mode=p.mode, level='WARN')

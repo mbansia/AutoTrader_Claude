@@ -1,3 +1,17 @@
+"""SQLAlchemy models — the canonical schema for the bot's local store.
+
+Every per-row table carries a :data:`mode` tag (``'paper'`` or
+``'live'``) so the same DB cleanly serves both views. Aggregate tables
+(:class:`StrategyConfig`, :class:`RuntimeState`) are single-row
+singletons; :class:`ModeState` and :class:`EarnState` are keyed by mode.
+
+Schema versioning is in-place via :func:`app.db.run_schema_migrations`
+which adds new columns with defaults. We never destructively alter
+existing columns — when semantics change (e.g. funding thresholds going
+from per-period to APY) we add a one-time data migration in
+:func:`app.bot.get_strategy_config`.
+"""
+
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text

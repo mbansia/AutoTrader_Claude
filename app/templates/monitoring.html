@@ -1,0 +1,66 @@
+{% extends 'base.html' %}
+{% block title %}Monitoring · Funding Arb{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>Monitoring</h2>
+  <div class="actions">
+    <form action="/monitoring" method="get" style="display:inline">
+      <button type="submit" class="btn">Refresh</button>
+    </form>
+  </div>
+</div>
+
+<div class="alert alert-info">
+  Raw API state for every configured exchange. Each probe runs synchronously when
+  this page loads — successes show the response (truncated to 4kB); failures
+  show the underlying ccxt / network error. Useful when something on the
+  Dashboard looks wrong and you want to see exactly what the bot sees.
+</div>
+
+{% for ex in exchanges %}
+<div class="card">
+  <h3>
+    {{ ex.name }}
+    {% if ex.configured %}
+      <span class="tag good" style="font-size:11px;margin-left:8px;">configured</span>
+    {% else %}
+      <span class="tag warn" style="font-size:11px;margin-left:8px;">not configured</span>
+    {% endif %}
+  </h3>
+  <div class="body">
+    <table style="margin-bottom:12px;">
+      <tbody>
+        <tr><th style="width:180px;">API key</th><td class="mono">{{ ex.key_masked }}</td></tr>
+        <tr><th>API secret</th><td class="mono">{{ ex.secret_masked }}</td></tr>
+        {% for cred in ex.extra_creds %}
+        <tr><th>{{ cred.label }}</th><td class="mono">{{ cred.value }}</td></tr>
+        {% endfor %}
+        {% if ex.last_balance_error %}
+        <tr><th>Last balance error</th><td class="mono bad">{{ ex.last_balance_error|truncate(220) }}</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+
+    {% if ex.probes %}
+    <div class="muted" style="font-size:12px;margin-bottom:8px;">{{ ex.probes|length }} probe(s) — click each to expand the raw response.</div>
+    {% for p in ex.probes %}
+    <details style="margin-bottom:8px;">
+      <summary style="cursor:pointer;padding:8px 12px;background:var(--panel-2);border-radius:6px;border:1px solid var(--border);">
+        {% if p.ok %}
+          <span class="tag good" style="font-size:10px;">OK</span>
+        {% else %}
+          <span class="tag bad" style="font-size:10px;">FAIL</span>
+        {% endif %}
+        <span class="mono">{{ p.label }}</span>
+        <span class="muted" style="font-size:11px;float:right;">{{ p.latency_ms }} ms</span>
+      </summary>
+      <pre style="background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;margin-top:6px;overflow-x:auto;font-size:11px;line-height:1.4;">{% if p.ok %}{{ p.raw | tojson(indent=2) | truncate(4000) }}{% else %}<span style="color:var(--bad);">{{ p.err }}</span>{% endif %}</pre>
+    </details>
+    {% endfor %}
+    {% else %}
+    <div class="empty">{% if not ex.configured %}Set the API credentials in environment variables to enable probes.{% else %}No probes registered for this exchange yet.{% endif %}</div>
+    {% endif %}
+  </div>
+</div>
+{% endfor %}
+{% endblock %}

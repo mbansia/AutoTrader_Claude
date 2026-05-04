@@ -1,3 +1,30 @@
+"""Pure-Python financial calculations, free of any HTTP / SQL state.
+
+* PnL
+    - :func:`position_realized_pnl` — closed-position trade PnL from the
+      Trade ledger (spot sells − spot buys + perp sells − perp buys − fees).
+    - :func:`position_unrealized_pnl` — mark-to-market on an open arb.
+    - :func:`total_realized_pnl`, :func:`total_funding_income`,
+      :func:`net_capital_in` — aggregations over the active mode (and
+      optionally a Binance gateway for net-injected capital).
+
+* Annualization
+    - :func:`effective_position_apy` — what the trader actually earns on
+      total deployed capital, accounting for both legs at the configured
+      leverage. ``effective ≈ funding × leverage / (leverage + 1)``.
+
+* Rate of return
+    - :func:`xirr` — Newton–Raphson XIRR over (date, cashflow) pairs.
+    - :func:`portfolio_xirr` — convenience wrapper that fetches capital
+      flows for a mode and adds the current equity as the terminal flow.
+
+* Equity composition
+    - :func:`equity_breakdown` — per-bucket slice for the donut chart on
+      the dashboard. Buckets differ for paper vs live.
+    - :func:`equity_donut_svg` — pure-SVG donut renderer (no JS chart
+      dep).
+"""
+
 from __future__ import annotations
 
 from datetime import datetime

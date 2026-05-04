@@ -1,3 +1,16 @@
+"""Database engine, session factory, and lightweight schema migrations.
+
+The bot uses a single SQLite file (configurable via the ``DATABASE_URL``
+env var). On startup the parent directory is auto-created so a fresh
+Coolify volume mount works without manual setup.
+
+:func:`run_schema_migrations` runs at app startup and applies any
+``ALTER TABLE ADD COLUMN`` statements needed to bring an older DB up to
+the current model. We keep migrations lightweight rather than pulling in
+Alembic — every migration is idempotent and only adds columns that are
+backwards-compatible (defaults supplied).
+"""
+
 import os
 
 from sqlalchemy import create_engine, inspect, text

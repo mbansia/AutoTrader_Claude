@@ -1,3 +1,28 @@
+"""Binance gateway — single point of contact for all exchange operations.
+
+The :class:`BinanceGateway` wraps two ccxt clients (spot + USDM-futures) and
+provides a uniform façade the bot uses for every cross-cutting concern:
+balances, prices, market scanning, order placement, universal transfer between
+spot/futures wallets, Simple Earn (subscribe / redeem / list), order-book
+depth measurement, and historical capital-flow lookup.
+
+Design notes
+------------
+* Every method that hits the network is wrapped to fail-soft (return
+  ``None`` / empty / a ``(False, err)`` tuple) so a transient API issue
+  doesn't crash the bot's main loop.
+* SAPI methods are looked up across a couple of ccxt name conventions
+  (``sapiV1Get…`` / ``sapi_v1_get_…``) so the gateway works across the
+  ccxt-version drift the user might encounter on their deployment.
+* Several caches (``_earn_product_id_cache``, ``_*_history_cache``) live
+  on the instance with explicit TTLs to keep API calls cheap on routes
+  that re-render frequently. They're invalidated by recreating the
+  gateway (e.g. on restart) — that's intentional.
+* Historical Binance error codes are tracked as named constants below
+  so the bot's error-handling paths use semantically meaningful names
+  rather than magic numbers.
+"""
+
 from __future__ import annotations
 
 import time
@@ -6,6 +31,17 @@ from dataclasses import dataclass, field
 import ccxt
 
 from app.config import settings
+
+
+# ─── Binance error codes we react to ────────────────────────────────────────
+# These are returned in the ccxt exception message text when Binance rejects
+# a request. We string-search rather than parse JSON because ccxt's message
+# format isn't fully stable across versions.
+
+BINANCE_ERR_INVALID_API = '-2015'           # bad key / IP not whitelisted / missing permission
+BINANCE_ERR_INSUFFICIENT_MARGIN = '-2019'   # futures order can't be placed for lack of free margin
+BINANCE_ERR_MALFORMED_AMOUNT = '-1102'      # amount param missing/empty/zero on a SAPI call
+BINANCE_ERR_NO_EARN_POSITION = '-6053'      # trying to redeem from a flexible product with no balance
 
 
 @dataclass

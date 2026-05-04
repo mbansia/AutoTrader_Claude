@@ -1,8 +1,41 @@
+"""FastAPI application — HTTP API + dashboard UI.
+
+This module owns the HTTP surface of the bot:
+
+* App lifecycle: :func:`startup` runs on app start, creates DB
+  tables, applies in-place schema migrations, and (unless the env
+  var disables it) spawns the bot worker thread.
+* Auth: HTTP Basic via :func:`auth`, scoped to every UI route. The
+  ``/health`` endpoint and ``/static`` are unauthenticated.
+* View toggle: ``/view/{mode}`` sets a cookie that scopes every
+  page to either paper or live data.
+* Mode controls: ``/mode/{mode}/{stop|start|exit-all-stop}`` flip
+  the per-mode :class:`ModeState` flags.
+* Position actions: ``/positions/{id}/close`` (manual close),
+  ``/run-once`` (synchronous one-cycle nudge), ``/worker/start``.
+* Pages: ``/dashboard`` (merged dashboard + positions + portfolio),
+  ``/transactions``, ``/logs``, ``/config``, ``/safety``,
+  ``/monitoring``.
+
+Worker thread management:
+
+* :data:`_worker_thread` is a module-level :class:`threading.Thread`
+  guarded by :data:`_worker_lock`. Single instance per process.
+  Started on app startup (gated by ``BOT_WORKER_ENABLED``) or by
+  a manual ``POST /worker/start``.
+
+The route bodies are deliberately not split into separate router
+modules yet — the codebase is small enough that one file per
+concern is overkill. If/when this file passes ~1500 lines,
+splitting routes into ``app/routes/*.py`` is the obvious next step.
+"""
+
 from __future__ import annotations
 
 import json
 import os
 import threading
+import time
 from datetime import datetime, timedelta
 
 from fastapi import Cookie, Depends, FastAPI, Form, HTTPException, Path, Request, status
@@ -694,6 +727,103 @@ def save_config(
         cfg.depth_band_bps = max(1.0, depth_band_bps)
         db.commit()
     return RedirectResponse(url='/config?saved=1', status_code=303)
+
+
+@app.get('/monitoring', response_class=HTMLResponse)
+def monitoring_page(request: Request, view: str | None = None, view_cookie: str | None = Cookie(default=None, alias='view'), _: None = Depends(auth)):
+    """Operational monitoring — raw API state for every configured exchange.
+
+    Each card runs a probe against a specific endpoint and shows whether it
+    succeeded plus the raw response (truncated). Useful for diagnosing
+    permission / IP / connectivity issues without diving into the bot logs.
+    Renders synchronously so the request takes a few seconds; that's fine
+    here because it's a debug page, not a hot path."""
+    v = _resolve_view(view, view_cookie)
+    with SessionLocal() as db:
+        ctx = _shared_ctx(request, v, db)
+        ctx['active'] = 'monitoring'
+        ctx['cfg'] = get_strategy_config(db)
+        ctx['exchanges'] = _gather_exchange_status()
+    return templates.TemplateResponse(request, 'monitoring.html', ctx)
+
+
+def _mask(secret: str, keep: int = 4) -> str:
+    if not secret:
+        return '<not set>'
+    if len(secret) <= keep * 2:
+        return '*' * len(secret)
+    return f'{secret[:keep]}…{secret[-keep:]} ({len(secret)} chars)'
+
+
+def _truncate_json(value, max_chars: int = 4000) -> str:
+    """Pretty-print `value` as JSON, truncated to `max_chars` for the UI."""
+    try:
+        text = json.dumps(value, indent=2, default=str, sort_keys=True)
+    except Exception as e:
+        text = f'<unable to serialize: {e}>'
+    if len(text) > max_chars:
+        return text[:max_chars] + f'\n… ({len(text) - max_chars} more chars truncated)'
+    return text
+
+
+def _probe(label: str, fn) -> dict:
+    """Run a probe callable and capture (ok, raw, err, latency_ms)."""
+    started = time.time()
+    try:
+        raw = fn()
+        return {'label': label, 'ok': True, 'raw': raw, 'err': '', 'latency_ms': int((time.time() - started) * 1000)}
+    except Exception as e:
+        return {'label': label, 'ok': False, 'raw': None, 'err': str(e)[:400], 'latency_ms': int((time.time() - started) * 1000)}
+
+
+def _gather_exchange_status() -> list[dict]:
+    """Build the per-exchange section list rendered on /monitoring. Today the
+    only exchange is Binance; this function is the seam where KuCoin will be
+    added once its gateway lands. The structure is intentionally generic."""
+    sections: list[dict] = []
+
+    # ---- Binance ----
+    gw = BinanceGateway()
+    has_creds = bool(settings.binance_api_key and settings.binance_api_secret)
+    probes: list[dict] = []
+    if has_creds:
+        probes.append(_probe('Spot fetch_balance()', lambda: gw.spot.fetch_balance()))
+        probes.append(_probe('Futures fetch_balance()', lambda: gw.futures.fetch_balance()))
+        probes.append(_probe('Earn flexible USDT position', lambda: gw._call_sapi((
+            'sapiV1GetSimpleEarnFlexiblePosition',
+            'sapi_v1_get_simple_earn_flexible_position',
+            'sapiGetSimpleEarnFlexiblePosition',
+        ), {'asset': 'USDT'})))
+        probes.append(_probe('Deposit history (USDT, 30d)', lambda: gw.deposit_history('USDT', lookback_days=30, ttl_seconds=0)))
+        probes.append(_probe('Withdrawal history (USDT, 30d)', lambda: gw.withdrawal_history('USDT', lookback_days=30, ttl_seconds=0)))
+        probes.append(_probe('Sub-account transfer in (USDT, 30d)', lambda: gw.sub_account_transfer_history('USDT', incoming=True, lookback_days=30, ttl_seconds=0)))
+        probes.append(_probe('Sub-account transfer out (USDT, 30d)', lambda: gw.sub_account_transfer_history('USDT', incoming=False, lookback_days=30, ttl_seconds=0)))
+        probes.append(_probe('Open perp positions', lambda: gw.open_perp_positions_raw()))
+    sections.append({
+        'name': 'Binance',
+        'configured': has_creds,
+        'key_masked': _mask(settings.binance_api_key),
+        'secret_masked': _mask(settings.binance_api_secret),
+        'extra_creds': [],
+        'probes': probes,
+        'last_balance_error': gw.last_balance_error,
+    })
+
+    # ---- KuCoin (placeholder until gateway lands) ----
+    kc_key = getattr(settings, 'kucoin_api_key', '')
+    kc_secret = getattr(settings, 'kucoin_api_secret', '')
+    kc_pass = getattr(settings, 'kucoin_api_passphrase', '')
+    sections.append({
+        'name': 'KuCoin',
+        'configured': bool(kc_key and kc_secret and kc_pass),
+        'key_masked': _mask(kc_key),
+        'secret_masked': _mask(kc_secret),
+        'extra_creds': [{'label': 'Passphrase', 'value': _mask(kc_pass)}],
+        'probes': [],
+        'last_balance_error': '(gateway not yet implemented — see docs/kucoin-integration-plan.md)',
+    })
+
+    return sections
 
 
 @app.get('/safety', response_class=HTMLResponse)

@@ -1,3 +1,16 @@
+"""Application-level settings + module-level strategy defaults.
+
+Settings are env-driven via Pydantic. Defaults are deliberately
+unrestrictive so paper-mode "just works" out of the box; LIVE mode
+requires real Binance credentials (and, optionally, a writable
+DATABASE_URL pointing at a persistent volume).
+
+The ``ENTRY_FUNDING_APR`` / ``EXIT_FUNDING_APR`` constants below are
+the *initial* values written into a fresh ``StrategyConfig`` row on
+first run. After that, the user's edits via the Configuration page
+take precedence.
+"""
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -7,6 +20,12 @@ class Settings(BaseSettings):
 
     binance_api_key: str = Field(default='')
     binance_api_secret: str = Field(default='')
+    # KuCoin requires three secrets (key + secret + passphrase). All three
+    # must be set for the future KuCoinGateway to be active. Until then the
+    # Monitoring tab still shows the configured-vs-not state.
+    kucoin_api_key: str = Field(default='')
+    kucoin_api_secret: str = Field(default='')
+    kucoin_api_passphrase: str = Field(default='')
     dashboard_user: str = Field(default='admin')
     dashboard_password: str = Field(default='change-me')
     database_url: str = Field(default='sqlite:///./bot.db')

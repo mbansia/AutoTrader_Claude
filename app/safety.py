@@ -1,3 +1,25 @@
+"""Safety guards — lightweight, pure functions and exchange-state queries.
+
+The strategy is delta-neutral by construction; this module enforces that
+property and provides the basis-aware gating for entries and voluntary
+exits.
+
+* :func:`basis_bps` — ``(perp − spot) / spot`` in basis points. Positive
+  means perp trades above spot.
+* :func:`is_basis_entry_acceptable` — refuse to open when the spread is
+  too wide in either direction. Captures the dislocation risk implied by
+  a large basis at entry.
+* :func:`is_basis_exit_favorable` — for a long-spot/short-perp arb, the
+  close direction is "sell spot, buy perp", which profits when basis ≤ 0.
+  We allow up to ``max_bps`` of unfavorable basis before deferring exit.
+* :func:`check_hedge` — verifies both legs are still on Binance with
+  approximately the expected size; returns the surviving leg name when
+  one side has gone naked.
+* :func:`check_market_health` — flags a position when either leg's
+  market on Binance is no longer in TRADING status (delisting, halt,
+  pre-settlement etc).
+"""
+
 from __future__ import annotations
 
 from app.exchange import BinanceGateway
