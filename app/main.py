@@ -14,6 +14,7 @@ from markupsafe import Markup
 from sqlalchemy import desc, func, select
 
 from app.bot import (
+    _position_leg_states,
     get_earn_state,
     get_mode_state,
     get_runtime_state,
@@ -352,6 +353,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             spot_now = gw.safe_price(p.spot_symbol) or 0.0
             perp_now = gw.safe_price(p.perp_symbol, perp=True) or 0.0
             interval_h = p.funding_interval_hours or 8.0
+            leg_states = _position_leg_states(gw, p) if v == MODE_LIVE else {'spot_alive': True, 'perp_alive': True, 'spot_actual': p.quantity, 'perp_actual': p.quantity}
             entry_trades = db.scalars(select(Trade).where(Trade.position_id == p.id, Trade.side == 'buy', Trade.venue == 'spot')).all() + \
                            db.scalars(select(Trade).where(Trade.position_id == p.id, Trade.side == 'sell', Trade.venue == 'futures')).all()
             spot_entry_trade = next((t for t in entry_trades if t.venue == 'spot'), None)
@@ -381,6 +383,13 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
                 'unrealized_pnl': position_unrealized_pnl(p, spot_now, perp_now) if (spot_now and perp_now) else 0.0,
                 'funding_income': p.funding_income_accrued,
                 'last_close_error': p.last_close_error or '',
+                'spot_alive': leg_states['spot_alive'],
+                'perp_alive': leg_states['perp_alive'],
+                'spot_actual': leg_states['spot_actual'],
+                'perp_actual': leg_states['perp_actual'],
+                'leg_status': ('fully open' if (leg_states['spot_alive'] and leg_states['perp_alive']) else
+                               ('spot only' if leg_states['spot_alive'] else
+                                ('perp only' if leg_states['perp_alive'] else 'flat (reconcile pending)'))),
                 'spot_leg': {
                     'symbol': p.spot_symbol, 'side': 'long', 'qty': p.quantity,
                     'entry_price': p.spot_entry_price, 'now_price': spot_now,
@@ -494,16 +503,40 @@ def transactions_page(request: Request, view: str | None = None, limit: int = 10
         ctx['cfg'] = get_strategy_config(db)
 
         # Position history — open + closed, newest first.
+        gw_for_legs = BinanceGateway() if v == MODE_LIVE else None
         position_rows = db.scalars(select(Position).where(Position.mode == v).order_by(desc(Position.id)).limit(limit)).all()
         positions_v = []
         for p in position_rows:
             trade_pnl = position_realized_pnl(db, p)
             ended = p.closed_at if p.closed_at else datetime.utcnow()
             hold = ended - p.opened_at
+            # Per-leg state from Binance (live only). Closed positions show
+            # both legs as "flat" since there's nothing to verify.
+            if v == MODE_LIVE and p.status == 'open' and gw_for_legs is not None:
+                st = _position_leg_states(gw_for_legs, p)
+                spot_alive = st['spot_alive']
+                perp_alive = st['perp_alive']
+            elif p.status == 'open':
+                spot_alive = perp_alive = True  # paper assumes both are good
+            else:
+                spot_alive = perp_alive = False  # closed → both flat
+            if p.status == 'closed':
+                leg_label = 'closed'
+            elif spot_alive and perp_alive:
+                leg_label = 'fully open'
+            elif spot_alive:
+                leg_label = 'spot only (naked long)'
+            elif perp_alive:
+                leg_label = 'perp only (naked short)'
+            else:
+                leg_label = 'flat (reconcile pending)'
             positions_v.append({
                 'id': p.id,
                 'symbol': p.symbol,
                 'status': p.status,
+                'leg_label': leg_label,
+                'spot_alive': spot_alive,
+                'perp_alive': perp_alive,
                 'quantity': p.quantity,
                 'notional_entry': p.quantity * p.spot_entry_price,
                 'spot_entry': p.spot_entry_price,

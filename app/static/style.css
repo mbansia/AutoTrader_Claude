@@ -412,6 +412,7 @@ tr.position-stuck:hover > td { background: color-mix(in srgb, var(--bad) 14%, tr
 }
 .leg-card.leg-spot { border-left: 3px solid var(--good); }
 .leg-card.leg-perp { border-left: 3px solid var(--bad); }
+.leg-card.leg-flat { opacity: 0.55; border-left-style: dashed; }
 .leg-title { font-size: 13px; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
 .leg-table { width: 100%; }
 .leg-table th, .leg-table td { padding: 6px 0; border-bottom: 1px dashed var(--border); font-size: 12.5px; }

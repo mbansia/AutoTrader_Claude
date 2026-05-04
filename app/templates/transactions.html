@@ -14,7 +14,7 @@
     <thead>
       <tr>
         <th>Symbol</th>
-        <th>Status</th>
+        <th>Status / legs</th>
         <th class="num">Qty</th>
         <th class="num">Entry notional</th>
         <th class="num">Spot entry</th>
@@ -31,7 +31,15 @@
     {% for p in positions %}
       <tr {% if p.last_close_error %}class="position-stuck" title="Close blocked: {{ p.last_close_error }}"{% endif %}>
         <td class="mono">{{ p.symbol }}{% if p.last_close_error %} <span class="tag bad" style="font-size:10px;margin-left:4px;">CLOSE BLOCKED</span>{% endif %}</td>
-        <td><span class="tag {{ 'good' if p.status == 'open' else '' }}">{{ p.status }}</span></td>
+        <td>
+          <span class="tag {{ 'good' if p.status == 'open' else '' }}">{{ p.status }}</span>
+          {% if p.status == 'open' %}
+            {% if p.spot_alive and p.perp_alive %}<span class="tag good" style="font-size:10px;">both legs</span>
+            {% elif p.spot_alive %}<span class="tag warn" style="font-size:10px;">spot only · naked long</span>
+            {% elif p.perp_alive %}<span class="tag warn" style="font-size:10px;">perp only · naked short</span>
+            {% else %}<span class="tag" style="font-size:10px;">flat (reconcile pending)</span>{% endif %}
+          {% endif %}
+        </td>
         <td class="num">{{ '%.6f' % p.quantity }}</td>
         <td class="num">{{ '%.4f' % p.notional_entry }}</td>
         <td class="num">{{ '%.6f' % p.spot_entry }}</td>

@@ -302,6 +302,42 @@ def _actual_perp_qty(gateway: BinanceGateway, p: Position) -> float:
     return 0.0
 
 
+def _position_leg_states(gateway: BinanceGateway, p: Position, tolerance: float = 0.05) -> dict:
+    """Returns per-leg state vs Binance for a position. Used for UI display
+    and the cycle's reconciliation step.
+
+    spot_alive / perp_alive: True if the actual quantity on Binance is at
+    least (1 - tolerance) × p.quantity. Tolerance accounts for fee/lot-size
+    drift between DB qty and actual balance."""
+    spot_actual = _actual_spot_qty(gateway, p)
+    perp_actual = _actual_perp_qty(gateway, p)
+    threshold = p.quantity * (1.0 - tolerance)
+    return {
+        'spot_actual': spot_actual,
+        'perp_actual': perp_actual,
+        'spot_alive': spot_actual >= threshold,
+        'perp_alive': perp_actual >= threshold,
+    }
+
+
+def _reconcile_open_position_state(db, gateway: BinanceGateway, mode: str) -> None:
+    """For each open position in this mode, check Binance's actual leg state.
+    If both legs are flat on Binance (e.g., the user closed manually, or a
+    previous partial close fully completed externally), mark the row closed
+    in DB so the UI matches reality. Live mode only."""
+    if mode != MODE_LIVE:
+        return
+    for p in db.scalars(select(Position).where(Position.status == 'open', Position.mode == MODE_LIVE)).all():
+        st = _position_leg_states(gateway, p)
+        if not st['spot_alive'] and not st['perp_alive']:
+            p.status = 'closed'
+            p.closed_at = datetime.utcnow()
+            p.last_close_error = ''
+            _CLOSE_ERROR_CACHE.pop((p.id, 'spot'), None)
+            _CLOSE_ERROR_CACHE.pop((p.id, 'perp'), None)
+            log_event(db, f'Reconciled {p.perp_symbol}: both legs flat on Binance — marking closed', mode=mode)
+
+
 def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyConfig, reason: str) -> None:
     """Close both legs of a position. The whole point of an arb is being hedged,
     so we never WANT to leave one leg open — if either close fails we either
@@ -572,6 +608,14 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                         log_event(db, f'Rehydrated orphan position {sym} qty={pos_amt}', mode=MODE_LIVE, level='WARN')
                 except Exception as e:
                     log_event(db, f'Reconcile failed: {str(e)[:120]}', mode=MODE_LIVE, level='WARN')
+                # And the inverse direction: if a position is open in our DB but
+                # both legs are actually flat on Binance (user closed manually,
+                # or a partial close fully completed outside the bot), mark it
+                # closed so the UI stops showing phantom "open" rows.
+                try:
+                    _reconcile_open_position_state(db, gateway, mode)
+                except Exception as e:
+                    log_event(db, f'State reconcile failed: {str(e)[:120]}', mode=MODE_LIVE, level='WARN')
 
             # Live short-circuit: if entries are off, no positions, and no earn or
             # auto-transfer to do, skip the API hits entirely.
@@ -879,7 +923,13 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
 
             prev_snap = db.scalar(select(BalanceSnapshot).where(BalanceSnapshot.source == mode).order_by(BalanceSnapshot.id.desc()).limit(1))
             snap = _take_balance_snapshot(db, gateway, mode, cfg, earn)
-            _detect_capital_flow(db, prev_snap, snap, mode)
+            # Note: live capital flows come from Binance deposit/withdraw +
+            # sub-account-transfer history via gateway.net_injected_capital_usdt().
+            # We previously also auto-detected balance jumps here, but that
+            # heuristic mistook funding payments and mark-price drift for
+            # withdrawals, polluting the Capital Flows table with phantom
+            # entries. The CapitalFlow table is now manual-only (or paper).
+            _ = prev_snap  # kept for the next-cycle baseline; no longer compared.
             db.add(EquityCurve(mode=mode, equity_usdt=snap.total_usdt))
             db.commit()
     except Exception as e:

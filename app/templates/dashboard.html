@@ -165,7 +165,14 @@
       {% for r in rows %}
       <tr class="position-row {{ 'position-stuck' if r.last_close_error }}" data-pos-id="{{ r.id }}" {% if r.last_close_error %}title="Close blocked: {{ r.last_close_error }}"{% endif %}>
         <td><button type="button" class="row-toggle" aria-expanded="false" aria-controls="detail-{{ r.id }}" onclick="togglePositionDetail({{ r.id }}, this)">▶</button></td>
-        <td class="mono">{{ r.symbol }}{% if r.last_close_error %} <span class="tag bad" style="font-size:10px;margin-left:4px;">CLOSE BLOCKED</span>{% endif %}</td>
+        <td class="mono">{{ r.symbol }}
+          {% if r.last_close_error %}<span class="tag bad" style="font-size:10px;margin-left:4px;">CLOSE BLOCKED</span>
+          {% elif r.spot_alive and r.perp_alive %}<span class="tag good" style="font-size:10px;margin-left:4px;">BOTH LEGS</span>
+          {% elif r.spot_alive %}<span class="tag warn" style="font-size:10px;margin-left:4px;">SPOT ONLY (naked long)</span>
+          {% elif r.perp_alive %}<span class="tag warn" style="font-size:10px;margin-left:4px;">PERP ONLY (naked short)</span>
+          {% else %}<span class="tag" style="font-size:10px;margin-left:4px;">FLAT (reconcile pending)</span>
+          {% endif %}
+        </td>
         <td class="num">{{ ('%.2f' % r.notional_now) if r.notional_now else ('%.2f' % r.notional_entry) }}</td>
         <td class="num {{ 'good' if r.last_funding_apy >= cfg.exit_funding_threshold else 'warn' }}">{{ '%.2f%%' % (r.last_funding_apy * 100) }} <span class="muted" style="font-size:11px;">({{ '%dh' % r.interval_hours }})</span></td>
         <td class="num">{{ '%.2f%%' % (r.effective_apy * 100) }}</td>
@@ -193,8 +200,13 @@
     </div>
     {% endif %}
     <div class="leg-grid">
-      <div class="leg-card leg-spot">
-        <div class="leg-title"><span class="tag good">SPOT · long</span> <span class="mono">{{ r.spot_leg.symbol }}</span></div>
+      <div class="leg-card leg-spot {{ 'leg-flat' if not r.spot_alive }}">
+        <div class="leg-title">
+          <span class="tag good">SPOT · long</span>
+          <span class="mono">{{ r.spot_leg.symbol }}</span>
+          {% if r.spot_alive %}<span class="tag good" style="font-size:10px;">on-chain · {{ '%.6f' % r.spot_actual }}</span>
+          {% else %}<span class="tag bad" style="font-size:10px;">flat (closed externally?)</span>{% endif %}
+        </div>
         <table class="leg-table">
           <tr><th>Quantity</th><td class="num">{{ '%.6f' % r.spot_leg.qty }}</td></tr>
           <tr><th>Entry price</th><td class="num">{{ '%.6f' % r.spot_leg.entry_price }} USDT</td></tr>
@@ -206,8 +218,13 @@
           <tr><th>Filled at</th><td class="muted mono">{{ r.spot_leg.entry_ts }}</td></tr>
         </table>
       </div>
-      <div class="leg-card leg-perp">
-        <div class="leg-title"><span class="tag bad">PERP · short</span> <span class="mono">{{ r.perp_leg.symbol }}</span></div>
+      <div class="leg-card leg-perp {{ 'leg-flat' if not r.perp_alive }}">
+        <div class="leg-title">
+          <span class="tag bad">PERP · short</span>
+          <span class="mono">{{ r.perp_leg.symbol }}</span>
+          {% if r.perp_alive %}<span class="tag good" style="font-size:10px;">on-chain · {{ '%.6f' % r.perp_actual }}</span>
+          {% else %}<span class="tag bad" style="font-size:10px;">flat (closed externally?)</span>{% endif %}
+        </div>
         <table class="leg-table">
           <tr><th>Quantity</th><td class="num">{{ '%.6f' % r.perp_leg.qty }}</td></tr>
           <tr><th>Entry price</th><td class="num">{{ '%.6f' % r.perp_leg.entry_price }} USDT</td></tr>
