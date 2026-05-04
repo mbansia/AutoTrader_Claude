@@ -367,7 +367,17 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         if v == MODE_PAPER:
             tracked = sum(max(0.0, i['value']) for i in breakdown_items)
             free_cash = max(0.0, current_equity - tracked)
-            breakdown_items.insert(0, {'label': 'Free cash', 'value': free_cash, 'color': '#38bdf8'})
+            breakdown_items.insert(0, {'label': 'Paper · Free cash', 'value': free_cash, 'color': '#38bdf8', 'venue': 'paper'})
+        # Group by venue so the donut + legend can show "single pool, per-venue
+        # breakdown" rather than just a flat list of buckets. Today only
+        # Binance + paper are populated; KuCoin / IBKR slot in here later.
+        venue_totals: dict[str, float] = {}
+        for item in breakdown_items:
+            venue_totals[item.get('venue', 'unknown')] = venue_totals.get(item.get('venue', 'unknown'), 0.0) + max(0.0, item['value'])
+        ctx['venue_totals'] = sorted(
+            ({'venue': vn, 'total': tot} for vn, tot in venue_totals.items() if tot > 0),
+            key=lambda x: x['total'], reverse=True,
+        )
         ctx['breakdown_items'] = breakdown_items
         ctx['breakdown_donut'] = equity_donut_svg(breakdown_items)
         ctx['equity_stale'] = equity_stale
@@ -396,6 +406,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             rows.append({
                 'id': p.id,
                 'symbol': p.symbol,
+                'venue': p.exchange,
                 'quantity': p.quantity,
                 'spot_symbol': p.spot_symbol,
                 'perp_symbol': p.perp_symbol,
@@ -451,6 +462,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         closed = [{
             'id': c.id,
             'symbol': c.symbol,
+            'venue': c.exchange,
             'quantity': c.quantity,
             'opened_at': _fmt_ts(c.opened_at),
             'closed_at': _fmt_ts(c.closed_at),
@@ -566,6 +578,7 @@ def transactions_page(request: Request, view: str | None = None, limit: int = 10
             positions_v.append({
                 'id': p.id,
                 'symbol': p.symbol,
+                'venue': p.exchange,
                 'status': p.status,
                 'leg_label': leg_label,
                 'spot_alive': spot_alive,
@@ -586,7 +599,8 @@ def transactions_page(request: Request, view: str | None = None, limit: int = 10
         # Trades — last `limit`, filtered by mode.
         trade_rows = db.scalars(select(Trade).where(Trade.mode == v).order_by(desc(Trade.id)).limit(limit)).all()
         trades_v = [{
-            'id': t.id, 'ts': _fmt_ts(t.ts), 'symbol': t.symbol, 'venue': t.venue,
+            'id': t.id, 'ts': _fmt_ts(t.ts), 'symbol': t.symbol,
+            'exchange': t.exchange, 'leg': t.venue,
             'side': t.side, 'quantity': t.quantity, 'price': t.price,
             'notional': t.quantity * t.price, 'fee': t.fee, 'position_id': t.position_id,
         } for t in trade_rows]
@@ -648,7 +662,7 @@ def logs_page(request: Request, view: str | None = None, view_cookie: str | None
         rejected_v = [{'ts': _fmt_ts(r.ts), 'symbol': r.symbol, 'reason': r.reason, 'funding_rate': r.funding_rate} for r in rejected]
 
         trades = db.scalars(select(Trade).where(Trade.mode == v).order_by(desc(Trade.id)).limit(30)).all()
-        trades_v = [{'ts': _fmt_ts(t.ts), 'symbol': t.symbol, 'venue': t.venue, 'side': t.side, 'quantity': t.quantity, 'price': t.price, 'fee': t.fee} for t in trades]
+        trades_v = [{'ts': _fmt_ts(t.ts), 'symbol': t.symbol, 'exchange': t.exchange, 'leg': t.venue, 'side': t.side, 'quantity': t.quantity, 'price': t.price, 'fee': t.fee} for t in trades]
 
         ctx.update({'scans': scans, 'events': events_v, 'rejected': rejected_v, 'trades': trades_v})
     response = templates.TemplateResponse(request, 'logs.html', ctx)
@@ -777,15 +791,20 @@ def _probe(label: str, fn) -> dict:
 
 
 def _gather_exchange_status() -> list[dict]:
-    """Build the per-exchange section list rendered on /monitoring. Today the
-    only exchange is Binance; this function is the seam where KuCoin will be
-    added once its gateway lands. The structure is intentionally generic."""
+    """Build the per-venue section list rendered on /monitoring. The system
+    treats the whole portfolio as a single pool of capital distributed across
+    venues — this function is the seam where each venue's gateway exposes its
+    slice of the pool (capital subtotal + raw API probes). Adding KuCoin /
+    Interactive Brokers means appending another section here once their
+    gateways land. The structure is intentionally generic."""
     sections: list[dict] = []
 
     # ---- Binance ----
     gw = BinanceGateway()
     has_creds = bool(settings.binance_api_key and settings.binance_api_secret)
     probes: list[dict] = []
+    capital_subtotal = 0.0
+    capital_breakdown: list[dict] = []
     if has_creds:
         probes.append(_probe('Spot fetch_balance()', lambda: gw.spot.fetch_balance()))
         probes.append(_probe('Futures fetch_balance()', lambda: gw.futures.fetch_balance()))
@@ -799,28 +818,74 @@ def _gather_exchange_status() -> list[dict]:
         probes.append(_probe('Sub-account transfer in (USDT, 30d)', lambda: gw.sub_account_transfer_history('USDT', incoming=True, lookback_days=30, ttl_seconds=0)))
         probes.append(_probe('Sub-account transfer out (USDT, 30d)', lambda: gw.sub_account_transfer_history('USDT', incoming=False, lookback_days=30, ttl_seconds=0)))
         probes.append(_probe('Open perp positions', lambda: gw.open_perp_positions_raw()))
+        # Capital subtotal: cash + spot assets + futures + earn (all USDT-denominated).
+        bals = gw.safe_balances() or {}
+        spot_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
+        fut_usdt = float((bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
+        spot_assets = 0.0
+        META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
+        for asset, bal in (bals.get('spot') or {}).items():
+            if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+                continue
+            qty = float(bal.get('total') or 0)
+            if qty <= 0:
+                continue
+            px = gw.safe_price(f'{asset}/USDT') or 0
+            spot_assets += qty * px
+        earn_usdt, _ = gw.earn_balance_usdt()
+        earn_usdt = earn_usdt or 0.0
+        capital_breakdown = [
+            {'label': 'Spot · USDT', 'value': spot_usdt},
+            {'label': 'Spot · assets', 'value': spot_assets},
+            {'label': 'Futures · USDT', 'value': fut_usdt},
+            {'label': 'Earn · USDT', 'value': earn_usdt},
+        ]
+        capital_subtotal = spot_usdt + spot_assets + fut_usdt + earn_usdt
     sections.append({
         'name': 'Binance',
+        'venue_id': 'binance',
         'configured': has_creds,
         'key_masked': _mask(settings.binance_api_key),
         'secret_masked': _mask(settings.binance_api_secret),
         'extra_creds': [],
         'probes': probes,
         'last_balance_error': gw.last_balance_error,
+        'capital_subtotal_usdt': capital_subtotal,
+        'capital_breakdown': capital_breakdown,
+        'role': 'spot + USDM-perp arb (active)',
     })
 
-    # ---- KuCoin (placeholder until gateway lands) ----
+    # ---- KuCoin (gateway pending) ----
     kc_key = getattr(settings, 'kucoin_api_key', '')
     kc_secret = getattr(settings, 'kucoin_api_secret', '')
     kc_pass = getattr(settings, 'kucoin_api_passphrase', '')
     sections.append({
         'name': 'KuCoin',
+        'venue_id': 'kucoin',
         'configured': bool(kc_key and kc_secret and kc_pass),
         'key_masked': _mask(kc_key),
         'secret_masked': _mask(kc_secret),
         'extra_creds': [{'label': 'Passphrase', 'value': _mask(kc_pass)}],
         'probes': [],
-        'last_balance_error': '(gateway not yet implemented — see docs/kucoin-integration-plan.md)',
+        'last_balance_error': '',
+        'capital_subtotal_usdt': 0.0,
+        'capital_breakdown': [],
+        'role': 'spot + USDM-perp arb (gateway pending — see docs/kucoin-integration-plan.md)',
+    })
+
+    # ---- Interactive Brokers (future — for cross-asset arb / equities) ----
+    sections.append({
+        'name': 'Interactive Brokers',
+        'venue_id': 'ibkr',
+        'configured': False,
+        'key_masked': '<not yet wired>',
+        'secret_masked': '<not yet wired>',
+        'extra_creds': [],
+        'probes': [],
+        'last_balance_error': '',
+        'capital_subtotal_usdt': 0.0,
+        'capital_breakdown': [],
+        'role': 'cross-asset / equities (future) — for high-funding stock perps like INCL, MSTR',
     })
 
     return sections
@@ -970,7 +1035,7 @@ def _render_export_md(v: str) -> str:
             else:
                 st = {'spot_actual': p.quantity, 'perp_actual': p.quantity, 'spot_alive': True, 'perp_alive': True, 'spot_min': 0.0, 'perp_min': 0.0}
             op_rows.append([
-                p.id, p.symbol, p.spot_symbol, p.perp_symbol, p.quantity,
+                p.id, p.exchange, p.symbol, p.spot_symbol, p.perp_symbol, p.quantity,
                 p.spot_entry_price, p.perp_entry_price,
                 st['spot_actual'], st['perp_actual'],
                 st['spot_min'], st['perp_min'],
@@ -979,10 +1044,11 @@ def _render_export_md(v: str) -> str:
                 p.funding_income_accrued, p.opened_at, p.last_close_error or '',
             ])
         parts.append(_md_table(
-            ['id', 'symbol', 'spot_symbol', 'perp_symbol', 'qty', 'spot_entry', 'perp_entry',
-             'spot_actual', 'perp_actual', 'spot_min_lot', 'perp_min_lot',
+            ['id', 'venue', 'symbol', 'spot_symbol', 'perp_symbol', 'qty (base)',
+             'spot_entry (USDT)', 'perp_entry (USDT)',
+             'spot_actual (base)', 'perp_actual (base)', 'spot_min_lot (base)', 'perp_min_lot (base)',
              'spot_alive', 'perp_alive', 'last_funding_rate', 'interval_h',
-             'funding_income', 'opened_at', 'last_close_error'],
+             'funding_income (USD)', 'opened_at', 'last_close_error'],
             op_rows,
         ))
 
@@ -992,13 +1058,14 @@ def _render_export_md(v: str) -> str:
         cp_rows = []
         for c in closed_positions:
             cp_rows.append([
-                c.id, c.symbol, c.quantity,
+                c.id, c.exchange, c.symbol, c.quantity,
                 c.spot_entry_price, c.perp_entry_price,
                 position_realized_pnl(db, c), c.funding_income_accrued,
                 c.opened_at, c.closed_at,
             ])
         parts.append(_md_table(
-            ['id', 'symbol', 'qty', 'spot_entry', 'perp_entry', 'trade_pnl', 'funding_income', 'opened_at', 'closed_at'],
+            ['id', 'venue', 'symbol', 'qty (base)', 'spot_entry (USDT)', 'perp_entry (USDT)',
+             'trade_pnl (USD)', 'funding_income (USD)', 'opened_at', 'closed_at'],
             cp_rows,
         ))
 
@@ -1006,15 +1073,15 @@ def _render_export_md(v: str) -> str:
         trades = db.scalars(select(Trade).where(Trade.mode == v).order_by(desc(Trade.id)).limit(100)).all()
         parts.append(f'\n## Recent trades ({v}) — last {len(trades)}\n')
         parts.append(_md_table(
-            ['id', 'ts', 'position_id', 'symbol', 'venue', 'side', 'qty', 'price', 'fee'],
-            [[t.id, t.ts, t.position_id, t.symbol, t.venue, t.side, t.quantity, t.price, t.fee] for t in trades],
+            ['id', 'ts', 'venue', 'leg', 'position_id', 'symbol', 'side', 'qty (base)', 'price (USDT)', 'fee (USDT)'],
+            [[t.id, t.ts, t.exchange, t.venue, t.position_id, t.symbol, t.side, t.quantity, t.price, t.fee] for t in trades],
         ))
 
         # ---- Capital flows ----
         flows = db.scalars(select(CapitalFlow).where(CapitalFlow.mode == v).order_by(desc(CapitalFlow.id)).limit(100)).all()
         parts.append(f'\n## Capital flows ({v}) — last {len(flows)}\n')
         parts.append(_md_table(
-            ['id', 'ts', 'amount_usdt', 'kind', 'detected_by', 'note'],
+            ['id', 'ts', 'amount (USDT)', 'kind', 'detected_by', 'note'],
             [[f.id, f.ts, f.amount_usdt, f.kind, f.detected_by, f.note] for f in flows],
         ))
 

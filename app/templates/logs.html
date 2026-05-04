@@ -9,7 +9,7 @@
   <h3>Scan history (last 50)</h3>
   {% if scans %}
   <table>
-    <thead><tr><th>Time</th><th class="num">Total</th><th class="num">Passing</th><th>Action</th><th>Top candidate</th><th>Note</th></tr></thead>
+    <thead><tr><th>Time</th><th class="num">Total (#)</th><th class="num">Passing (#)</th><th>Action</th><th>Top candidate</th><th>Note</th></tr></thead>
     <tbody>
       {% for s in scans %}
       <tr>
@@ -49,10 +49,10 @@
   <h3>Rejected candidates (last 50)</h3>
   {% if rejected %}
   <table>
-    <thead><tr><th>Time</th><th>Symbol</th><th>Reason</th><th class="num">Funding APR</th></tr></thead>
+    <thead><tr><th>Time</th><th>Symbol</th><th>Reason</th><th class="num">Funding APY (%)</th></tr></thead>
     <tbody>
     {% for r in rejected %}
-      <tr><td class="muted mono">{{ r.ts }}</td><td class="mono">{{ r.symbol }}</td><td>{{ r.reason }}</td><td class="num">{{ '%.2f%%' % (r.funding_rate * 100) }}</td></tr>
+      <tr><td class="muted mono">{{ r.ts }}</td><td class="mono">{{ r.symbol }}</td><td>{{ r.reason }}</td><td class="num">{{ '%.2f' % (r.funding_rate * 100) }}</td></tr>
     {% endfor %}
     </tbody>
   </table>
@@ -65,13 +65,23 @@
   <h3>Recent trades (last 30)</h3>
   {% if trades %}
   <table>
-    <thead><tr><th>Time</th><th>Symbol</th><th>Venue</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Fee</th></tr></thead>
+    <thead><tr>
+      <th>Time</th>
+      <th>Symbol</th>
+      <th>Venue</th>
+      <th>Leg</th>
+      <th>Side</th>
+      <th class="num">Qty (base)</th>
+      <th class="num">Price (USDT)</th>
+      <th class="num">Fee (USDT)</th>
+    </tr></thead>
     <tbody>
     {% for t in trades %}
       <tr>
         <td class="muted mono">{{ t.ts }}</td>
         <td class="mono">{{ t.symbol }}</td>
-        <td>{{ t.venue }}</td>
+        <td><span class="tag">{{ t.exchange }}</span></td>
+        <td><span class="tag">{{ t.leg }}</span></td>
         <td><span class="tag {{ 'good' if t.side == 'buy' else 'bad' }}">{{ t.side }}</span></td>
         <td class="num">{{ '%.6f' % t.quantity }}</td>
         <td class="num">{{ '%.6f' % t.price }}</td>

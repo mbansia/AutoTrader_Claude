@@ -54,6 +54,7 @@ from app.models import (
     ALL_MODES,
     MODE_LIVE,
     MODE_PAPER,
+    VENUE_BINANCE,
     BalanceSnapshot,
     BotEvent,
     CapitalFlow,
@@ -193,8 +194,22 @@ def get_strategy_config(db) -> StrategyConfig:
     return cfg
 
 
-def record_trade(db, position_id: int | None, mode: str, symbol: str, venue: str, side: str, qty: float, order: dict):
-    db.add(Trade(mode=mode, position_id=position_id, symbol=symbol, venue=venue, side=side, quantity=qty, price=float(order.get('price') or 0), fee=float((order.get('fee') or {}).get('cost') or 0)))
+def record_trade(db, position_id: int | None, mode: str, symbol: str, venue: str, side: str, qty: float, order: dict, exchange: str = VENUE_BINANCE):
+    """Record a single fill. ``venue`` is the leg ('spot' / 'futures').
+    ``exchange`` is the broker the fill happened on (Binance, KuCoin, IBKR…)
+    — the system treats the whole portfolio as a single pool distributed
+    across these exchanges."""
+    db.add(Trade(
+        mode=mode,
+        exchange=exchange,
+        position_id=position_id,
+        symbol=symbol,
+        venue=venue,
+        side=side,
+        quantity=qty,
+        price=float(order.get('price') or 0),
+        fee=float((order.get('fee') or {}).get('cost') or 0),
+    ))
 
 
 def _log_close_error(db, p: Position, leg: str, err: str) -> None:
@@ -530,7 +545,7 @@ def reconcile_positions(gateway: BinanceGateway) -> None:
             if existing or pos_amt == 0:
                 continue
             base = symbol.split('/')[0]
-            db.add(Position(mode=MODE_LIVE, symbol=base, spot_symbol=f'{base}/USDT', perp_symbol=symbol, quantity=abs(pos_amt), entry_funding_rate=0.0))
+            db.add(Position(mode=MODE_LIVE, exchange=VENUE_BINANCE, symbol=base, spot_symbol=f'{base}/USDT', perp_symbol=symbol, quantity=abs(pos_amt), entry_funding_rate=0.0))
             log_event(db, f'Rehydrated orphan position {symbol} qty={pos_amt}', mode=MODE_LIVE)
         db.commit()
 
@@ -684,7 +699,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                             continue
                         base = sym.split('/')[0]
                         db.add(Position(
-                            mode=MODE_LIVE, symbol=base,
+                            mode=MODE_LIVE, exchange=VENUE_BINANCE, symbol=base,
                             spot_symbol=f'{base}/USDT', perp_symbol=sym,
                             quantity=pos_amt, entry_funding_rate=0.0,
                             last_funding_accrual_ts=datetime.utcnow(),
@@ -896,6 +911,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                         # rollback path (or next-cycle hedge check) has a row to attach to.
                         pos = Position(
                             mode=mode,
+                            exchange=VENUE_BINANCE,
                             symbol=c.spot_symbol.split('/')[0],
                             spot_symbol=c.spot_symbol,
                             perp_symbol=c.perp_symbol,

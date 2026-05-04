@@ -93,8 +93,12 @@ def total_funding_income(db, mode: str | None = None, status: str | None = None)
 
 def equity_breakdown(db, gateway, mode: str, earn_deployed: float) -> list[dict]:
     """Return a per-component slice of total equity for the donut chart.
-    Each item: {label, value, color}. Designed for both paper and live."""
-    from app.models import Position, MODE_LIVE
+    Each item: ``{label, value, color, venue}``. ``venue`` tags the bucket to
+    the exchange / broker it lives on so the dashboard can group buckets by
+    venue and show a "single pool, multiple venues" breakdown. Today every
+    bucket is on Binance (or the synthetic ``paper`` book); KuCoin and
+    Interactive Brokers slot in here once their gateways land."""
+    from app.models import Position, MODE_LIVE, VENUE_BINANCE
     PALETTE = {
         'spot_usdt': '#38bdf8',
         'fut_usdt': '#fbbf24',
@@ -119,10 +123,10 @@ def equity_breakdown(db, gateway, mode: str, earn_deployed: float) -> list[dict]
                 continue
             px = gateway.safe_price(f'{asset}/USDT') or 0
             spot_assets += qty * px
-        items.append({'label': 'Spot USDT', 'value': spot_usdt, 'color': PALETTE['spot_usdt']})
-        items.append({'label': 'Futures USDT', 'value': fut_usdt, 'color': PALETTE['fut_usdt']})
-        items.append({'label': 'Spot assets', 'value': spot_assets, 'color': PALETTE['spot_assets']})
-        items.append({'label': 'In Earn', 'value': earn_deployed, 'color': PALETTE['earn']})
+        items.append({'label': 'Binance · Spot USDT', 'value': spot_usdt, 'color': PALETTE['spot_usdt'], 'venue': VENUE_BINANCE})
+        items.append({'label': 'Binance · Futures USDT', 'value': fut_usdt, 'color': PALETTE['fut_usdt'], 'venue': VENUE_BINANCE})
+        items.append({'label': 'Binance · Spot assets', 'value': spot_assets, 'color': PALETTE['spot_assets'], 'venue': VENUE_BINANCE})
+        items.append({'label': 'Binance · Earn', 'value': earn_deployed, 'color': PALETTE['earn'], 'venue': VENUE_BINANCE})
     else:
         open_ps = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all()
         in_positions = sum(p.quantity * p.spot_entry_price for p in open_ps)
@@ -135,8 +139,8 @@ def equity_breakdown(db, gateway, mode: str, earn_deployed: float) -> list[dict]
         # Caller computes total_equity separately; we expose the raw components.
         # We don't include realized + funding in items because they're already
         # rolled into "free cash" in paper accounting.
-        items.append({'label': 'In positions', 'value': max(0.0, in_positions), 'color': PALETTE['in_positions']})
-        items.append({'label': 'In Earn', 'value': earn_deployed, 'color': PALETTE['earn']})
+        items.append({'label': 'Paper · In positions', 'value': max(0.0, in_positions), 'color': PALETTE['in_positions'], 'venue': 'paper'})
+        items.append({'label': 'Paper · In Earn', 'value': earn_deployed, 'color': PALETTE['earn'], 'venue': 'paper'})
         # 'Free cash' computed by caller and added so totals match.
     return items
 

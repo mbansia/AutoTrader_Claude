@@ -14,23 +14,25 @@
     <thead>
       <tr>
         <th>Symbol</th>
+        <th>Venue</th>
         <th>Status / legs</th>
-        <th class="num">Qty</th>
-        <th class="num">Entry notional</th>
-        <th class="num">Spot entry</th>
-        <th class="num">Perp entry</th>
+        <th class="num">Qty (base)</th>
+        <th class="num">Entry notional (USDT)</th>
+        <th class="num">Spot entry (USDT)</th>
+        <th class="num">Perp entry (USDT)</th>
         <th>Opened</th>
         <th>Closed</th>
         <th class="num">Hold</th>
-        <th class="num">Trade PnL</th>
-        <th class="num">Funding earned</th>
-        <th class="num">Realized total</th>
+        <th class="num">Trade PnL (USD)</th>
+        <th class="num">Funding earned (USD)</th>
+        <th class="num">Realized total (USD)</th>
       </tr>
     </thead>
     <tbody>
     {% for p in positions %}
       <tr {% if p.last_close_error %}class="position-stuck" title="Close blocked: {{ p.last_close_error }}"{% endif %}>
         <td class="mono">{{ p.symbol }}{% if p.last_close_error %} <span class="tag bad" style="font-size:10px;margin-left:4px;">CLOSE BLOCKED</span>{% endif %}</td>
+        <td><span class="tag">{{ p.venue }}</span></td>
         <td>
           <span class="tag {{ 'good' if p.status == 'open' else '' }}">{{ p.status }}</span>
           {% if p.status == 'open' %}
@@ -65,13 +67,25 @@
   {% if trades %}
   <div class="table-wrapper">
   <table>
-    <thead><tr><th>Time</th><th>Symbol</th><th>Venue</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Notional</th><th class="num">Fee</th><th class="num">Position</th></tr></thead>
+    <thead><tr>
+      <th>Time</th>
+      <th>Symbol</th>
+      <th>Venue</th>
+      <th>Leg</th>
+      <th>Side</th>
+      <th class="num">Qty (base)</th>
+      <th class="num">Price (USDT)</th>
+      <th class="num">Notional (USDT)</th>
+      <th class="num">Fee (USDT)</th>
+      <th class="num">Position #</th>
+    </tr></thead>
     <tbody>
     {% for t in trades %}
       <tr>
         <td class="muted mono">{{ t.ts }}</td>
         <td class="mono">{{ t.symbol }}</td>
-        <td><span class="tag">{{ t.venue }}</span></td>
+        <td><span class="tag">{{ t.exchange }}</span></td>
+        <td><span class="tag">{{ t.leg }}</span></td>
         <td><span class="tag {{ 'good' if t.side == 'buy' else 'bad' }}">{{ t.side }}</span></td>
         <td class="num">{{ '%.6f' % t.quantity }}</td>
         <td class="num">{{ '%.6f' % t.price }}</td>
@@ -114,7 +128,7 @@
   <h3>Capital flows</h3>
   {% if flows %}
   <table>
-    <thead><tr><th>Date</th><th class="num">Amount</th><th>Kind</th><th>Detected</th><th>Note</th></tr></thead>
+    <thead><tr><th>Date</th><th class="num">Amount (USDT)</th><th>Kind</th><th>Detected</th><th>Note</th></tr></thead>
     <tbody>
     {% for f in flows %}
       <tr>

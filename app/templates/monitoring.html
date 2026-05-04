@@ -2,7 +2,7 @@
 {% block title %}Monitoring · Funding Arb{% endblock %}
 {% block content %}
 <div class="page-header">
-  <h2>Monitoring</h2>
+  <h2>Monitoring · Capital pool by venue</h2>
   <div class="actions">
     <form action="/monitoring" method="get" style="display:inline">
       <button type="submit" class="btn">Refresh</button>
@@ -12,13 +12,36 @@
 </div>
 
 <div class="alert alert-info">
-  Raw API state for every configured exchange. Each probe runs synchronously when
-  this page loads — successes show the response (truncated to 4kB); failures
-  show the underlying ccxt / network error. Useful when something on the
-  Dashboard looks wrong and you want to see exactly what the bot sees.
-  The <strong>Download .md export</strong> button bundles config, mode/earn states,
-  open + closed positions with leg states, recent trades / events / capital flows,
-  equity composition, and the live API probes into a single markdown file.
+  The portfolio is a single pool of capital distributed across venues — Binance today,
+  KuCoin and Interactive Brokers later. Each card below is one slice of that pool:
+  its capital subtotal (USDT), what role it plays in the strategy, and the raw API
+  probes that confirm the slice is reachable. The <strong>Download .md export</strong>
+  bundles config, balances, positions, trades, events, and the live probe results
+  into a single markdown file for sharing.
+</div>
+
+{% set total_pool = exchanges|sum(attribute='capital_subtotal_usdt') %}
+<div class="card">
+  <h3>Pool total <span class="muted" style="font-size:13px;font-weight:400;">(USDT)</span></h3>
+  <div class="body">
+    <div class="kpi-grid">
+      <div class="kpi">
+        <div class="label">All venues</div>
+        <div class="value">{{ '%.2f' % total_pool }} <span class="muted" style="font-size:14px">USDT</span></div>
+        <div class="sub">{{ exchanges|length }} venue(s) registered</div>
+      </div>
+      {% for ex in exchanges %}
+      <div class="kpi">
+        <div class="label">{{ ex.name }}</div>
+        <div class="value">{{ '%.2f' % ex.capital_subtotal_usdt }} <span class="muted" style="font-size:14px">USDT</span></div>
+        <div class="sub">
+          {% if ex.configured %}<span class="tag good" style="font-size:10px;">configured</span>{% else %}<span class="tag warn" style="font-size:10px;">not configured</span>{% endif %}
+          {% if total_pool > 0 %} · {{ '%.1f%%' % (ex.capital_subtotal_usdt / total_pool * 100) }} of pool{% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
 </div>
 
 {% for ex in exchanges %}
@@ -30,11 +53,13 @@
     {% else %}
       <span class="tag warn" style="font-size:11px;margin-left:8px;">not configured</span>
     {% endif %}
+    <span class="muted" style="font-size:12px;font-weight:400;margin-left:8px;">role: {{ ex.role }}</span>
   </h3>
   <div class="body">
     <table style="margin-bottom:12px;">
       <tbody>
-        <tr><th style="width:180px;">API key</th><td class="mono">{{ ex.key_masked }}</td></tr>
+        <tr><th style="width:200px;">Capital here (USDT)</th><td class="num mono">{{ '%.2f' % ex.capital_subtotal_usdt }}</td></tr>
+        <tr><th>API key</th><td class="mono">{{ ex.key_masked }}</td></tr>
         <tr><th>API secret</th><td class="mono">{{ ex.secret_masked }}</td></tr>
         {% for cred in ex.extra_creds %}
         <tr><th>{{ cred.label }}</th><td class="mono">{{ cred.value }}</td></tr>
@@ -44,6 +69,22 @@
         {% endif %}
       </tbody>
     </table>
+
+    {% if ex.capital_breakdown %}
+    <details open style="margin-bottom:12px;">
+      <summary style="cursor:pointer;padding:6px 12px;background:var(--panel-2);border-radius:6px;border:1px solid var(--border);">
+        Capital breakdown — {{ ex.name }}
+      </summary>
+      <table style="margin-top:8px;">
+        <thead><tr><th>Bucket</th><th class="num">Value (USDT)</th></tr></thead>
+        <tbody>
+          {% for b in ex.capital_breakdown %}
+          <tr><td>{{ b.label }}</td><td class="num">{{ '%.4f' % b.value }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </details>
+    {% endif %}
 
     {% if ex.probes %}
     <div class="muted" style="font-size:12px;margin-bottom:8px;">{{ ex.probes|length }} probe(s) — click each to expand the raw response.</div>
@@ -62,9 +103,23 @@
     </details>
     {% endfor %}
     {% else %}
-    <div class="empty">{% if not ex.configured %}Set the API credentials in environment variables to enable probes.{% else %}No probes registered for this exchange yet.{% endif %}</div>
+    <div class="empty">{% if not ex.configured %}Set the API credentials in environment variables to enable probes.{% else %}No probes registered for this venue yet.{% endif %}</div>
     {% endif %}
   </div>
 </div>
 {% endfor %}
+
+<div class="card">
+  <h3>Cross-venue rebalancing</h3>
+  <div class="body">
+    <div class="muted" style="font-size:13px;line-height:1.6;">
+      Single-pool framing means capital can (and eventually will) move between venues
+      automatically — the same way the bot already moves USDT between Binance spot ↔
+      futures wallets today. When KuCoin and IBKR gateways land, the rebalancer will
+      route capital toward whichever venue currently has the best risk-adjusted yield
+      (highest funding APY net of fees + transfer cost). For now the only active
+      rebalancing is intra-Binance (Spot ↔ Futures ↔ Earn), surfaced on the Configuration tab.
+    </div>
+  </div>
+</div>
 {% endblock %}

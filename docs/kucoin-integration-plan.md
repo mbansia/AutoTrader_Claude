@@ -1,259 +1,163 @@
-# KuCoin Integration Plan
+# Multi-venue integration plan (KuCoin first, IBKR later)
 
-This doc lays out the approach for adding KuCoin alongside Binance. It is a
-plan — no code yet — so we can agree on shape before building.
+## Framing — one pool, many venues
 
-## 1. Account setup
+The bot manages **a single pool of capital distributed across venues**. It is
+not "the Binance dashboard plus a separate KuCoin dashboard"; it is one
+strategy operating across whichever exchanges and brokers are configured. Today
+the only live venue is Binance (spot + USDM-perp). KuCoin is next, and
+Interactive Brokers (for cross-asset / equities-perp arb) sits behind that.
 
-You'll need:
+Concrete consequences of this framing:
 
-1. **KuCoin sub-account** (Account Center → Sub-Accounts → Create). The arb bot
-   should never run on the master account; sub-accounts isolate API blast
-   radius and let you cap balance via internal transfers.
-2. **API key on the sub-account** with these scopes ticked:
-   - **General** (read account info, balances, orders).
-   - **Trade** (place/cancel orders on spot + futures).
-   - **Transfer** (universal transfer between spot/futures/earn).
-   - **Earn** if/when KuCoin exposes the SAPI for it (see §3 below).
-3. **API passphrase** — KuCoin requires a third secret (alongside key +
-   secret), set when you create the key. Treat it like a password.
-4. **IP whitelist** — same workflow as Binance. The Coolify outbound IP shown
-   on Safety & Rules works for both.
+* Every `Position` and `Trade` row carries an `exchange` tag. The same DB,
+  the same UI, the same accounting code path serves all venues. Adding a
+  venue is appending a row to the venues registry — not a new dashboard.
+* The dashboard's equity composition donut and KPIs aggregate across venues
+  by default. Per-venue subtotals are a breakdown of the pool, not an
+  independent dashboard.
+* The Monitoring tab is the operational view of the pool: pool total →
+  per-venue capital subtotals → per-venue API probes. Same shape for every
+  venue.
+* The cross-venue rebalancer (future) is the natural extension of the
+  intra-Binance Spot ↔ Futures ↔ Earn rebalancer the bot already runs every
+  cycle. Same logic, wider scope.
 
-## 2. KuCoin's product surface (mapped to our needs)
+## Phase 1 — KuCoin gateway
 
-| Concern                        | Binance                                                                | KuCoin                                                                       |
-| ------------------------------ | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| Spot trading                   | `binance` exchange in ccxt                                             | `kucoin` exchange in ccxt                                                    |
-| Perp/futures trading           | `binanceusdm` (USDM-margined linear)                                   | `kucoinfutures` (USDT-margined linear, e.g. `XBTUSDTM`, `ETHUSDTM`)          |
-| Funding rate fetch             | `fetchFundingRates()`                                                  | `fetchFundingRates()` — same ccxt unified call                               |
-| Order book depth               | `fetchOrderBook(symbol)`                                               | `fetchOrderBook(symbol)`                                                     |
-| Universal transfer spot↔fut    | `POST /sapi/v1/asset/transfer` with `MAIN_UMFUTURE` / `UMFUTURE_MAIN`  | `POST /api/v3/accounts/inner-transfer` between `main` and `contract` accts   |
-| Sub→master/master→sub transfer | `POST /sapi/v1/sub-account/universalTransfer` (master)                 | `POST /api/v2/accounts/sub-transfer` (master) / `GET /api/v3/sub-accounts/transfer` |
-| Sub-side transfer history      | `GET /sapi/v1/sub-account/sub/transfer/history`                        | `GET /api/v3/accounts/sub-transfer` filtered by sub                          |
-| Deposit/withdraw history       | `GET /sapi/v1/capital/deposit/hisrec` + `…/withdraw/history`           | `GET /api/v1/deposits` + `GET /api/v1/withdrawals`                           |
-| Flexible savings               | Simple Earn `/sapi/v1/simple-earn/flexible/{list,subscribe,redeem,position}` | Earn / Pool-X — `/api/v1/earn/saving/products` + `…/saving/purchases` etc.    |
-| Margin mode + leverage         | `setMarginMode`, `setLeverage` (per symbol on USDM)                    | `setLeverage` (per contract; cross/isolated set by contract type)            |
+**Account setup**
 
-ccxt's unified API gives us most of what we need (`fetchBalance`,
-`fetchOrderBook`, `fetchFundingRates`, `createOrder`). The SAPI/private
-endpoints for Earn, transfer history, and sub-account flows need direct
-calls.
+* Create a sub-account for the bot (not the master). Restrict the API key to
+  spot + futures trading only; no withdraw permission.
+* Whitelist the bot's outbound IP (Coolify static egress IP, surfaced on the
+  Safety tab).
+* Enable both `kucoin` (spot) and `kucoinfutures` (USDT-margined perps) ccxt
+  clients.
 
-### Funding rate gotchas on KuCoin
+**Endpoint mapping (KuCoin → Binance equivalent)**
 
-- KuCoin perps use **8h funding** uniformly (no 4h windows like Binance has on
-  some pairs). Our existing `_interval_hours` helper handles this; the field
-  just always returns 8.
-- Funding rate is paid on the *position notional × rate*, just like Binance.
-  No semantic change.
-- KuCoin lists fewer perps than Binance — maybe 100–200 vs Binance's ~400.
-  Smaller universe.
+| Concept                   | Binance                                | KuCoin                                              |
+| ------------------------- | -------------------------------------- | --------------------------------------------------- |
+| Spot account              | `ccxt.binance().fetch_balance()`       | `ccxt.kucoin().fetch_balance()`                     |
+| USDT-perp account         | `ccxt.binanceusdm().fetch_balance()`   | `ccxt.kucoinfutures().fetch_balance()`              |
+| Funding rates             | `binanceusdm.fetch_funding_rates()`    | `kucoinfutures.fetch_funding_rates()` (per symbol)  |
+| Spot ↔ futures transfer   | `sapiPostAssetTransfer` (universal)    | `privateInnerTransferV2` SAPI on the spot client    |
+| Earn / Lend               | Simple Earn Flexible                   | Pool-X (auto-lend); separate gateway optional       |
+| Order-book depth          | `fetch_order_book(symbol, limit=50)`   | Same — ccxt-uniform                                 |
+| Cross margin / leverage   | `set_margin_mode('cross')` + `set_leverage(1)` | Same shape; both clients accept it           |
+| Sub-account transfer      | `sapiV1GetSubAccountSubTransferHistory` | Universal-transfer endpoint w/ sub-account ID      |
 
-### Earn product gotchas
-
-KuCoin's Earn UI is messier than Binance's:
-
-- **Pool-X / Earn Lending** is the closest analog to Binance Simple Earn
-  Flexible. Subscribe with USDT and earn variable APR. Redemption is
-  near-instant for "flexible" tier; "fixed" terms have lockups.
-- The API is **less mature** than Binance's. Some endpoints are documented
-  but undocumented in ccxt — we'd have to call them via the raw private
-  request layer.
-- KuCoin also has **structured products / dual investment** — those are
-  *not* what we want. Stick to flexible savings only.
-
-## 3. Architectural changes needed
-
-### 3.1 Gateway abstraction
-
-Today `BinanceGateway` is concrete and the bot imports it directly. To support
-multiple exchanges cleanly:
-
-```
-app/exchanges/
-  __init__.py          # registry / factory
-  base.py              # abstract Gateway (Protocol or ABC)
-  binance.py           # BinanceGateway (move from app/exchange.py)
-  kucoin.py            # KucoinGateway (new)
-```
-
-`base.py` defines the contract every exchange must implement:
+**Gateway abstraction** — what `BinanceGateway` already does, generalized
 
 ```python
-class Gateway(Protocol):
-    name: str  # 'binance' | 'kucoin'
+class VenueGateway(Protocol):
+    venue_id: str  # 'binance' | 'kucoin' | 'ibkr'
 
-    def load_markets(self) -> None: ...
     def safe_balances(self) -> dict | None: ...
-    def safe_price(self, symbol: str, perp: bool = False) -> float | None: ...
-    def scan_funding(self, ...) -> tuple[list[Candidate], int, list]: ...
-    def order_book_depth_usdt(self, ...) -> float: ...
-
-    # Orders
-    def create_spot_buy(self, symbol, qty, paper, slippage_bps, fee_bps): ...
-    def create_perp_short(self, ...): ...
-    def close_spot(self, ...): ...
-    def close_perp(self, ...): ...
+    def scan_funding(self, ...) -> tuple[list[Candidate], int, list[tuple]]: ...
+    def order_book_depth_usdt(self, symbol, side, band_bps, perp) -> float: ...
+    def market_min_amount(self, symbol, perp) -> float: ...
     def configure_perp_for_arb(self, symbol) -> tuple[bool, str]: ...
-
-    # Transfers
-    def transfer_spot_to_futures(self, amount, paper) -> tuple[bool, str]: ...
-    def transfer_futures_to_spot(self, amount, paper) -> tuple[bool, str]: ...
-
-    # Earn
-    def earn_subscribe(self, amount_usdt, paper) -> tuple[bool, str]: ...
-    def earn_redeem(self, amount_usdt, paper) -> tuple[bool, str]: ...
+    def create_spot_buy(...): ...
+    def create_perp_short(...): ...
+    def close_spot(...): ...
+    def close_perp(...): ...
+    def safe_price(self, symbol, perp) -> float | None: ...
+    def transfer_spot_to_futures(...): ...
+    def transfer_futures_to_spot(...): ...
+    def net_injected_capital_usdt(...) -> tuple[float | None, dict]: ...
+    # Earn is opt-in per gateway; venues without an Earn equivalent return 0.
     def earn_balance_usdt(self) -> tuple[float | None, str]: ...
-    def earn_subscribe_asset(self, asset, amount, paper) -> tuple[bool, str]: ...
-    def earn_redeem_asset(self, asset, amount, paper) -> tuple[bool, str]: ...
-    def flexible_earn_apr(self, asset) -> float: ...
-
-    # Capital flows
-    def deposit_history(self, asset='USDT', lookback_days=365) -> list[dict]: ...
-    def withdrawal_history(self, ...) -> list[dict]: ...
-    def sub_account_transfer_history(self, ...) -> list[dict]: ...
-    def net_injected_capital_usdt(self, lookback_days=365) -> tuple[float | None, dict]: ...
-
-    # Misc
-    def open_perp_positions_raw(self) -> list[dict]: ...
-    last_balance_error: str
+    def earn_subscribe(self, amount_usdt, paper_mode) -> tuple[bool, str]: ...
+    def earn_redeem(self, amount_usdt, paper_mode) -> tuple[bool, str]: ...
 ```
 
-### 3.2 Exchange dimension on data
-
-Add an `exchange` column to:
-- `Position`
-- `Trade`
-- `EquityCurve`
-- `BalanceSnapshot`
-- `RejectedCandidate`
-- `BotEvent`
-- `CapitalFlow`
-- `ScanResult`
-
-Default to `'binance'` for back-compat. Migration adds the column and backfills.
-
-`ModeState` / `StrategyConfig` / `EarnState` get keyed by `(mode, exchange)`
-instead of just `(mode,)`. So you'd have e.g. `paper-binance`,
-`paper-kucoin`, `live-binance`, `live-kucoin`.
-
-### 3.3 Cycle changes
-
-`run_one_cycle` iterates `(mode, exchange)` instead of just `mode`. Each pass
-runs against its own gateway with its own state row. The candidate picker
-(combined-yield rank) operates **per-exchange** because the trade is
-same-exchange (spot leg + perp leg on the same venue). Cross-exchange arb is
-explicitly out of scope for v1 because hedge-break risk during transfer
-windows is too high.
-
-### 3.4 Configuration
-
-Most strategy params should be the same across exchanges. To keep the UI
-simple, `StrategyConfig` stays a single row — it's exchange-agnostic. Per-
-exchange tunables (which we don't really need yet — perp leverage, paper
-slippage, etc. work the same) can be added later if they diverge.
-
-### 3.5 Settings
-
-Add KuCoin creds to `Settings`:
+`BinanceGateway` already implements this surface; `KuCoinGateway` will mirror
+it. The bot currently constructs `BinanceGateway()` directly in
+`app.bot.run_loop` and `app.main`. After Phase 1:
 
 ```python
-kucoin_api_key: str = Field(default='')
-kucoin_api_secret: str = Field(default='')
-kucoin_api_passphrase: str = Field(default='')   # the third secret
+def make_gateways(cfg) -> list[VenueGateway]:
+    gws = [BinanceGateway()] if cfg.binance_enabled else []
+    if cfg.kucoin_enabled:
+        gws.append(KuCoinGateway())
+    return gws
 ```
 
-Document in README that all three must be set for KuCoin to be active. If
-any is missing, the gateway constructor returns a stub that reports
-"unconfigured" on every call (no exceptions, just empty data).
+The cycle then iterates over `gws` for each scan / open / close, comparing
+candidates across venues and routing each entry to whichever venue has the
+better combined yield (funding APY + spot earn) net of estimated taker fees
+and transfer cost.
 
-### 3.6 UI
+## Phase 2 — Cross-venue rebalancing
 
-- Sidebar gets a per-exchange toggle alongside the per-mode tabs. So the
-  user picks one of {paper-binance, live-binance, paper-kucoin, live-kucoin}.
-- All filters on routes update to `WHERE mode = :v AND exchange = :ex`.
-- Equity composition pie shows total across exchanges for the active mode,
-  with each exchange as a segment.
-- Net injected capital sums across exchanges.
+Once two venues are live:
 
-## 4. Implementation phases (recommended order)
+1. Each cycle, compute the pool's free USDT distribution across venues.
+2. If venue A has a candidate scoring `combined_apy_A` and free USDT < min
+   notional, but venue B has free USDT > min notional **and** its best
+   candidate scores `combined_apy_B < combined_apy_A − rebalance_cost_bps`,
+   move USDT B → A.
+3. Transfer cost = withdraw fee + taker fee + slippage on both sides. The
+   bot won't rebalance unless the yield delta covers the round-trip cost
+   over the expected hold period.
+4. Same rebalance threshold pattern as the intra-Binance one already running
+   today (`auto_rebalance_threshold` in `StrategyConfig`).
 
-### Phase 0 — Gateway abstraction without behavior change (1–2 days)
+Liquidity / network constraints to respect:
 
-- Move `app/exchange.py` → `app/exchanges/binance.py`.
-- Create `app/exchanges/base.py` with the `Gateway` protocol/ABC.
-- Update imports across the codebase. Bot still uses Binance-only via the
-  factory. No data-model changes yet. Verify nothing breaks.
+* USDT on different chains (TRC20 / ERC20 / BEP20) — each venue has a
+  preferred chain. The bot needs a "chain matrix" lookup so it always
+  withdraws on the cheapest mutual chain.
+* Withdraw whitelists (mandatory on KuCoin sub-accounts) — pre-register
+  every counterparty venue's deposit address before enabling rebalancing.
+* Withdrawal status (`pending` / `processing`) — treat in-flight USDT as
+  earmarked, neither in the source venue's free balance nor the
+  destination's, until confirmed.
 
-### Phase 1 — Add `exchange` column + factory selection (1 day)
+## Phase 3 — Interactive Brokers (cross-asset)
 
-- Schema migration adds `exchange` to all per-row tables, default `'binance'`.
-- `ModeState`, `EarnState` re-keyed by `(mode, exchange)`.
-- Cycle iterates a list of active exchanges, currently `['binance']`.
+This is the interesting one and motivates the single-pool framing more than
+KuCoin does. Some of the highest funding rates the bot already sees are on
+**single-stock perps** like `INCL-USDT-PERP`, `MSTR-USDT-PERP`. Today we
+can't take those: the spot leg of the arb requires holding the actual stock
+on a brokerage that supports fractional shares and US equities — i.e. IBKR.
 
-### Phase 2 — KucoinGateway implementation (2–3 days)
+Sketch:
 
-- Subclass / implement `Gateway` for KuCoin via ccxt + raw SAPI for the
-  parts ccxt doesn't expose (Earn, sub-account transfers).
-- Test against KuCoin sandbox first if available, then live with $5 to
-  validate every path.
+* `IBKRGateway` implements the same `VenueGateway` protocol. Its "spot"
+  client is the IBKR REST / TWS API; its "perp" client is whichever crypto
+  venue lists the corresponding stock-perp (Binance lists some).
+* The arb is split-venue: long stock at IBKR, short stock-perp at Binance.
+  Both legs settle in USD / USDT; the bot tracks the cross-venue hedge in
+  the same `Position` row, just with different `exchange` tags on the
+  `Trade` rows that built each leg.
+* This is genuinely new territory — separate FX risk (USD vs USDT), a
+  separate margin pool, and tax treatment differs from pure-crypto arb.
+* Defer to its own design pass once Phase 2 is solid.
 
-### Phase 3 — UI per-exchange tab (1 day)
+## Backwards-compatibility commitments
 
-- Sidebar gets exchange selector.
-- All routes scope queries by exchange.
-- Monitoring tab (already planned) shows both exchanges' raw state side
-  by side.
+* `Position.exchange` and `Trade.exchange` default to `'binance'` so every
+  existing row reads correctly on first migrated load.
+* The dashboard / transactions / monitoring pages all render the venue tag
+  from `exchange`, with the historical Binance value baked in.
+* The bot continues to call `BinanceGateway` directly for now; Phase 1
+  adds the gateway-list seam without changing bot behavior.
+* Paper mode stays a single virtual venue tagged `paper`; no per-venue
+  paper accounting until users actually want it.
 
-### Phase 4 — Production hardening (ongoing)
+## Open questions
 
-- Cross-exchange diversity rule: skip a candidate if the same base asset
-  is open on **any** exchange.
-- Per-exchange rate limits (KuCoin's are tighter than Binance's; the
-  current rate-limited ccxt clients should mostly handle this).
-- Per-exchange Earn caveats — KuCoin's flexible-savings redemption can
-  occasionally take a few seconds rather than being instant.
-
-**Total effort: ~5–7 days of focused dev** before live trading on KuCoin.
-Most of that is testing and edge-case handling, not the API integration
-itself.
-
-## 5. Risks specific to KuCoin
-
-- **Earn API less polished** — flexible-savings products may not always
-  be redeemable instantly. Pre-flight close logic should treat KuCoin
-  Earn redeem as best-effort and fall back to manual top-up if it doesn't
-  return promptly.
-- **Smaller liquidity** — depth filter threshold may need to be lower
-  per-exchange. Start with `min_order_book_depth_usdt` halved on KuCoin.
-- **Funding paid in BTC for some pairs** — most are USDT-margined but a
-  few use the underlying asset. Stick to USDT-margined linear perps
-  (`*USDTM` symbols) for parity with our existing logic.
-- **Settlement quirks** — KuCoin perps use a slightly different
-  mark-price calculation. Basis filter (±20 bps default) may need
-  retuning per-exchange.
-- **Sub-account transfer latency** — master→sub on KuCoin can take a
-  few seconds longer than Binance. Don't auto-transfer mid-cycle; only
-  at well-defined points.
-
-## 6. Open questions for you
-
-1. Do you want KuCoin live and Binance live **at the same time**, or
-   one at a time with a switch? (The architecture supports both; same-
-   time is more capital-efficient but doubles the risk surface.)
-2. Should diversity be **per-exchange** (can hold SOL on Binance and
-   SOL on KuCoin simultaneously) or **global** (only one SOL position
-   total)?
-3. Any KuCoin-specific perps you definitely want included or excluded?
-   E.g., `xMSTRUSDTM` if KuCoin lists it (they may not).
-
-## 7. Recommendation
-
-Do this in stages, not all at once. Phase 0 + Phase 1 alone are worth
-shipping early — they make the codebase ready for KuCoin without
-introducing live KuCoin trading. That gives you a clean checkpoint to
-verify nothing broke before we add the KuCoin gateway and start trading
-on it.
-
-Once you confirm the answers in §6, I'll write the actual code.
+1. **KuCoin sub-account vs master?** Sub-account is safer (a compromised
+   key only drains that sub-account) but the universal-transfer endpoint
+   shapes differ between master and sub. Recommendation: sub-account; live
+   with the slightly more annoying transfer code path.
+2. **Earn equivalent on KuCoin?** Pool-X auto-lend exists but pays in the
+   asset, not USDT, with variable rates that make the "compounded APY"
+   accounting messier. Defer Earn integration on KuCoin past Phase 1.
+3. **Funding-rate frequency parity?** KuCoin pays funding every 8 hours
+   (same as Binance); this is the easy case. IBKR's stock-perp funding is
+   daily. The annualization helper in `app.exchange.annualize_rate`
+   already takes interval hours as an argument so this is purely a
+   gateway-config concern.

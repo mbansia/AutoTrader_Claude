@@ -27,10 +27,27 @@ MODE_LIVE = 'live'
 ALL_MODES = (MODE_PAPER, MODE_LIVE)
 
 
+# Venue tag — which exchange / broker the row lives on. The system treats the
+# entire portfolio as a single pool of capital distributed across venues. Today
+# Binance is the only live venue; KuCoin and Interactive Brokers will be added
+# without requiring schema changes by extending this list and the gateway
+# factory in app.exchange. Every Position / Trade carries a venue so the UI can
+# break down equity, PnL, and exposure by venue without ambiguity.
+VENUE_BINANCE = 'binance'
+VENUE_KUCOIN = 'kucoin'
+VENUE_IBKR = 'ibkr'
+ALL_VENUES = (VENUE_BINANCE, VENUE_KUCOIN, VENUE_IBKR)
+
+
 class Position(Base):
     __tablename__ = 'positions'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     mode: Mapped[str] = mapped_column(String(8), default=MODE_PAPER, index=True)
+    # Which exchange / broker the position lives on. Today every position is
+    # ``VENUE_BINANCE``; KuCoin and Interactive Brokers will populate this
+    # column once their gateways land. The dashboard breaks down equity, PnL
+    # and exposure across venues using this tag.
+    exchange: Mapped[str] = mapped_column(String(16), default=VENUE_BINANCE, index=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
     spot_symbol: Mapped[str] = mapped_column(String(32))
     perp_symbol: Mapped[str] = mapped_column(String(32))
@@ -58,9 +75,14 @@ class Trade(Base):
     __tablename__ = 'trades'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     mode: Mapped[str] = mapped_column(String(8), default=MODE_PAPER, index=True)
+    # Cross-venue tag — which broker / exchange the fill landed on. Together
+    # with ``venue`` (which is the leg: 'spot' / 'futures') this forms the
+    # full coordinate of the fill. ``exchange`` is the dimension we'll add
+    # KuCoin / Interactive Brokers to.
+    exchange: Mapped[str] = mapped_column(String(16), default=VENUE_BINANCE, index=True)
     position_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
-    venue: Mapped[str] = mapped_column(String(16))
+    venue: Mapped[str] = mapped_column(String(16))  # 'spot' | 'futures' — the leg, kept for backwards compat
     side: Mapped[str] = mapped_column(String(8))
     quantity: Mapped[float] = mapped_column(Float)
     price: Mapped[float] = mapped_column(Float)

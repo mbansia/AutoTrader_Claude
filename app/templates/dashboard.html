@@ -94,9 +94,17 @@
 
 {# ========== EQUITY COMPOSITION + CURVE ========== #}
 <div class="card">
-  <h3>Equity composition</h3>
+  <h3>Capital pool · equity composition <span class="muted" style="font-size:13px;font-weight:400;">(USDT)</span></h3>
   <div class="body">
     {% if breakdown_donut %}
+    {% if venue_totals and venue_totals|length > 1 %}
+    <div class="row-flex muted" style="font-size:12px;margin-bottom:10px;gap:14px;">
+      <span>Pool spread across {{ venue_totals|length }} venue(s):</span>
+      {% for vt in venue_totals %}
+        <span class="tag">{{ vt.venue }} · {{ '%.2f' % vt.total }} USDT</span>
+      {% endfor %}
+    </div>
+    {% endif %}
     <div class="composition-grid">
       <svg viewBox="0 0 200 200" class="equity-donut" aria-label="Equity composition donut chart">
         {{ breakdown_donut | safe }}
@@ -150,14 +158,16 @@
   <table class="positions-table">
     <thead>
       <tr>
-        <th></th><th>Symbol</th>
-        <th class="num">Notional now</th>
-        <th class="num">Funding APY</th>
-        <th class="num">Effective APY</th>
-        <th class="num">Basis now</th>
-        <th class="num">Age</th>
-        <th class="num">Funding earned</th>
-        <th class="num">Unrealized PnL</th>
+        <th></th>
+        <th>Symbol</th>
+        <th>Venue</th>
+        <th class="num">Notional now (USDT)</th>
+        <th class="num">Funding APY (%)</th>
+        <th class="num">Effective APY (%)</th>
+        <th class="num">Basis now (bps)</th>
+        <th class="num">Age (h:m)</th>
+        <th class="num">Funding earned (USD)</th>
+        <th class="num">Unrealized PnL (USD)</th>
         <th></th>
       </tr>
     </thead>
@@ -173,10 +183,11 @@
           {% else %}<span class="tag" style="font-size:10px;margin-left:4px;">FLAT (reconcile pending)</span>
           {% endif %}
         </td>
+        <td><span class="tag">{{ r.venue }}</span></td>
         <td class="num">{{ ('%.2f' % r.notional_now) if r.notional_now else ('%.2f' % r.notional_entry) }}</td>
-        <td class="num {{ 'good' if r.last_funding_apy >= cfg.exit_funding_threshold else 'warn' }}">{{ '%.2f%%' % (r.last_funding_apy * 100) }} <span class="muted" style="font-size:11px;">({{ '%dh' % r.interval_hours }})</span></td>
-        <td class="num">{{ '%.2f%%' % (r.effective_apy * 100) }}</td>
-        <td class="num {{ 'good' if r.basis_now_bps <= cfg.max_exit_basis_bps else 'warn' }}">{{ '%+.1f bps' % r.basis_now_bps }}</td>
+        <td class="num {{ 'good' if r.last_funding_apy >= cfg.exit_funding_threshold else 'warn' }}">{{ '%.2f' % (r.last_funding_apy * 100) }} <span class="muted" style="font-size:11px;">({{ '%dh' % r.interval_hours }})</span></td>
+        <td class="num">{{ '%.2f' % (r.effective_apy * 100) }}</td>
+        <td class="num {{ 'good' if r.basis_now_bps <= cfg.max_exit_basis_bps else 'warn' }}">{{ '%+.1f' % r.basis_now_bps }}</td>
         <td class="num">{{ r.age }}</td>
         <td class="num {{ 'good' if r.funding_income >= 0 else 'bad' }}">{{ '%+.4f' % r.funding_income }}</td>
         <td class="num {{ 'good' if r.unrealized_pnl >= 0 else 'bad' }}">{{ '%+.4f' % r.unrealized_pnl }}</td>
@@ -251,11 +262,21 @@
   <h3>Closed positions (last 20)</h3>
   {% if closed %}
   <table>
-    <thead><tr><th>Symbol</th><th class="num">Qty</th><th>Opened</th><th>Closed</th><th class="num">Trade PnL</th><th class="num">Funding earned</th><th class="num">Realized total</th></tr></thead>
+    <thead><tr>
+      <th>Symbol</th>
+      <th>Venue</th>
+      <th class="num">Qty (base)</th>
+      <th>Opened</th>
+      <th>Closed</th>
+      <th class="num">Trade PnL (USD)</th>
+      <th class="num">Funding earned (USD)</th>
+      <th class="num">Realized total (USD)</th>
+    </tr></thead>
     <tbody>
     {% for c in closed %}
       <tr>
         <td class="mono">{{ c.symbol }}</td>
+        <td><span class="tag">{{ c.venue }}</span></td>
         <td class="num">{{ '%.6f' % c.quantity }}</td>
         <td class="muted">{{ c.opened_at }}</td>
         <td class="muted">{{ c.closed_at }}</td>
@@ -284,18 +305,27 @@
       </div>
       {% if latest_scan_top %}
       <table>
-        <thead><tr><th>Symbol</th><th class="num">Funding APY</th><th class="num">+ Earn APR</th><th class="num">Combined</th><th class="num">Effective</th><th class="num">Depth (min)</th><th class="num">Interval</th><th class="num">24h Volume</th></tr></thead>
+        <thead><tr>
+          <th>Symbol</th>
+          <th class="num">Funding APY (%)</th>
+          <th class="num">+ Earn APR (%)</th>
+          <th class="num">Combined (%)</th>
+          <th class="num">Effective (%)</th>
+          <th class="num">Depth min (USD)</th>
+          <th class="num">Interval (h)</th>
+          <th class="num">24h Volume (USDT)</th>
+        </tr></thead>
         <tbody>
         {% for c in latest_scan_top %}
           {% set depth_min = ((c.spot_depth or 0) if (c.spot_depth or 0) <= (c.perp_depth or 0) else (c.perp_depth or 0)) if c.spot_depth is defined and c.perp_depth is defined else 0 %}
           <tr>
             <td class="mono">{{ c.perp }}</td>
-            <td class="num good">{{ '%.2f%%' % (c.apr * 100) }}</td>
-            <td class="num">{{ '%.2f%%' % ((c.spot_earn_apr or 0) * 100) }}</td>
-            <td class="num good">{{ '%.2f%%' % ((c.combined_apy or c.apr) * 100) }}</td>
-            <td class="num good">{{ '%.2f%%' % ((c.effective_apy or c.apr/2) * 100) }}</td>
-            <td class="num">{{ '${:,.0f}'.format(depth_min) if depth_min else '—' }}</td>
-            <td class="num muted">{{ '%dh' % (c.interval_h or 8) }}</td>
+            <td class="num good">{{ '%.2f' % (c.apr * 100) }}</td>
+            <td class="num">{{ '%.2f' % ((c.spot_earn_apr or 0) * 100) }}</td>
+            <td class="num good">{{ '%.2f' % ((c.combined_apy or c.apr) * 100) }}</td>
+            <td class="num good">{{ '%.2f' % ((c.effective_apy or c.apr/2) * 100) }}</td>
+            <td class="num">{{ '{:,.0f}'.format(depth_min) if depth_min else '—' }}</td>
+            <td class="num muted">{{ '%d' % (c.interval_h or 8) }}</td>
             <td class="num">{{ '{:,.0f}'.format(c.qv) }}</td>
           </tr>
         {% endfor %}
@@ -322,7 +352,7 @@
     </form>
     {% if flows %}
     <table>
-      <thead><tr><th>Date</th><th class="num">Amount</th><th>Kind</th><th>Detected</th><th>Note</th><th></th></tr></thead>
+      <thead><tr><th>Date</th><th class="num">Amount (USDT)</th><th>Kind</th><th>Detected</th><th>Note</th><th></th></tr></thead>
       <tbody>
       {% for f in flows %}
         <tr>
