@@ -171,24 +171,87 @@ def _log_close_error(db, p: Position, leg: str, err: str) -> None:
     log_event(db, f'Failed to close {leg} leg of {p.perp_symbol}: {snippet} (will retry next cycle)', mode=p.mode, level='ERROR')
 
 
-def _redeem_spot_asset_before_close(db, gateway: BinanceGateway, cfg: StrategyConfig, p: Position) -> None:
-    """If the position's base asset was subscribed to Earn on entry, pull it back
-    into the spot wallet so close_spot has something to sell. Best-effort — if
-    nothing was subscribed (or product changed), this is a no-op."""
-    if p.mode != MODE_LIVE or not cfg.earn_subscribe_spot_assets:
+def _ensure_close_readiness(db, gateway: BinanceGateway, p: Position, cfg: StrategyConfig) -> None:
+    """Walk all three wallets (spot, futures, earn) and reshuffle capital so the
+    close has both legs funded. Live only — paper has no separate wallets.
+
+    Spot leg: needs `p.quantity` of the base asset on spot. If short, redeems
+    that exact deficit from the base asset's flexible Earn product.
+
+    Perp leg buy-back: needs futures.free ≥ position_notional / leverage + a
+    small fee buffer. Binance's order-placement check requires fresh initial
+    margin even on a reducing trade, which is why a stuck close looks like
+    "Margin is insufficient" even though the position is small. Funds the gap
+    by, in order: surplus spot USDT → spot→futures transfer; then, if still
+    short, USDT redeem from Earn → spot → transfer.
+
+    Best-effort throughout — each step is wrapped, and the actual close attempt
+    that runs after this is the source of truth for whether we succeeded.
+    Logs only when an action actually fires (no spam if pre-flight is a no-op
+    or if global capital is genuinely insufficient)."""
+    if p.mode != MODE_LIVE:
         return
+
+    bals = gateway.safe_balances() or {}
     base = p.spot_symbol.split('/')[0]
-    ok, err = gateway.earn_redeem_asset(base, p.quantity, False)
-    if ok:
-        log_event(db, f'Redeemed {p.quantity:.6f} {base} from Earn before close', mode=p.mode)
+
+    # ---- Spot asset side ----
+    spot_asset_qty = float((bals.get('spot', {}).get(base) or {}).get('total') or 0)
+    if cfg.earn_subscribe_spot_assets and spot_asset_qty < p.quantity * 0.99:
+        deficit = max(0.0, p.quantity - spot_asset_qty)
+        if deficit > 0:
+            ok, err = gateway.earn_redeem_asset(base, deficit, False)
+            if ok:
+                log_event(db, f'Pre-close: redeemed {deficit:.6f} {base} from Earn', mode=p.mode)
+            elif '-6053' in err or "doesn't exist" in err.lower() or 'no flexible product' in err.lower():
+                pass  # nothing was subscribed; close_spot will use whatever's already in spot
+            else:
+                log_event(db, f'Pre-close: redeem {base} failed: {err[:120]}', mode=p.mode, level='WARN')
+
+    # ---- Perp leg margin side ----
+    fut_free = float((bals.get('futures', {}).get('USDT') or {}).get('free') or 0)
+    spot_free = float((bals.get('spot', {}).get('USDT') or {}).get('free') or 0)
+    perp_now = gateway.safe_price(p.perp_symbol, perp=True) or p.perp_entry_price or 0.0
+    if perp_now <= 0:
+        return  # can't size the requirement; the close attempt will surface the failure
+    leverage = max(1, cfg.perp_leverage or 1)
+    needed_margin = p.quantity * perp_now / leverage
+    target = needed_margin * 1.005  # +50 bps buffer for fee + tiny adverse drift
+    if fut_free >= target:
         return
-    # "Position doesn't exist" / -6053 is the Binance code for "nothing subscribed
-    # under this product" — expected when earn_subscribe_spot_assets was flipped on
-    # after a position was already opened, or when the asset has no flexible product.
-    # Treat it as a clean skip rather than a WARN to avoid noise on every close attempt.
-    if '-6053' in err or "doesn't exist" in err.lower() or 'no flexible product' in err.lower():
-        return
-    log_event(db, f'Earn redeem of {base} skipped: {err[:120]}', mode=p.mode, level='WARN')
+
+    gap = target - fut_free
+
+    # Step 1: surplus spot USDT → futures
+    if cfg.auto_transfer_enabled and spot_free > 0.30:
+        avail = max(0.0, spot_free - 0.10)  # leave dust in spot
+        transfer = min(gap, avail)
+        if transfer >= 0.20:
+            ok, err = gateway.transfer_spot_to_futures(transfer, False)
+            if ok:
+                spot_free -= transfer
+                fut_free += transfer
+                gap -= transfer
+                log_event(db, f'Pre-close: transferred {transfer:.2f} USDT spot→futures (margin top-up for {p.perp_symbol})', mode=p.mode)
+            else:
+                log_event(db, f'Pre-close: spot→futures transfer failed: {err[:120]}', mode=p.mode, level='WARN')
+
+    # Step 2: redeem USDT from Earn → spot → futures
+    if gap >= 0.20 and cfg.earn_enabled and cfg.auto_transfer_enabled:
+        earn_bal, _ = gateway.earn_balance_usdt()
+        earn_bal = earn_bal or 0.0
+        if earn_bal >= 0.20:
+            redeem_amt = min(gap + 0.20, earn_bal)  # tiny extra so subsequent transfer has room
+            ok, err = gateway.earn_redeem(redeem_amt, False)
+            if ok:
+                log_event(db, f'Pre-close: redeemed {redeem_amt:.2f} USDT from Earn (margin top-up for {p.perp_symbol})', mode=p.mode)
+                transfer = min(gap, redeem_amt)
+                if transfer >= 0.20:
+                    ok2, err2 = gateway.transfer_spot_to_futures(transfer, False)
+                    if ok2:
+                        log_event(db, f'Pre-close: transferred {transfer:.2f} USDT to futures (Earn → spot → futures)', mode=p.mode)
+                    else:
+                        log_event(db, f'Pre-close: post-redeem transfer failed: {err2[:120]}', mode=p.mode, level='WARN')
 
 
 def _rebalance_spot_fut(db, gateway: BinanceGateway, cfg: StrategyConfig, mode: str) -> None:
@@ -218,28 +281,6 @@ def _rebalance_spot_fut(db, gateway: BinanceGateway, cfg: StrategyConfig, mode: 
         log_event(db, f'Rebalance {direction} failed: {err}', mode=mode, level='WARN')
 
 
-def _try_fund_close_margin(db, gateway: BinanceGateway, cfg: StrategyConfig, mode: str) -> None:
-    """Closing a perp short can need a sliver of free USDT in the futures wallet
-    for the close-side fee. If futures.free is dust, transfer a tiny buffer
-    from spot. Conservative on amount and frequency — it's easy to over-drain
-    spot if the close keeps failing for unrelated reasons (size mismatch,
-    market halted, etc.)."""
-    if not cfg.auto_transfer_enabled:
-        return
-    bals = gateway.safe_balances() or {}
-    fut_free = float((bals.get('futures', {}).get('USDT') or {}).get('free') or 0)
-    spot_free = float((bals.get('spot', {}).get('USDT') or {}).get('free') or 0)
-    # Only act when futures is genuinely dust AND spot has more than the buffer to spare.
-    if fut_free >= 0.20 or spot_free <= 0.30:
-        return
-    transfer = min(0.50, max(0.20, spot_free - 0.20))
-    ok, err = gateway.transfer_spot_to_futures(transfer, False)
-    if ok:
-        log_event(db, f'Funded close margin: {transfer:.2f} USDT spot→futures (fut.free was {fut_free:.4f})', mode=mode)
-    else:
-        log_event(db, f'Close-margin top-up failed: {err}', mode=mode, level='WARN')
-
-
 def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyConfig, reason: str) -> None:
     """Close both legs of a position. Wrap each call so a single Binance error
     (insufficient balance, market halted, etc.) doesn't crash the entire cycle.
@@ -247,8 +288,7 @@ def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyCon
     retry on the next cycle. Errors are deduped per (position, leg)."""
     paper = (p.mode == MODE_PAPER)
     if not paper:
-        _redeem_spot_asset_before_close(db, gateway, cfg, p)
-        _try_fund_close_margin(db, gateway, cfg, p.mode)
+        _ensure_close_readiness(db, gateway, p, cfg)
     spot_ok = perp_ok = False
     try:
         s = gateway.close_spot(p.spot_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
@@ -280,7 +320,7 @@ def _close_naked_leg(db, gateway: BinanceGateway, p: Position, cfg: StrategyConf
     try:
         if surviving_leg == 'spot':
             if not paper:
-                _redeem_spot_asset_before_close(db, gateway, cfg, p)
+                _ensure_close_readiness(db, gateway, p, cfg)
             s = gateway.close_spot(p.spot_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
             record_trade(db, p.id, p.mode, p.spot_symbol, 'spot', 'sell', p.quantity, s)
             closed_ok = True
