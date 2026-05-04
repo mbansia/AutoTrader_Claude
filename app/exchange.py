@@ -265,6 +265,23 @@ class BinanceGateway:
         except Exception:
             return None
 
+    def market_min_amount(self, symbol: str, perp: bool = False) -> float:
+        """Minimum order quantity (LOT_SIZE.minQty) for a symbol. Binance refuses
+        orders below this, so when our actual balance falls below it (e.g.,
+        funding / fee deductions ate into the spot leg) the leg is effectively
+        un-tradeable and the bot should treat it as flat rather than spinning
+        on rejected close attempts. Returns 0.0 if the market isn't loaded — the
+        caller should still attempt the order in that case."""
+        ex = self.futures if perp else self.spot
+        try:
+            market = ex.market(symbol)
+        except Exception:
+            return 0.0
+        try:
+            return float((market.get('limits') or {}).get('amount', {}).get('min') or 0.0)
+        except Exception:
+            return 0.0
+
     def _market_order(self, venue: str, symbol: str, side: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float):
         if paper_mode:
             mid = self.perp_price(symbol) if venue == 'futures' else self.price(symbol)

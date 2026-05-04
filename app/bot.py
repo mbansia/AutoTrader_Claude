@@ -342,21 +342,36 @@ def _actual_perp_qty(gateway: BinanceGateway, p: Position) -> float:
     return 0.0
 
 
+def _is_dust(qty: float, min_amount: float) -> bool:
+    """True if `qty` is below the symbol's LOT_SIZE minimum — i.e., we can't
+    place a market order for it. Treated as "already flat" by the close path
+    so the bot doesn't spin on un-tradeable dust."""
+    return min_amount > 0 and 0 < qty < min_amount
+
+
 def _position_leg_states(gateway: BinanceGateway, p: Position, tolerance: float = 0.05) -> dict:
     """Returns per-leg state vs Binance for a position. Used for UI display
     and the cycle's reconciliation step.
 
     spot_alive / perp_alive: True if the actual quantity on Binance is at
-    least (1 - tolerance) × p.quantity. Tolerance accounts for fee/lot-size
-    drift between DB qty and actual balance."""
+    least (1 - tolerance) × p.quantity AND above the symbol's LOT_SIZE
+    minimum. Tolerance accounts for fee/lot-size drift; the min-lot check
+    ensures sub-min dust (which Binance refuses to trade) counts as flat
+    so the bot doesn't loop on un-closeable positions."""
     spot_actual = _actual_spot_qty(gateway, p)
     perp_actual = _actual_perp_qty(gateway, p)
+    spot_min = gateway.market_min_amount(p.spot_symbol, perp=False)
+    perp_min = gateway.market_min_amount(p.perp_symbol, perp=True)
     threshold = p.quantity * (1.0 - tolerance)
+    spot_alive = spot_actual >= threshold and not _is_dust(spot_actual, spot_min)
+    perp_alive = perp_actual >= threshold and not _is_dust(perp_actual, perp_min)
     return {
         'spot_actual': spot_actual,
         'perp_actual': perp_actual,
-        'spot_alive': spot_actual >= threshold,
-        'perp_alive': perp_actual >= threshold,
+        'spot_alive': spot_alive,
+        'perp_alive': perp_alive,
+        'spot_min': spot_min,
+        'perp_min': perp_min,
     }
 
 
@@ -399,12 +414,25 @@ def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyCon
 
     if paper:
         spot_qty = perp_qty = p.quantity
+        spot_min = perp_min = 0.0
     else:
         spot_qty = _actual_spot_qty(gateway, p)
         perp_qty = _actual_perp_qty(gateway, p)
+        spot_min = gateway.market_min_amount(p.spot_symbol, perp=False)
+        perp_min = gateway.market_min_amount(p.perp_symbol, perp=True)
 
     spot_ok = (spot_qty <= 0.0)  # nothing to sell counts as already-flat
     perp_ok = (perp_qty <= 0.0)
+
+    # Sub-LOT_SIZE dust is un-tradeable on Binance — treat the leg as flat.
+    if _is_dust(spot_qty, spot_min):
+        log_event(db, f'Spot leg of {p.perp_symbol} is sub-min-lot dust ({spot_qty:.6f} < {spot_min:.6f}); treating as flat', mode=p.mode, level='WARN')
+        spot_qty = 0.0
+        spot_ok = True
+    if _is_dust(perp_qty, perp_min):
+        log_event(db, f'Perp leg of {p.perp_symbol} is sub-min-lot dust ({perp_qty:.6f} < {perp_min:.6f}); treating as flat', mode=p.mode, level='WARN')
+        perp_qty = 0.0
+        perp_ok = True
 
     # ---- Spot leg first ----
     if spot_qty > 0:
@@ -451,13 +479,29 @@ def _close_naked_leg(db, gateway: BinanceGateway, p: Position, cfg: StrategyConf
         if surviving_leg == 'spot':
             if not paper:
                 _ensure_close_readiness(db, gateway, p, cfg)
-            s = gateway.close_spot(p.spot_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-            record_trade(db, p.id, p.mode, p.spot_symbol, 'spot', 'sell', p.quantity, s)
-            closed_ok = True
+            qty = _actual_spot_qty(gateway, p) if not paper else p.quantity
+            min_amt = gateway.market_min_amount(p.spot_symbol, perp=False) if not paper else 0.0
+            if _is_dust(qty, min_amt):
+                log_event(db, f'Naked spot leg of {p.perp_symbol} is sub-min-lot dust ({qty:.6f} < {min_amt:.6f}); treating as flat', mode=p.mode, level='WARN')
+                closed_ok = True
+            elif qty <= 0:
+                closed_ok = True
+            else:
+                s = gateway.close_spot(p.spot_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+                record_trade(db, p.id, p.mode, p.spot_symbol, 'spot', 'sell', qty, s)
+                closed_ok = True
         elif surviving_leg == 'perp':
-            f = gateway.close_perp(p.perp_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-            record_trade(db, p.id, p.mode, p.perp_symbol, 'futures', 'buy', p.quantity, f)
-            closed_ok = True
+            qty = _actual_perp_qty(gateway, p) if not paper else p.quantity
+            min_amt = gateway.market_min_amount(p.perp_symbol, perp=True) if not paper else 0.0
+            if _is_dust(qty, min_amt):
+                log_event(db, f'Naked perp leg of {p.perp_symbol} is sub-min-lot dust ({qty:.6f} < {min_amt:.6f}); treating as flat', mode=p.mode, level='WARN')
+                closed_ok = True
+            elif qty <= 0:
+                closed_ok = True
+            else:
+                f = gateway.close_perp(p.perp_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+                record_trade(db, p.id, p.mode, p.perp_symbol, 'futures', 'buy', qty, f)
+                closed_ok = True
         else:
             closed_ok = True  # no surviving leg to close
     except Exception as e:

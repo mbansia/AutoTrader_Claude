@@ -39,7 +39,7 @@ import time
 from datetime import datetime, timedelta
 
 from fastapi import Cookie, Depends, FastAPI, Form, HTTPException, Path, Request, status
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -824,6 +824,249 @@ def _gather_exchange_status() -> list[dict]:
     })
 
     return sections
+
+
+@app.get('/monitoring/export.md', response_class=PlainTextResponse)
+def monitoring_export(view: str | None = None, view_cookie: str | None = Cookie(default=None, alias='view'), _: None = Depends(auth)):
+    """Single-shot markdown dump of the bot's full state for diagnostic
+    sharing. Includes: configuration, mode/earn states, open + closed
+    positions (with leg states), recent trades / events / capital flows,
+    equity composition, current Binance probe results, and the outbound IP.
+
+    Renders synchronously, hitting Binance for the live probes — slow on
+    first call but acceptable for a manual download."""
+    v = _resolve_view(view, view_cookie)
+    body = _render_export_md(v)
+    return PlainTextResponse(
+        body,
+        media_type='text/markdown; charset=utf-8',
+        headers={'Content-Disposition': f'attachment; filename="autotrader_export_{v}_{datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")}.md"'},
+    )
+
+
+def _md_table(headers: list[str], rows: list[list]) -> str:
+    if not rows:
+        return '_no rows_\n'
+    lines = ['| ' + ' | '.join(headers) + ' |',
+             '|' + '|'.join(['---'] * len(headers)) + '|']
+    for r in rows:
+        lines.append('| ' + ' | '.join(_md_cell(c) for c in r) + ' |')
+    return '\n'.join(lines) + '\n'
+
+
+def _md_cell(value) -> str:
+    if value is None:
+        return ''
+    if isinstance(value, datetime):
+        return value.strftime('%Y-%m-%d %H:%M:%S') + 'Z'
+    if isinstance(value, float):
+        return f'{value:.6g}'
+    text = str(value).replace('|', '\\|').replace('\n', ' ')
+    return text[:240]
+
+
+def _render_export_md(v: str) -> str:
+    now = datetime.utcnow()
+    parts: list[str] = []
+    parts.append(f'# AutoTrader export — view=`{v}` — generated {now.strftime("%Y-%m-%d %H:%M:%S")}Z\n')
+
+    with SessionLocal() as db:
+        cfg = get_strategy_config(db)
+        paper_state = get_mode_state(db, MODE_PAPER)
+        live_state = get_mode_state(db, MODE_LIVE)
+        paper_earn = get_earn_state(db, MODE_PAPER)
+        live_earn = get_earn_state(db, MODE_LIVE)
+
+        # ---- Configuration ----
+        parts.append('## Strategy configuration\n')
+        cfg_rows = [
+            ['entry_funding_threshold', cfg.entry_funding_threshold],
+            ['exit_funding_threshold', cfg.exit_funding_threshold],
+            ['min_24h_quote_volume', cfg.min_24h_quote_volume],
+            ['min_order_book_depth_usdt', cfg.min_order_book_depth_usdt],
+            ['depth_band_bps', cfg.depth_band_bps],
+            ['stop_loss_pct', cfg.stop_loss_pct],
+            ['max_open_positions', cfg.max_open_positions],
+            ['max_trades_per_day', cfg.max_trades_per_day],
+            ['min_position_pct', cfg.min_position_pct],
+            ['max_position_pct', cfg.max_position_pct],
+            ['max_hold_hours', cfg.max_hold_hours],
+            ['loop_seconds', cfg.loop_seconds],
+            ['paper_slippage_bps', cfg.paper_slippage_bps],
+            ['paper_fee_bps', cfg.paper_fee_bps],
+            ['paper_starting_equity', cfg.paper_starting_equity],
+            ['max_entry_basis_bps', cfg.max_entry_basis_bps],
+            ['max_exit_basis_bps', cfg.max_exit_basis_bps],
+            ['enforce_hedge_check', cfg.enforce_hedge_check],
+            ['delisting_check', cfg.delisting_check],
+            ['earn_enabled', cfg.earn_enabled],
+            ['earn_idle_threshold_usdt', cfg.earn_idle_threshold_usdt],
+            ['earn_paper_apr', cfg.earn_paper_apr],
+            ['earn_subscribe_spot_assets', cfg.earn_subscribe_spot_assets],
+            ['auto_transfer_enabled', cfg.auto_transfer_enabled],
+            ['auto_rebalance_threshold', cfg.auto_rebalance_threshold],
+            ['perp_leverage', cfg.perp_leverage],
+        ]
+        parts.append(_md_table(['key', 'value'], cfg_rows))
+
+        # ---- Mode + earn states ----
+        parts.append('\n## Mode states\n')
+        parts.append(_md_table(
+            ['mode', 'entry_enabled', 'exit_enabled', 'maintenance_mode', 'updated_at'],
+            [[m.mode, m.entry_enabled, m.exit_enabled, m.maintenance_mode, m.updated_at]
+             for m in (paper_state, live_state)],
+        ))
+        parts.append('\n## Earn states\n')
+        parts.append(_md_table(
+            ['mode', 'deployed_usdt', 'cumulative_yield_usdt', 'last_accrual_ts', 'last_error'],
+            [[e.mode, e.deployed_usdt, e.cumulative_yield_usdt, e.last_accrual_ts, e.last_error or '']
+             for e in (paper_earn, live_earn)],
+        ))
+
+        # ---- Live wallet snapshot ----
+        gw = BinanceGateway()
+        if v == MODE_LIVE:
+            parts.append('\n## Binance balances (live)\n')
+            bals = gw.safe_balances()
+            if bals is None:
+                parts.append(f'_failed: {gw.last_balance_error or "unknown"}_\n')
+            else:
+                bal_rows = []
+                for wallet in ('spot', 'futures'):
+                    w = bals.get(wallet, {}) or {}
+                    META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
+                    for asset, bal in w.items():
+                        if asset in META_KEYS or not isinstance(bal, dict):
+                            continue
+                        free_q = float(bal.get('free') or 0)
+                        used_q = float(bal.get('used') or 0)
+                        tot_q = float(bal.get('total') or 0)
+                        if free_q == 0 and used_q == 0 and tot_q == 0:
+                            continue
+                        bal_rows.append([wallet, asset, free_q, used_q, tot_q])
+                parts.append(_md_table(['wallet', 'asset', 'free', 'used', 'total'], bal_rows))
+
+        # ---- Equity composition for current view ----
+        earn_for_view = live_earn if v == MODE_LIVE else paper_earn
+        try:
+            breakdown = equity_breakdown(db, gw, v, earn_for_view.deployed_usdt)
+        except Exception as e:
+            breakdown = []
+            parts.append(f'\n_equity breakdown failed: {e}_\n')
+        if breakdown:
+            parts.append(f'\n## Equity composition ({v})\n')
+            parts.append(_md_table(['bucket', 'value_usdt'], [[b['label'], b['value']] for b in breakdown]))
+
+        # ---- Open positions with leg states ----
+        open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == v)).all()
+        parts.append(f'\n## Open positions ({v}) — {len(open_positions)} row(s)\n')
+        op_rows = []
+        for p in open_positions:
+            if v == MODE_LIVE:
+                try:
+                    st = _position_leg_states(gw, p)
+                except Exception:
+                    st = {'spot_actual': 0.0, 'perp_actual': 0.0, 'spot_alive': None, 'perp_alive': None, 'spot_min': 0.0, 'perp_min': 0.0}
+            else:
+                st = {'spot_actual': p.quantity, 'perp_actual': p.quantity, 'spot_alive': True, 'perp_alive': True, 'spot_min': 0.0, 'perp_min': 0.0}
+            op_rows.append([
+                p.id, p.symbol, p.spot_symbol, p.perp_symbol, p.quantity,
+                p.spot_entry_price, p.perp_entry_price,
+                st['spot_actual'], st['perp_actual'],
+                st['spot_min'], st['perp_min'],
+                st['spot_alive'], st['perp_alive'],
+                p.last_funding_rate, p.funding_interval_hours,
+                p.funding_income_accrued, p.opened_at, p.last_close_error or '',
+            ])
+        parts.append(_md_table(
+            ['id', 'symbol', 'spot_symbol', 'perp_symbol', 'qty', 'spot_entry', 'perp_entry',
+             'spot_actual', 'perp_actual', 'spot_min_lot', 'perp_min_lot',
+             'spot_alive', 'perp_alive', 'last_funding_rate', 'interval_h',
+             'funding_income', 'opened_at', 'last_close_error'],
+            op_rows,
+        ))
+
+        # ---- Closed positions (last 50) ----
+        closed_positions = db.scalars(select(Position).where(Position.status == 'closed', Position.mode == v).order_by(desc(Position.id)).limit(50)).all()
+        parts.append(f'\n## Closed positions ({v}) — last {len(closed_positions)}\n')
+        cp_rows = []
+        for c in closed_positions:
+            cp_rows.append([
+                c.id, c.symbol, c.quantity,
+                c.spot_entry_price, c.perp_entry_price,
+                position_realized_pnl(db, c), c.funding_income_accrued,
+                c.opened_at, c.closed_at,
+            ])
+        parts.append(_md_table(
+            ['id', 'symbol', 'qty', 'spot_entry', 'perp_entry', 'trade_pnl', 'funding_income', 'opened_at', 'closed_at'],
+            cp_rows,
+        ))
+
+        # ---- Trades (last 100) ----
+        trades = db.scalars(select(Trade).where(Trade.mode == v).order_by(desc(Trade.id)).limit(100)).all()
+        parts.append(f'\n## Recent trades ({v}) — last {len(trades)}\n')
+        parts.append(_md_table(
+            ['id', 'ts', 'position_id', 'symbol', 'venue', 'side', 'qty', 'price', 'fee'],
+            [[t.id, t.ts, t.position_id, t.symbol, t.venue, t.side, t.quantity, t.price, t.fee] for t in trades],
+        ))
+
+        # ---- Capital flows ----
+        flows = db.scalars(select(CapitalFlow).where(CapitalFlow.mode == v).order_by(desc(CapitalFlow.id)).limit(100)).all()
+        parts.append(f'\n## Capital flows ({v}) — last {len(flows)}\n')
+        parts.append(_md_table(
+            ['id', 'ts', 'amount_usdt', 'kind', 'detected_by', 'note'],
+            [[f.id, f.ts, f.amount_usdt, f.kind, f.detected_by, f.note] for f in flows],
+        ))
+
+        # ---- Bot events (last 100) ----
+        events = db.scalars(select(BotEvent).where(BotEvent.mode == v).order_by(desc(BotEvent.id)).limit(100)).all()
+        parts.append(f'\n## Bot events ({v}) — last {len(events)}\n')
+        parts.append(_md_table(
+            ['id', 'ts', 'level', 'message'],
+            [[e.id, e.ts, e.level, e.message] for e in events],
+        ))
+
+        # ---- Latest scan ----
+        latest_scan = db.scalar(select(ScanResult).where(ScanResult.mode == v).order_by(desc(ScanResult.id)).limit(1))
+        if latest_scan:
+            parts.append(f'\n## Latest scan ({v})\n')
+            parts.append(_md_table(
+                ['ts', 'candidates_total', 'candidates_passing', 'action', 'note'],
+                [[latest_scan.ts, latest_scan.candidates_total, latest_scan.candidates_passing, latest_scan.action, latest_scan.note]],
+            ))
+            parts.append('\n```json\n' + (latest_scan.top_candidates or '[]') + '\n```\n')
+
+        # ---- Outbound IP ----
+        outbound_ip, ip_error = get_outbound_ip()
+        parts.append('\n## Network\n')
+        parts.append(_md_table(['key', 'value'], [
+            ['outbound_ip', outbound_ip or '<unavailable>'],
+            ['outbound_ip_error', ip_error or ''],
+        ]))
+
+    # ---- Live API probes (re-run, fresh) ----
+    parts.append('\n## Exchange API probes\n')
+    sections = _gather_exchange_status()
+    for section in sections:
+        parts.append(f'\n### {section["name"]}\n')
+        parts.append(_md_table(['key', 'value'], [
+            ['configured', section['configured']],
+            ['api_key', section['key_masked']],
+            ['api_secret', section['secret_masked']],
+            *[[c['label'], c['value']] for c in section.get('extra_creds', [])],
+            ['last_balance_error', section.get('last_balance_error', '')],
+        ]))
+        if section.get('probes'):
+            parts.append('\n')
+            for probe in section['probes']:
+                status_tag = 'OK' if probe['ok'] else 'FAIL'
+                parts.append(f'\n#### {status_tag} — {probe["label"]} ({probe["latency_ms"]} ms)\n')
+                if probe['ok']:
+                    parts.append('```json\n' + _truncate_json(probe['raw'], max_chars=4000) + '\n```\n')
+                else:
+                    parts.append(f'```\n{probe["err"]}\n```\n')
+
+    return ''.join(parts)
 
 
 @app.get('/safety', response_class=HTMLResponse)

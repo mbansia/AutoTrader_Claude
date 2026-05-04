@@ -7,6 +7,7 @@
     <form action="/monitoring" method="get" style="display:inline">
       <button type="submit" class="btn">Refresh</button>
     </form>
+    <a href="/monitoring/export.md" class="btn btn-primary" style="margin-left:6px;">Download .md export</a>
   </div>
 </div>
 
@@ -15,6 +16,9 @@
   this page loads — successes show the response (truncated to 4kB); failures
   show the underlying ccxt / network error. Useful when something on the
   Dashboard looks wrong and you want to see exactly what the bot sees.
+  The <strong>Download .md export</strong> button bundles config, mode/earn states,
+  open + closed positions with leg states, recent trades / events / capital flows,
+  equity composition, and the live API probes into a single markdown file.
 </div>
 
 {% for ex in exchanges %}
