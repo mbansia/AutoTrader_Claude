@@ -179,10 +179,14 @@ def _redeem_spot_asset_before_close(db, gateway: BinanceGateway, cfg: StrategyCo
     ok, err = gateway.earn_redeem_asset(base, p.quantity, False)
     if ok:
         log_event(db, f'Redeemed {p.quantity:.6f} {base} from Earn before close', mode=p.mode)
-    else:
-        # Don't escalate — the close attempt below will also fail with insufficient
-        # balance and surface the issue. Often this is just "nothing was subscribed".
-        log_event(db, f'Earn redeem of {base} skipped: {err[:120]}', mode=p.mode, level='WARN')
+        return
+    # "Position doesn't exist" / -6053 is the Binance code for "nothing subscribed
+    # under this product" — expected when earn_subscribe_spot_assets was flipped on
+    # after a position was already opened, or when the asset has no flexible product.
+    # Treat it as a clean skip rather than a WARN to avoid noise on every close attempt.
+    if '-6053' in err or "doesn't exist" in err.lower() or 'no flexible product' in err.lower():
+        return
+    log_event(db, f'Earn redeem of {base} skipped: {err[:120]}', mode=p.mode, level='WARN')
 
 
 def _rebalance_spot_fut(db, gateway: BinanceGateway, cfg: StrategyConfig, mode: str) -> None:
