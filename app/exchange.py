@@ -433,3 +433,80 @@ class BinanceGateway:
         if amount_usdt <= 0:
             return True, 'noop'
         return self._universal_transfer('UMFUTURE_MAIN', amount_usdt)
+
+    # ─── Deposit / withdrawal history (for net-injected-capital headline) ───
+    # Binance only returns up to 90 days of history per call, so we walk
+    # backwards in 90-day chunks for `lookback_days` total. Cached for 5min.
+
+    _deposit_history_cache: dict[str, tuple[list[dict], float]] = {}
+    _withdrawal_history_cache: dict[str, tuple[list[dict], float]] = {}
+
+    def _walk_history(self, sapi_candidates: tuple[str, ...], asset: str, status_value: int, lookback_days: int) -> list[dict]:
+        rows: list[dict] = []
+        chunk_ms = 90 * 86400 * 1000
+        end = int(time.time() * 1000)
+        oldest = end - lookback_days * 86400 * 1000
+        cursor = end
+        while cursor > oldest:
+            start = max(oldest, cursor - chunk_ms)
+            try:
+                resp = self._call_sapi(sapi_candidates, {'coin': asset, 'startTime': start, 'endTime': cursor})
+            except Exception:
+                break
+            if not resp:
+                break
+            chunk = resp if isinstance(resp, list) else resp.get('rows') or resp.get('data') or []
+            for r in chunk:
+                if r.get('status') == status_value or status_value == -1:
+                    rows.append(r)
+            if cursor - chunk_ms <= oldest:
+                break
+            cursor = start
+        return rows
+
+    def deposit_history(self, asset: str = 'USDT', lookback_days: int = 365, ttl_seconds: float = 300.0) -> list[dict]:
+        key = f'{asset}:{lookback_days}'
+        cached = self._deposit_history_cache.get(key)
+        if cached and (time.time() - cached[1]) < ttl_seconds:
+            return cached[0]
+        rows = self._walk_history((
+            'sapiV1GetCapitalDepositHisrec',
+            'sapi_v1_get_capital_deposit_hisrec',
+            'sapiGetCapitalDepositHisrec',
+        ), asset, status_value=1, lookback_days=lookback_days)  # 1 = success
+        self._deposit_history_cache[key] = (rows, time.time())
+        return rows
+
+    def withdrawal_history(self, asset: str = 'USDT', lookback_days: int = 365, ttl_seconds: float = 300.0) -> list[dict]:
+        key = f'{asset}:{lookback_days}'
+        cached = self._withdrawal_history_cache.get(key)
+        if cached and (time.time() - cached[1]) < ttl_seconds:
+            return cached[0]
+        rows = self._walk_history((
+            'sapiV1GetCapitalWithdrawHistory',
+            'sapi_v1_get_capital_withdraw_history',
+            'sapiGetCapitalWithdrawHistory',
+        ), asset, status_value=6, lookback_days=lookback_days)  # 6 = completed
+        self._withdrawal_history_cache[key] = (rows, time.time())
+        return rows
+
+    def net_injected_capital_usdt(self, lookback_days: int = 365) -> tuple[float | None, dict]:
+        """Sum of completed USDT deposits − completed USDT withdrawals over the
+        lookback window. Returns (net_value, meta) where meta carries deposit/
+        withdraw totals and counts so the UI can show the breakdown. Returns
+        (None, …) if the API call failed (caller falls back to CapitalFlow rows)."""
+        try:
+            deps = self.deposit_history('USDT', lookback_days=lookback_days)
+            wdrs = self.withdrawal_history('USDT', lookback_days=lookback_days)
+        except Exception as e:
+            return None, {'error': str(e)[:120]}
+        total_in = sum(float(d.get('amount') or 0) for d in deps)
+        total_out = sum(float(w.get('amount') or 0) for w in wdrs)
+        return total_in - total_out, {
+            'deposits_count': len(deps),
+            'deposits_total': total_in,
+            'withdrawals_count': len(wdrs),
+            'withdrawals_total': total_out,
+            'asset': 'USDT',
+            'lookback_days': lookback_days,
+        }

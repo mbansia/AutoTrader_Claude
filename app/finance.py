@@ -142,12 +142,35 @@ def equity_donut_svg(items: list[dict], cx: int = 100, cy: int = 100, r: int = 8
     return ''.join(paths)
 
 
-def net_capital_in(db, mode: str | None = None) -> float:
+def net_capital_in(db, mode: str | None = None, gateway=None) -> tuple[float, dict]:
+    """Net capital injected (deposits − withdrawals).
+
+    For live mode with a gateway present, queries Binance's deposit/withdraw
+    history directly — that's the authoritative number regardless of any
+    auto-detect threshold or whether manual flows were entered.
+
+    For paper mode (no gateway, or live without a gateway), falls back to the
+    CapitalFlow table which is filled by user-entered flows + the cycle-time
+    auto-detect heuristic.
+
+    Returns (value, meta). meta carries 'source' = 'binance' or 'capital_flows'
+    plus any breakdown counts for the UI.
+    """
+    from app.models import MODE_LIVE
+    if mode == MODE_LIVE and gateway is not None and hasattr(gateway, 'net_injected_capital_usdt'):
+        try:
+            value, meta = gateway.net_injected_capital_usdt()
+            if value is not None:
+                meta = {**(meta or {}), 'source': 'binance'}
+                return value, meta
+        except Exception:
+            pass
     stmt = select(CapitalFlow)
     if mode is not None:
         stmt = stmt.where(CapitalFlow.mode == mode)
     flows = db.scalars(stmt).all()
-    return sum(f.amount_usdt for f in flows)
+    total = sum(f.amount_usdt for f in flows)
+    return total, {'source': 'capital_flows', 'count': len(flows)}
 
 
 def xirr(flows: Iterable[tuple[datetime, float]], guess: float = 0.1, max_iter: int = 200, tol: float = 1e-7) -> float | None:

@@ -308,7 +308,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         funding_income = total_funding_income(db, mode=v)
         realized = trade_realized + funding_income
         unrealized = _unrealized_for_open(db, gw, v)
-        net_capital = net_capital_in(db, mode=v)
+        net_capital, net_capital_meta = net_capital_in(db, mode=v, gateway=gw)
         flow_count_n = db.scalar(select(func.count(CapitalFlow.id)).where(CapitalFlow.mode == v)) or 0
         xirr_value = portfolio_xirr(db, current_equity, mode=v)
         open_count = db.scalar(select(func.count(Position.id)).where(Position.status == 'open', Position.mode == v)) or 0
@@ -355,6 +355,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             'unrealized_pnl': unrealized,
             'total_pnl': realized + unrealized,
             'net_capital': net_capital,
+            'net_capital_meta': net_capital_meta,
             'flow_count': flow_count_n,
             'xirr_value': xirr_value,
             'open_count': open_count,
@@ -475,7 +476,7 @@ def portfolio_page(request: Request, view: str | None = None, view_cookie: str |
         funding_income = total_funding_income(db, mode=v)
         realized = trade_realized + funding_income
         unrealized = _unrealized_for_open(db, gw, v)
-        net_capital = net_capital_in(db, mode=v)
+        net_capital, net_capital_meta = net_capital_in(db, mode=v, gateway=gw)
         xirr_value = portfolio_xirr(db, current_equity, mode=v)
         flows = db.scalars(select(CapitalFlow).where(CapitalFlow.mode == v).order_by(desc(CapitalFlow.id))).all()
 
@@ -520,6 +521,7 @@ def portfolio_page(request: Request, view: str | None = None, view_cookie: str |
             'unrealized_pnl': unrealized,
             'total_pnl': realized + unrealized,
             'net_capital': net_capital,
+            'net_capital_meta': net_capital_meta,
             'xirr_value': xirr_value,
             'flows': [{'id': f.id, 'ts': _fmt_ts(f.ts), 'amount_usdt': f.amount_usdt, 'kind': f.kind, 'detected_by': f.detected_by, 'note': f.note} for f in flows],
             'breakdown': breakdown,

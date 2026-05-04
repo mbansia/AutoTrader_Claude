@@ -7,7 +7,7 @@
 
 <div class="kpi-grid">
   <div class="kpi"><div class="label">Current equity</div><div class="value">{{ '%.2f' % current_equity }} USDT</div><div class="sub">{{ equity_source }}</div></div>
-  <div class="kpi"><div class="label">Net capital injected</div><div class="value">{{ '%.2f' % net_capital }} USDT</div></div>
+  <div class="kpi"><div class="label">Net injected capital</div><div class="value">{{ '%.2f' % net_capital }} USDT</div>{% if net_capital_meta and net_capital_meta.source == 'binance' %}<div class="sub">{{ net_capital_meta.deposits_count }} dep / {{ net_capital_meta.withdrawals_count }} wd · last {{ net_capital_meta.lookback_days }}d · Binance</div>{% endif %}</div>
   <div class="kpi"><div class="label">Trade PnL</div><div class="value {{ 'good' if trade_pnl >= 0 else 'bad' }}">{{ '%+.2f' % trade_pnl }}</div><div class="sub">closed legs</div></div>
   <div class="kpi"><div class="label">Funding earned</div><div class="value {{ 'good' if funding_income >= 0 else 'bad' }}">{{ '%+.2f' % funding_income }}</div><div class="sub">accrued + paid out</div></div>
   <div class="kpi"><div class="label">Unrealized PnL</div><div class="value {{ 'good' if unrealized_pnl >= 0 else 'bad' }}">{{ '%+.2f' % unrealized_pnl }}</div><div class="sub">MTM on opens</div></div>

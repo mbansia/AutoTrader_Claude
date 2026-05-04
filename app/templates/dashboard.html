@@ -50,9 +50,15 @@
     <div class="sub">{% for it in breakdown_items %}{% if it.value > 0 %}{{ it.label }} {{ '%.2f' % it.value }}{% if not loop.last %} · {% endif %}{% endif %}{% endfor %}</div>
   </div>
   <div class="kpi">
-    <div class="label">Net capital injected</div>
+    <div class="label">Net injected capital</div>
     <div class="value">{{ '%.2f' % net_capital }} <span class="muted" style="font-size:14px">USDT</span></div>
-    <div class="sub">{{ flow_count }} flow(s) recorded</div>
+    <div class="sub">
+      {% if net_capital_meta and net_capital_meta.source == 'binance' %}
+        {{ net_capital_meta.deposits_count }} deposits in / {{ net_capital_meta.withdrawals_count }} withdrawals out · last {{ net_capital_meta.lookback_days }}d · live from Binance
+      {% else %}
+        {{ flow_count }} flow(s) recorded
+      {% endif %}
+    </div>
   </div>
   <div class="kpi">
     <div class="label">Total PnL</div>
