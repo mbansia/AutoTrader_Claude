@@ -3,7 +3,53 @@
 {% block content %}
 <div class="page-header">
   <h2>Transactions</h2>
-  <div class="muted">{{ trades|length }} trades · {{ transfers|length }} transfers · {{ flows|length }} capital flows</div>
+  <div class="muted">{{ positions|length }} positions · {{ trades|length }} trades · {{ transfers|length }} transfers · {{ flows|length }} capital flows</div>
+</div>
+
+<div class="card">
+  <h3>Position history (last {{ limit }})</h3>
+  {% if positions %}
+  <div class="table-wrapper">
+  <table>
+    <thead>
+      <tr>
+        <th>Symbol</th>
+        <th>Status</th>
+        <th class="num">Qty</th>
+        <th class="num">Entry notional</th>
+        <th class="num">Spot entry</th>
+        <th class="num">Perp entry</th>
+        <th>Opened</th>
+        <th>Closed</th>
+        <th class="num">Hold</th>
+        <th class="num">Trade PnL</th>
+        <th class="num">Funding earned</th>
+        <th class="num">Realized total</th>
+      </tr>
+    </thead>
+    <tbody>
+    {% for p in positions %}
+      <tr {% if p.last_close_error %}class="position-stuck" title="Close blocked: {{ p.last_close_error }}"{% endif %}>
+        <td class="mono">{{ p.symbol }}{% if p.last_close_error %} <span class="tag bad" style="font-size:10px;margin-left:4px;">CLOSE BLOCKED</span>{% endif %}</td>
+        <td><span class="tag {{ 'good' if p.status == 'open' else '' }}">{{ p.status }}</span></td>
+        <td class="num">{{ '%.6f' % p.quantity }}</td>
+        <td class="num">{{ '%.4f' % p.notional_entry }}</td>
+        <td class="num">{{ '%.6f' % p.spot_entry }}</td>
+        <td class="num">{{ '%.6f' % p.perp_entry }}</td>
+        <td class="muted">{{ p.opened_at }}</td>
+        <td class="muted">{{ p.closed_at or '—' }}</td>
+        <td class="num muted">{{ p.hold_time }}</td>
+        <td class="num {{ 'good' if p.trade_pnl >= 0 else 'bad' }}">{{ '%+.4f' % p.trade_pnl }}</td>
+        <td class="num {{ 'good' if p.funding_income >= 0 else 'bad' }}">{{ '%+.4f' % p.funding_income }}</td>
+        <td class="num {{ 'good' if p.realized >= 0 else 'bad' }}">{{ '%+.4f' % p.realized }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <div class="empty">No positions in {{ view|upper }} yet.</div>
+  {% endif %}
 </div>
 
 <div class="card">

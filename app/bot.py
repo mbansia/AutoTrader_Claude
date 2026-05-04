@@ -281,27 +281,84 @@ def _rebalance_spot_fut(db, gateway: BinanceGateway, cfg: StrategyConfig, mode: 
         log_event(db, f'Rebalance {direction} failed: {err}', mode=mode, level='WARN')
 
 
+def _actual_spot_qty(gateway: BinanceGateway, p: Position) -> float:
+    """Actual base-asset balance on Binance spot, capped at p.quantity. Handles
+    drift from fee deductions, lot-size rounding, or earlier partial fills."""
+    bals = gateway.safe_balances() or {}
+    base = p.spot_symbol.split('/')[0]
+    actual = float((bals.get('spot', {}).get(base) or {}).get('total') or 0)
+    return min(p.quantity, max(0.0, actual))
+
+
+def _actual_perp_qty(gateway: BinanceGateway, p: Position) -> float:
+    """Actual perp position size on Binance, capped at p.quantity."""
+    try:
+        for r in gateway.open_perp_positions_raw():
+            if r.get('symbol') == p.perp_symbol:
+                actual = abs(float(r.get('contracts') or r.get('info', {}).get('positionAmt') or 0))
+                return min(p.quantity, max(0.0, actual))
+    except Exception:
+        pass
+    return 0.0
+
+
 def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyConfig, reason: str) -> None:
-    """Close both legs of a position. Wrap each call so a single Binance error
-    (insufficient balance, market halted, etc.) doesn't crash the entire cycle.
-    If one leg fails to close, the position stays open and check_hedge will
-    retry on the next cycle. Errors are deduped per (position, leg)."""
+    """Close both legs of a position. The whole point of an arb is being hedged,
+    so we never WANT to leave one leg open — if either close fails we either
+    abort (preserving the hedge for retry) or surface CRITICAL when there's no
+    safe path back.
+
+    Order: spot first (sell the base asset), then perp (buy back the short).
+    If spot fails, abort entirely so the perp short stays in place as the
+    hedge for the unsold spot. If spot succeeds but perp fails, we briefly
+    have naked-short exposure; the hedge check on the next cycle will buy
+    back the perp via _close_naked_leg.
+
+    Quantities are pulled from actual Binance balances (capped at the DB
+    quantity), so drift from fees / lot-size rounding doesn't cause
+    "insufficient balance" rejections — we sell exactly what we have."""
     paper = (p.mode == MODE_PAPER)
     if not paper:
         _ensure_close_readiness(db, gateway, p, cfg)
-    spot_ok = perp_ok = False
-    try:
-        s = gateway.close_spot(p.spot_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-        record_trade(db, p.id, p.mode, p.spot_symbol, 'spot', 'sell', p.quantity, s)
-        spot_ok = True
-    except Exception as e:
-        _log_close_error(db, p, 'spot', str(e))
-    try:
-        f = gateway.close_perp(p.perp_symbol, p.quantity, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-        record_trade(db, p.id, p.mode, p.perp_symbol, 'futures', 'buy', p.quantity, f)
-        perp_ok = True
-    except Exception as e:
-        _log_close_error(db, p, 'perp', str(e))
+
+    if paper:
+        spot_qty = perp_qty = p.quantity
+    else:
+        spot_qty = _actual_spot_qty(gateway, p)
+        perp_qty = _actual_perp_qty(gateway, p)
+
+    spot_ok = (spot_qty <= 0.0)  # nothing to sell counts as already-flat
+    perp_ok = (perp_qty <= 0.0)
+
+    # ---- Spot leg first ----
+    if spot_qty > 0:
+        try:
+            s = gateway.close_spot(p.spot_symbol, spot_qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+            record_trade(db, p.id, p.mode, p.spot_symbol, 'spot', 'sell', spot_qty, s)
+            spot_ok = True
+        except Exception as e:
+            _log_close_error(db, p, 'spot', str(e))
+            # Abort — leaving perp open keeps the position fully hedged for retry.
+            return
+
+    # ---- Perp leg ----
+    if perp_qty > 0:
+        try:
+            f = gateway.close_perp(p.perp_symbol, perp_qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+            record_trade(db, p.id, p.mode, p.perp_symbol, 'futures', 'buy', perp_qty, f)
+            perp_ok = True
+        except Exception as e:
+            _log_close_error(db, p, 'perp', str(e))
+            if spot_qty > 0 and spot_ok:
+                # Spot already sold, perp failed → naked-short exposure. Hedge
+                # check next cycle will call _close_naked_leg(surviving='perp')
+                # which buys back the perp.
+                log_event(
+                    db,
+                    f'CRITICAL: spot leg of {p.perp_symbol} sold but perp buy-back failed — naked-short exposure until hedge check resolves it next cycle',
+                    mode=p.mode, level='ERROR',
+                )
+
     if spot_ok and perp_ok:
         p.status = 'closed'
         p.closed_at = datetime.utcnow()
@@ -309,9 +366,6 @@ def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyCon
         _CLOSE_ERROR_CACHE.pop((p.id, 'spot'), None)
         _CLOSE_ERROR_CACHE.pop((p.id, 'perp'), None)
         log_event(db, f'Closed {p.perp_symbol} ({reason}); realized={position_realized_pnl(db, p):+.4f}', mode=p.mode)
-    elif spot_ok or perp_ok:
-        # Partial close — surface clearly. Hedge check will recover on the next cycle.
-        log_event(db, f'PARTIAL CLOSE on {p.perp_symbol}: {("spot only" if spot_ok else "perp only")} closed; other leg will retry next cycle', mode=p.mode, level='ERROR')
 
 
 def _close_naked_leg(db, gateway: BinanceGateway, p: Position, cfg: StrategyConfig, surviving_leg: str | None, reason: str) -> None:

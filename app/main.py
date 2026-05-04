@@ -493,6 +493,30 @@ def transactions_page(request: Request, view: str | None = None, limit: int = 10
         ctx['active'] = 'transactions'
         ctx['cfg'] = get_strategy_config(db)
 
+        # Position history — open + closed, newest first.
+        position_rows = db.scalars(select(Position).where(Position.mode == v).order_by(desc(Position.id)).limit(limit)).all()
+        positions_v = []
+        for p in position_rows:
+            trade_pnl = position_realized_pnl(db, p)
+            ended = p.closed_at if p.closed_at else datetime.utcnow()
+            hold = ended - p.opened_at
+            positions_v.append({
+                'id': p.id,
+                'symbol': p.symbol,
+                'status': p.status,
+                'quantity': p.quantity,
+                'notional_entry': p.quantity * p.spot_entry_price,
+                'spot_entry': p.spot_entry_price,
+                'perp_entry': p.perp_entry_price,
+                'opened_at': _fmt_ts(p.opened_at),
+                'closed_at': _fmt_ts(p.closed_at) if p.closed_at else None,
+                'hold_time': _fmt_age(hold),
+                'trade_pnl': trade_pnl,
+                'funding_income': p.funding_income_accrued,
+                'realized': trade_pnl + p.funding_income_accrued,
+                'last_close_error': p.last_close_error or '',
+            })
+
         # Trades — last `limit`, filtered by mode.
         trade_rows = db.scalars(select(Trade).where(Trade.mode == v).order_by(desc(Trade.id)).limit(limit)).all()
         trades_v = [{
@@ -522,7 +546,7 @@ def transactions_page(request: Request, view: str | None = None, limit: int = 10
             'kind': f.kind, 'detected_by': f.detected_by, 'note': f.note,
         } for f in flow_rows]
 
-        ctx.update({'trades': trades_v, 'transfers': transfers_v, 'flows': flows_v, 'limit': limit})
+        ctx.update({'positions': positions_v, 'trades': trades_v, 'transfers': transfers_v, 'flows': flows_v, 'limit': limit})
     response = templates.TemplateResponse(request, 'transactions.html', ctx)
     response.set_cookie('view', v, max_age=60 * 60 * 24 * 365, httponly=False)
     return response
