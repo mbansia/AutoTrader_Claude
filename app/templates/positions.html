@@ -27,9 +27,9 @@
     </thead>
     <tbody>
       {% for r in rows %}
-      <tr class="position-row" data-pos-id="{{ r.id }}">
+      <tr class="position-row {{ 'position-stuck' if r.last_close_error }}" data-pos-id="{{ r.id }}" {% if r.last_close_error %}title="Close blocked: {{ r.last_close_error }}"{% endif %}>
         <td><button type="button" class="row-toggle" aria-expanded="false" aria-controls="detail-{{ r.id }}" onclick="togglePositionDetail({{ r.id }}, this)">▶</button></td>
-        <td class="mono">{{ r.symbol }}</td>
+        <td class="mono">{{ r.symbol }}{% if r.last_close_error %} <span class="tag bad" style="font-size:10px;margin-left:4px;">CLOSE BLOCKED</span>{% endif %}</td>
         <td class="num">{{ ('%.2f' % r.notional_now) if r.notional_now else ('%.2f' % r.notional_entry) }}</td>
         <td class="num {{ 'good' if r.last_funding_apy >= cfg.exit_funding_threshold else 'warn' }}">{{ '%.2f%%' % (r.last_funding_apy * 100) }} <span class="muted" style="font-size:11px;">({{ '%dh' % r.interval_hours }})</span></td>
         <td class="num">{{ '%.2f%%' % (r.effective_apy * 100) }}</td>
@@ -52,6 +52,12 @@
      not by the (sometimes overflowing) sum of column widths. #}
   {% for r in rows %}
   <div class="position-detail-panel" id="detail-{{ r.id }}" hidden>
+    {% if r.last_close_error %}
+    <div class="alert alert-error" style="margin-bottom:12px;">
+      <strong>Close blocked:</strong> <span class="mono" style="font-size:12px;">{{ r.last_close_error }}</span>
+      <span class="muted" style="margin-left:8px;">Bot is retrying every cycle. Likely cause: not enough free USDT in the futures wallet for the buy-back fee, or spot wallet doesn't have enough of the base asset to sell.</span>
+    </div>
+    {% endif %}
     <div class="leg-grid">
       <div class="leg-card leg-spot">
         <div class="leg-title"><span class="tag good">SPOT · long</span> <span class="mono">{{ r.spot_leg.symbol }}</span></div>

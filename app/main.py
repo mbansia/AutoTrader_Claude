@@ -318,6 +318,9 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         last_cycle_ts = latest_scan.ts if latest_scan else (equity_points[-1].ts if equity_points else None)
         last_cycle_age = _fmt_age(datetime.utcnow() - last_cycle_ts) if last_cycle_ts else None
 
+        stuck_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == v, Position.last_close_error != '')).all()
+        ctx['stuck_positions'] = [{'symbol': p.symbol, 'err': p.last_close_error[:160]} for p in stuck_positions]
+
         earn = get_earn_state(db, v)
         ctx['earn'] = {
             'enabled': cfg.earn_enabled,
@@ -411,6 +414,7 @@ def positions_page(request: Request, view: str | None = None, view_cookie: str |
                 'age': _fmt_age(datetime.utcnow() - p.opened_at),
                 'unrealized_pnl': position_unrealized_pnl(p, spot_now, perp_now) if (spot_now and perp_now) else 0.0,
                 'funding_income': p.funding_income_accrued,
+                'last_close_error': p.last_close_error or '',
                 'spot_leg': {
                     'symbol': p.spot_symbol,
                     'side': 'long',

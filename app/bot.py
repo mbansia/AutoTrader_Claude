@@ -160,9 +160,11 @@ def record_trade(db, position_id: int | None, mode: str, symbol: str, venue: str
 def _log_close_error(db, p: Position, leg: str, err: str) -> None:
     """Record a close-leg error, but only if it's different from the last one we
     logged for this (position, leg). Stops the same 'Margin is insufficient'
-    line from spamming the Logs tab on every cycle."""
+    line from spamming the Logs tab on every cycle. Also persists the latest
+    error on the Position row so the UI can show it without diving into Logs."""
     key = (p.id, leg)
     snippet = err[:140]
+    p.last_close_error = f'{leg}: {snippet}'
     if _CLOSE_ERROR_CACHE.get(key) == snippet:
         return  # already logged this exact error for this leg
     _CLOSE_ERROR_CACHE[key] = snippet
@@ -263,6 +265,7 @@ def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyCon
     if spot_ok and perp_ok:
         p.status = 'closed'
         p.closed_at = datetime.utcnow()
+        p.last_close_error = ''
         _CLOSE_ERROR_CACHE.pop((p.id, 'spot'), None)
         _CLOSE_ERROR_CACHE.pop((p.id, 'perp'), None)
         log_event(db, f'Closed {p.perp_symbol} ({reason}); realized={position_realized_pnl(db, p):+.4f}', mode=p.mode)
@@ -288,11 +291,14 @@ def _close_naked_leg(db, gateway: BinanceGateway, p: Position, cfg: StrategyConf
         else:
             closed_ok = True  # no surviving leg to close
     except Exception as e:
-        log_event(db, f'Failed to flatten naked {surviving_leg} leg of {p.perp_symbol}: {str(e)[:140]} (will retry)', mode=p.mode, level='ERROR')
+        snippet = str(e)[:140]
+        p.last_close_error = f'{surviving_leg or "?"}: {snippet}'
+        log_event(db, f'Failed to flatten naked {surviving_leg} leg of {p.perp_symbol}: {snippet} (will retry)', mode=p.mode, level='ERROR')
         return
     if closed_ok:
         p.status = 'closed'
         p.closed_at = datetime.utcnow()
+        p.last_close_error = ''
         log_event(db, f'Closed naked leg on {p.perp_symbol}: {reason}; flattened {surviving_leg or "no surviving leg"}', mode=p.mode, level='ERROR')
 
 

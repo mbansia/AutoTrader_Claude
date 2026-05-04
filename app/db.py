@@ -62,3 +62,4 @@ def run_schema_migrations() -> None:
     _add_column_if_missing('strategy_config', 'perp_leverage', 'INTEGER NOT NULL DEFAULT 1')
     _add_column_if_missing('strategy_config', 'min_order_book_depth_usdt', 'FLOAT NOT NULL DEFAULT 500.0')
     _add_column_if_missing('strategy_config', 'depth_band_bps', 'FLOAT NOT NULL DEFAULT 10.0')
+    _add_column_if_missing('positions', 'last_close_error', "TEXT NOT NULL DEFAULT ''")

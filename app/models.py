@@ -33,6 +33,10 @@ class Position(Base):
     # attribute per-position in live for v1, so this stays at 0 there).
     funding_income_accrued: Mapped[float] = mapped_column(Float, default=0.0)
     last_funding_accrual_ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Last close-attempt error message for this position, if a close is failing
+    # repeatedly. Cleared once the close goes through. Surfaced on the UI so the
+    # user can see at a glance why a position is stuck.
+    last_close_error: Mapped[str] = mapped_column(Text, default='')
     closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 

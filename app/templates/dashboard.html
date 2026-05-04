@@ -27,6 +27,14 @@
 <div class="alert alert-error">Equity snapshot is older than 5 minutes. The worker may be stuck — check the Logs &amp; Scans tab.</div>
 {% endif %}
 
+{% if stuck_positions %}
+<div class="alert alert-error">
+  <strong>Close blocked on {{ stuck_positions|length }} position(s):</strong>
+  {% for sp in stuck_positions %}<span class="mono">{{ sp.symbol }}</span> — {{ sp.err|truncate(120) }}{% if not loop.last %}; {% endif %}{% endfor %}
+  <span class="muted" style="display:block;margin-top:4px;">The bot is retrying every cycle. To unstick: top up futures wallet on Binance (~$2 USDT usually enough), or close manually from the Binance app and let reconcile catch up next cycle.</span>
+</div>
+{% endif %}
+
 {% if view == 'live' and live_spot_free is not none %}
 <div class="alert alert-info" style="display:flex;gap:18px;">
   <span><strong>Spot free:</strong> {{ '%.2f' % live_spot_free }} USDT</span>
