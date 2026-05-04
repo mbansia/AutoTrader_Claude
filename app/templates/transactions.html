@@ -1,0 +1,80 @@
+{% extends 'base.html' %}
+{% block title %}Transactions · Funding Arb{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h2>Transactions</h2>
+  <div class="muted">{{ trades|length }} trades · {{ transfers|length }} transfers · {{ flows|length }} capital flows</div>
+</div>
+
+<div class="card">
+  <h3>Trades (last {{ limit }})</h3>
+  {% if trades %}
+  <div class="table-wrapper">
+  <table>
+    <thead><tr><th>Time</th><th>Symbol</th><th>Venue</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Notional</th><th class="num">Fee</th><th class="num">Position</th></tr></thead>
+    <tbody>
+    {% for t in trades %}
+      <tr>
+        <td class="muted mono">{{ t.ts }}</td>
+        <td class="mono">{{ t.symbol }}</td>
+        <td><span class="tag">{{ t.venue }}</span></td>
+        <td><span class="tag {{ 'good' if t.side == 'buy' else 'bad' }}">{{ t.side }}</span></td>
+        <td class="num">{{ '%.6f' % t.quantity }}</td>
+        <td class="num">{{ '%.6f' % t.price }}</td>
+        <td class="num">{{ '%.4f' % t.notional }}</td>
+        <td class="num">{{ '%.4f' % t.fee }}</td>
+        <td class="num muted">{{ t.position_id or '—' }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <div class="empty">No trades recorded in {{ view|upper }} yet.</div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h3>Transfers, redeems &amp; Earn sweeps (last {{ limit }})</h3>
+  {% if transfers %}
+  <div class="table-wrapper">
+  <table>
+    <thead><tr><th>Time</th><th>Level</th><th>Action</th></tr></thead>
+    <tbody>
+    {% for tx in transfers %}
+      <tr>
+        <td class="muted mono">{{ tx.ts }}</td>
+        <td><span class="tag {{ 'bad' if tx.level == 'ERROR' else ('warn' if tx.level == 'WARN' else 'good') }}">{{ tx.level }}</span></td>
+        <td>{{ tx.message }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% else %}
+  <div class="empty">No transfers, redeems or sweeps yet.</div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h3>Capital flows</h3>
+  {% if flows %}
+  <table>
+    <thead><tr><th>Date</th><th class="num">Amount</th><th>Kind</th><th>Detected</th><th>Note</th></tr></thead>
+    <tbody>
+    {% for f in flows %}
+      <tr>
+        <td class="muted">{{ f.ts }}</td>
+        <td class="num {{ 'good' if f.amount_usdt > 0 else 'bad' }}">{{ '%+.2f' % f.amount_usdt }}</td>
+        <td><span class="tag">{{ f.kind }}</span></td>
+        <td><span class="tag {{ 'warn' if f.detected_by == 'auto' else 'good' }}">{{ f.detected_by }}</span></td>
+        <td class="muted">{{ f.note }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">No manual capital flows recorded. Use the form on Dashboard or rely on Binance history sync (live mode).</div>
+  {% endif %}
+</div>
+{% endblock %}

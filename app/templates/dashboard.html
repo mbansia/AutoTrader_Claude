@@ -39,10 +39,11 @@
 <div class="alert alert-info" style="display:flex;gap:18px;">
   <span><strong>Spot free:</strong> {{ '%.2f' % live_spot_free }} USDT</span>
   <span><strong>Futures free:</strong> {{ '%.2f' % live_fut_free }} USDT</span>
-  <span class="muted">— this is the actual cash the bot can deploy. Auto-transfer balances them before each entry.</span>
+  <span class="muted">— this is the actual cash the bot can deploy. Auto-rebalance keeps them ≈ equal.</span>
 </div>
 {% endif %}
 
+{# ========== KPI ROW ========== #}
 <div class="kpi-grid">
   <div class="kpi">
     <div class="label">Current equity</div>
@@ -54,14 +55,14 @@
     <div class="value">{{ '%.2f' % net_capital }} <span class="muted" style="font-size:14px">USDT</span></div>
     <div class="sub">
       {% if net_capital_meta and net_capital_meta.source == 'binance' %}
-        {% set dep_n = net_capital_meta.deposits_count %}{% set wd_n = net_capital_meta.withdrawals_count %}{% set in_n = net_capital_meta.sub_in_count or 0 %}{% set out_n = net_capital_meta.sub_out_count or 0 %}
+        {% set in_n = net_capital_meta.sub_in_count or 0 %}{% set out_n = net_capital_meta.sub_out_count or 0 %}
         {% if in_n or out_n %}
-          deposits {{ dep_n }} · sub-in {{ in_n }} · sub-out {{ out_n }} · withdrawals {{ wd_n }} · last {{ net_capital_meta.lookback_days }}d
+          deposits {{ net_capital_meta.deposits_count }} · sub-in {{ in_n }} · sub-out {{ out_n }} · withdrawals {{ net_capital_meta.withdrawals_count }} · last {{ net_capital_meta.lookback_days }}d
         {% else %}
-          {{ dep_n }} deposits in / {{ wd_n }} withdrawals out · last {{ net_capital_meta.lookback_days }}d · live from Binance
+          {{ net_capital_meta.deposits_count }} deposits in / {{ net_capital_meta.withdrawals_count }} withdrawals out · last {{ net_capital_meta.lookback_days }}d · live from Binance
         {% endif %}
       {% elif net_capital_meta and net_capital_meta.error %}
-        no Binance history visible — falling back to {{ flow_count }} manual flow(s). For sub-accounts, ensure the key has read permission for sub-account transfer history.
+        no Binance history visible — falling back to {{ flow_count }} manual flow(s).
       {% else %}
         {{ flow_count }} flow(s) recorded
       {% endif %}
@@ -91,6 +92,38 @@
   {% endif %}
 </div>
 
+{# ========== EQUITY COMPOSITION + CURVE ========== #}
+<div class="card">
+  <h3>Equity composition</h3>
+  <div class="body">
+    {% if breakdown_donut %}
+    <div class="composition-grid">
+      <svg viewBox="0 0 200 200" class="equity-donut" aria-label="Equity composition donut chart">
+        {{ breakdown_donut | safe }}
+        <circle cx="100" cy="100" r="50" fill="var(--panel)"/>
+        <text x="100" y="96" text-anchor="middle" class="donut-total">{{ '%.2f' % current_equity }}</text>
+        <text x="100" y="115" text-anchor="middle" class="donut-sub">USDT total</text>
+      </svg>
+      <ul class="legend">
+        {% set total = breakdown_items|sum(attribute='value') %}
+        {% for it in breakdown_items %}
+          {% if it.value > 0 %}
+          <li>
+            <span class="swatch" style="background:{{ it.color }}"></span>
+            <span class="legend-label">{{ it.label }}</span>
+            <span class="legend-value mono">{{ '%.2f' % it.value }} USDT</span>
+            <span class="legend-pct muted">{{ '%.1f%%' % (it.value / total * 100 if total > 0 else 0) }}</span>
+          </li>
+          {% endif %}
+        {% endfor %}
+      </ul>
+    </div>
+    {% else %}
+    <div class="empty">No equity data yet — run the worker.</div>
+    {% endif %}
+  </div>
+</div>
+
 <div class="card">
   <h3>Equity curve ({{ view|upper }}, last 60 snapshots)</h3>
   <div class="body">
@@ -109,6 +142,119 @@
   </div>
 </div>
 
+{# ========== OPEN POSITIONS ========== #}
+<div class="card">
+  <h3>Open positions ({{ rows|length }})</h3>
+  {% if rows %}
+  <div class="table-wrapper">
+  <table class="positions-table">
+    <thead>
+      <tr>
+        <th></th><th>Symbol</th>
+        <th class="num">Notional now</th>
+        <th class="num">Funding APY</th>
+        <th class="num">Effective APY</th>
+        <th class="num">Basis now</th>
+        <th class="num">Age</th>
+        <th class="num">Funding earned</th>
+        <th class="num">Unrealized PnL</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr class="position-row {{ 'position-stuck' if r.last_close_error }}" data-pos-id="{{ r.id }}" {% if r.last_close_error %}title="Close blocked: {{ r.last_close_error }}"{% endif %}>
+        <td><button type="button" class="row-toggle" aria-expanded="false" aria-controls="detail-{{ r.id }}" onclick="togglePositionDetail({{ r.id }}, this)">▶</button></td>
+        <td class="mono">{{ r.symbol }}{% if r.last_close_error %} <span class="tag bad" style="font-size:10px;margin-left:4px;">CLOSE BLOCKED</span>{% endif %}</td>
+        <td class="num">{{ ('%.2f' % r.notional_now) if r.notional_now else ('%.2f' % r.notional_entry) }}</td>
+        <td class="num {{ 'good' if r.last_funding_apy >= cfg.exit_funding_threshold else 'warn' }}">{{ '%.2f%%' % (r.last_funding_apy * 100) }} <span class="muted" style="font-size:11px;">({{ '%dh' % r.interval_hours }})</span></td>
+        <td class="num">{{ '%.2f%%' % (r.effective_apy * 100) }}</td>
+        <td class="num {{ 'good' if r.basis_now_bps <= cfg.max_exit_basis_bps else 'warn' }}">{{ '%+.1f bps' % r.basis_now_bps }}</td>
+        <td class="num">{{ r.age }}</td>
+        <td class="num {{ 'good' if r.funding_income >= 0 else 'bad' }}">{{ '%+.4f' % r.funding_income }}</td>
+        <td class="num {{ 'good' if r.unrealized_pnl >= 0 else 'bad' }}">{{ '%+.4f' % r.unrealized_pnl }}</td>
+        <td>
+          <form action="/positions/{{ r.id }}/close" method="post" style="display:inline" onsubmit="return confirm('Market-close both legs of {{ r.symbol }}?');">
+            <button type="submit" class="btn btn-danger" style="padding:3px 10px;font-size:12px;">Close</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+
+  {% for r in rows %}
+  <div class="position-detail-panel" id="detail-{{ r.id }}" hidden>
+    {% if r.last_close_error %}
+    <div class="alert alert-error" style="margin-bottom:12px;">
+      <strong>Close blocked:</strong> <span class="mono" style="font-size:12px;">{{ r.last_close_error }}</span>
+      <span class="muted" style="margin-left:8px;">Bot is retrying every cycle. Likely cause: not enough free USDT in the futures wallet for the buy-back fee, or spot wallet doesn't have enough of the base asset to sell.</span>
+    </div>
+    {% endif %}
+    <div class="leg-grid">
+      <div class="leg-card leg-spot">
+        <div class="leg-title"><span class="tag good">SPOT · long</span> <span class="mono">{{ r.spot_leg.symbol }}</span></div>
+        <table class="leg-table">
+          <tr><th>Quantity</th><td class="num">{{ '%.6f' % r.spot_leg.qty }}</td></tr>
+          <tr><th>Entry price</th><td class="num">{{ '%.6f' % r.spot_leg.entry_price }} USDT</td></tr>
+          <tr><th>Current price</th><td class="num">{{ ('%.6f' % r.spot_leg.now_price) if r.spot_leg.now_price else '—' }} USDT</td></tr>
+          <tr><th>Notional entry</th><td class="num">{{ '%.4f' % r.spot_leg.notional_entry }} USDT</td></tr>
+          <tr><th>Notional now</th><td class="num">{{ ('%.4f' % r.spot_leg.notional_now) if r.spot_leg.notional_now else '—' }} USDT</td></tr>
+          <tr><th>Entry fee</th><td class="num">{{ '%.4f' % r.spot_leg.fee_paid }} USDT</td></tr>
+          <tr><th>Leg MTM PnL</th><td class="num {{ 'good' if r.spot_leg.mtm_pnl >= 0 else 'bad' }}">{{ '%+.4f' % r.spot_leg.mtm_pnl }} USDT</td></tr>
+          <tr><th>Filled at</th><td class="muted mono">{{ r.spot_leg.entry_ts }}</td></tr>
+        </table>
+      </div>
+      <div class="leg-card leg-perp">
+        <div class="leg-title"><span class="tag bad">PERP · short</span> <span class="mono">{{ r.perp_leg.symbol }}</span></div>
+        <table class="leg-table">
+          <tr><th>Quantity</th><td class="num">{{ '%.6f' % r.perp_leg.qty }}</td></tr>
+          <tr><th>Entry price</th><td class="num">{{ '%.6f' % r.perp_leg.entry_price }} USDT</td></tr>
+          <tr><th>Current price</th><td class="num">{{ ('%.6f' % r.perp_leg.now_price) if r.perp_leg.now_price else '—' }} USDT</td></tr>
+          <tr><th>Notional entry</th><td class="num">{{ '%.4f' % r.perp_leg.notional_entry }} USDT</td></tr>
+          <tr><th>Notional now</th><td class="num">{{ ('%.4f' % r.perp_leg.notional_now) if r.perp_leg.notional_now else '—' }} USDT</td></tr>
+          <tr><th>Entry fee</th><td class="num">{{ '%.4f' % r.perp_leg.fee_paid }} USDT</td></tr>
+          <tr><th>Leg MTM PnL</th><td class="num {{ 'good' if r.perp_leg.mtm_pnl >= 0 else 'bad' }}">{{ '%+.4f' % r.perp_leg.mtm_pnl }} USDT</td></tr>
+          <tr><th>Funding rate</th><td class="num">{{ '%.2f%% APY' % (r.perp_leg.last_funding_apy * 100) }} <span class="muted">({{ '%dh' % r.perp_leg.interval_hours }} interval)</span></td></tr>
+          <tr><th>Funding earned</th><td class="num {{ 'good' if r.perp_leg.funding_income >= 0 else 'bad' }}">{{ '%+.4f' % r.perp_leg.funding_income }} USDT</td></tr>
+          <tr><th>Filled at</th><td class="muted mono">{{ r.perp_leg.entry_ts }}</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+  {% else %}
+  <div class="empty">No open positions in {{ view|upper }}. The bot will open one when funding APY exceeds {{ '%.2f%%' % (cfg.entry_funding_threshold * 100) }} and the spot/perp basis is within ±{{ '%.0f' % cfg.max_entry_basis_bps }} bps.</div>
+  {% endif %}
+</div>
+
+{# ========== CLOSED POSITIONS ========== #}
+<div class="card">
+  <h3>Closed positions (last 20)</h3>
+  {% if closed %}
+  <table>
+    <thead><tr><th>Symbol</th><th class="num">Qty</th><th>Opened</th><th>Closed</th><th class="num">Trade PnL</th><th class="num">Funding earned</th><th class="num">Realized total</th></tr></thead>
+    <tbody>
+    {% for c in closed %}
+      <tr>
+        <td class="mono">{{ c.symbol }}</td>
+        <td class="num">{{ '%.6f' % c.quantity }}</td>
+        <td class="muted">{{ c.opened_at }}</td>
+        <td class="muted">{{ c.closed_at }}</td>
+        <td class="num {{ 'good' if c.trade_pnl >= 0 else 'bad' }}">{{ '%+.4f' % c.trade_pnl }}</td>
+        <td class="num {{ 'good' if c.funding_income >= 0 else 'bad' }}">{{ '%+.4f' % c.funding_income }}</td>
+        <td class="num {{ 'good' if c.realized >= 0 else 'bad' }}">{{ '%+.4f' % c.realized }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="empty">No closed positions in {{ view|upper }} yet.</div>
+  {% endif %}
+</div>
+
+{# ========== LATEST SCAN ========== #}
 <div class="card">
   <h3>Latest scan</h3>
   <div class="body">
@@ -143,6 +289,43 @@
       {% endif %}
     {% else %}
       <div class="empty">No scans recorded for {{ view|upper }} yet.</div>
+    {% endif %}
+  </div>
+</div>
+
+{# ========== CAPITAL FLOWS ========== #}
+<div class="card">
+  <h3>Capital flows</h3>
+  <div class="body">
+    <form action="/capital-flow" method="post" class="row-flex" style="margin-bottom:14px;">
+      <div class="form-row" style="min-width:140px;"><label>Date (UTC)</label><input type="datetime-local" name="ts" required></div>
+      <div class="form-row" style="min-width:140px;"><label>Amount (USDT)</label><input type="number" step="0.01" name="amount" required placeholder="positive=deposit"></div>
+      <div class="form-row" style="min-width:200px;"><label>Note</label><input name="note" placeholder="optional"></div>
+      <button type="submit" class="btn btn-primary">Add manual flow</button>
+    </form>
+    {% if flows %}
+    <table>
+      <thead><tr><th>Date</th><th class="num">Amount</th><th>Kind</th><th>Detected</th><th>Note</th><th></th></tr></thead>
+      <tbody>
+      {% for f in flows %}
+        <tr>
+          <td class="muted">{{ f.ts }}</td>
+          <td class="num {{ 'good' if f.amount_usdt > 0 else 'bad' }}">{{ '%+.2f' % f.amount_usdt }}</td>
+          <td><span class="tag">{{ f.kind }}</span></td>
+          <td><span class="tag {{ 'warn' if f.detected_by == 'auto' else 'good' }}">{{ f.detected_by }}</span></td>
+          <td class="muted">{{ f.note }}</td>
+          <td>
+            <form action="/capital-flow/delete" method="post" style="display:inline">
+              <input type="hidden" name="id" value="{{ f.id }}">
+              <button type="submit" class="btn btn-danger" style="padding:3px 8px;font-size:12px;">Delete</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty">No manual capital flows recorded. Live mode reads net injected from Binance directly; this section is for paper or for manually overriding.</div>
     {% endif %}
   </div>
 </div>

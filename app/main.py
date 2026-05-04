@@ -345,48 +345,13 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         else:
             ctx['live_spot_free'] = ctx['live_fut_free'] = None
 
-        ctx.update({
-            'current_equity': current_equity,
-            'equity_source': equity_source,
-            'balances_error': balances_error,
-            'realized_pnl': realized,
-            'trade_pnl': trade_realized,
-            'funding_income': funding_income,
-            'unrealized_pnl': unrealized,
-            'total_pnl': realized + unrealized,
-            'net_capital': net_capital,
-            'net_capital_meta': net_capital_meta,
-            'flow_count': flow_count_n,
-            'xirr_value': xirr_value,
-            'open_count': open_count,
-            'trades_today': trades_today_n,
-            'equity_points': [{'ts': _fmt_ts(p.ts), 'equity_usdt': p.equity_usdt} for p in equity_points],
-            'equity_polyline': equity_polyline,
-            'latest_scan': {'ts': _fmt_ts(latest_scan.ts), 'candidates_total': latest_scan.candidates_total, 'candidates_passing': latest_scan.candidates_passing, 'action': latest_scan.action} if latest_scan else None,
-            'latest_scan_top': latest_scan_top,
-            'last_cycle_age': last_cycle_age,
-        })
-    response = templates.TemplateResponse(request, 'dashboard.html', ctx)
-    response.set_cookie('view', v, max_age=60 * 60 * 24 * 365, httponly=False)
-    return response
-
-
-@app.get('/positions', response_class=HTMLResponse)
-def positions_page(request: Request, view: str | None = None, view_cookie: str | None = Cookie(default=None, alias='view'), _: None = Depends(auth)):
-    v = _resolve_view(view, view_cookie)
-    with SessionLocal() as db:
-        ctx = _shared_ctx(request, v, db)
-        ctx['active'] = 'positions'
-        cfg = get_strategy_config(db)
-        ctx['cfg'] = cfg
-        gw = BinanceGateway()
+        # Open positions rows + leg detail (formerly /positions).
         open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == v)).all()
         rows = []
         for p in open_positions:
             spot_now = gw.safe_price(p.spot_symbol) or 0.0
             perp_now = gw.safe_price(p.perp_symbol, perp=True) or 0.0
             interval_h = p.funding_interval_hours or 8.0
-            # Per-leg breakdown for the expandable detail panel.
             entry_trades = db.scalars(select(Trade).where(Trade.position_id == p.id, Trade.side == 'buy', Trade.venue == 'spot')).all() + \
                            db.scalars(select(Trade).where(Trade.position_id == p.id, Trade.side == 'sell', Trade.venue == 'futures')).all()
             spot_entry_trade = next((t for t in entry_trades if t.venue == 'spot'), None)
@@ -417,11 +382,8 @@ def positions_page(request: Request, view: str | None = None, view_cookie: str |
                 'funding_income': p.funding_income_accrued,
                 'last_close_error': p.last_close_error or '',
                 'spot_leg': {
-                    'symbol': p.spot_symbol,
-                    'side': 'long',
-                    'qty': p.quantity,
-                    'entry_price': p.spot_entry_price,
-                    'now_price': spot_now,
+                    'symbol': p.spot_symbol, 'side': 'long', 'qty': p.quantity,
+                    'entry_price': p.spot_entry_price, 'now_price': spot_now,
                     'notional_entry': p.quantity * p.spot_entry_price,
                     'notional_now': p.quantity * spot_now if spot_now else 0.0,
                     'fee_paid': float(spot_entry_trade.fee) if spot_entry_trade else 0.0,
@@ -429,11 +391,8 @@ def positions_page(request: Request, view: str | None = None, view_cookie: str |
                     'entry_ts': _fmt_ts(spot_entry_trade.ts) if spot_entry_trade else _fmt_ts(p.opened_at),
                 },
                 'perp_leg': {
-                    'symbol': p.perp_symbol,
-                    'side': 'short',
-                    'qty': p.quantity,
-                    'entry_price': p.perp_entry_price,
-                    'now_price': perp_now,
+                    'symbol': p.perp_symbol, 'side': 'short', 'qty': p.quantity,
+                    'entry_price': p.perp_entry_price, 'now_price': perp_now,
                     'notional_entry': p.quantity * p.perp_entry_price,
                     'notional_now': p.quantity * perp_now if perp_now else 0.0,
                     'fee_paid': float(perp_entry_trade.fee) if perp_entry_trade else 0.0,
@@ -445,6 +404,7 @@ def positions_page(request: Request, view: str | None = None, view_cookie: str |
                 },
             })
 
+        # Closed positions table (formerly bottom of /positions).
         closed_rows = db.scalars(select(Position).where(Position.status == 'closed', Position.mode == v).order_by(desc(Position.id)).limit(20)).all()
         closed = [{
             'id': c.id,
@@ -456,65 +416,14 @@ def positions_page(request: Request, view: str | None = None, view_cookie: str |
             'funding_income': c.funding_income_accrued,
             'realized': position_realized_pnl(db, c) + c.funding_income_accrued,
         } for c in closed_rows]
-        ctx.update({'rows': rows, 'closed': closed})
-    response = templates.TemplateResponse(request, 'positions.html', ctx)
-    response.set_cookie('view', v, max_age=60 * 60 * 24 * 365, httponly=False)
-    return response
 
-
-@app.get('/portfolio', response_class=HTMLResponse)
-def portfolio_page(request: Request, view: str | None = None, view_cookie: str | None = Cookie(default=None, alias='view'), _: None = Depends(auth)):
-    v = _resolve_view(view, view_cookie)
-    with SessionLocal() as db:
-        ctx = _shared_ctx(request, v, db)
-        ctx['active'] = 'portfolio'
-        cfg = get_strategy_config(db)
-        ctx['cfg'] = cfg
-        gw = BinanceGateway()
-        current_equity, equity_source, equity_stale = _current_equity(db, v)
-        trade_realized = total_realized_pnl(db, mode=v)
-        funding_income = total_funding_income(db, mode=v)
-        realized = trade_realized + funding_income
-        unrealized = _unrealized_for_open(db, gw, v)
-        net_capital, net_capital_meta = net_capital_in(db, mode=v, gateway=gw)
-        xirr_value = portfolio_xirr(db, current_equity, mode=v)
+        # Capital flows (formerly on /portfolio).
         flows = db.scalars(select(CapitalFlow).where(CapitalFlow.mode == v).order_by(desc(CapitalFlow.id))).all()
-
-        all_positions = db.scalars(select(Position).where(Position.mode == v).order_by(desc(Position.id))).all()
-        breakdown = []
-        for p in all_positions:
-            unreal = 0.0
-            if p.status == 'open':
-                spot_now = gw.safe_price(p.spot_symbol) or 0.0
-                perp_now = gw.safe_price(p.perp_symbol, perp=True) or 0.0
-                if spot_now and perp_now:
-                    unreal = position_unrealized_pnl(p, spot_now, perp_now)
-            spot_now_for_breakdown = gw.safe_price(p.spot_symbol) if p.status == 'open' else None
-            ref_price = spot_now_for_breakdown or p.spot_entry_price or 0.0
-            breakdown.append({
-                'symbol': p.symbol,
-                'status': p.status,
-                'quantity': p.quantity,
-                'notional_entry': p.quantity * p.spot_entry_price,
-                'notional_now': p.quantity * ref_price,
-                'opened_at': _fmt_ts(p.opened_at),
-                'closed_at': _fmt_ts(p.closed_at) if p.closed_at else None,
-                'trade_pnl': position_realized_pnl(db, p),
-                'funding_income': p.funding_income_accrued,
-                'realized': position_realized_pnl(db, p) + p.funding_income_accrued,
-                'unrealized': unreal,
-            })
-
-        earn = get_earn_state(db, v)
-        breakdown_items = equity_breakdown(db, gw, v, earn.deployed_usdt)
-        if v == MODE_PAPER:
-            tracked = sum(max(0.0, i['value']) for i in breakdown_items)
-            free_cash = max(0.0, current_equity - tracked)
-            breakdown_items.insert(0, {'label': 'Free cash', 'value': free_cash, 'color': '#38bdf8'})
 
         ctx.update({
             'current_equity': current_equity,
             'equity_source': equity_source,
+            'balances_error': balances_error,
             'realized_pnl': realized,
             'trade_pnl': trade_realized,
             'funding_income': funding_income,
@@ -522,15 +431,34 @@ def portfolio_page(request: Request, view: str | None = None, view_cookie: str |
             'total_pnl': realized + unrealized,
             'net_capital': net_capital,
             'net_capital_meta': net_capital_meta,
+            'flow_count': flow_count_n,
             'xirr_value': xirr_value,
+            'open_count': open_count,
+            'trades_today': trades_today_n,
+            'equity_points': [{'ts': _fmt_ts(p.ts), 'equity_usdt': p.equity_usdt} for p in equity_points],
+            'equity_polyline': equity_polyline,
+            'latest_scan': {'ts': _fmt_ts(latest_scan.ts), 'candidates_total': latest_scan.candidates_total, 'candidates_passing': latest_scan.candidates_passing, 'action': latest_scan.action} if latest_scan else None,
+            'latest_scan_top': latest_scan_top,
+            'last_cycle_age': last_cycle_age,
+            'rows': rows,
+            'closed': closed,
             'flows': [{'id': f.id, 'ts': _fmt_ts(f.ts), 'amount_usdt': f.amount_usdt, 'kind': f.kind, 'detected_by': f.detected_by, 'note': f.note} for f in flows],
-            'breakdown': breakdown,
-            'breakdown_items': breakdown_items,
-            'breakdown_donut': equity_donut_svg(breakdown_items),
         })
-    response = templates.TemplateResponse(request, 'portfolio.html', ctx)
+    response = templates.TemplateResponse(request, 'dashboard.html', ctx)
     response.set_cookie('view', v, max_age=60 * 60 * 24 * 365, httponly=False)
     return response
+
+
+# Legacy routes redirect to the merged /dashboard so existing bookmarks still work.
+@app.get('/positions')
+def positions_page_redirect(_: None = Depends(auth)):
+    return RedirectResponse(url='/dashboard', status_code=303)
+
+
+@app.get('/portfolio')
+def portfolio_page_redirect(_: None = Depends(auth)):
+    return RedirectResponse(url='/dashboard', status_code=303)
+
 
 
 @app.post('/capital-flow')
@@ -555,6 +483,49 @@ def delete_capital_flow(id: int = Form(...), _: None = Depends(auth)):
             db.delete(f)
             db.commit()
     return RedirectResponse(url='/portfolio', status_code=303)
+
+
+@app.get('/transactions', response_class=HTMLResponse)
+def transactions_page(request: Request, view: str | None = None, limit: int = 100, view_cookie: str | None = Cookie(default=None, alias='view'), _: None = Depends(auth)):
+    v = _resolve_view(view, view_cookie)
+    with SessionLocal() as db:
+        ctx = _shared_ctx(request, v, db)
+        ctx['active'] = 'transactions'
+        ctx['cfg'] = get_strategy_config(db)
+
+        # Trades — last `limit`, filtered by mode.
+        trade_rows = db.scalars(select(Trade).where(Trade.mode == v).order_by(desc(Trade.id)).limit(limit)).all()
+        trades_v = [{
+            'id': t.id, 'ts': _fmt_ts(t.ts), 'symbol': t.symbol, 'venue': t.venue,
+            'side': t.side, 'quantity': t.quantity, 'price': t.price,
+            'notional': t.quantity * t.price, 'fee': t.fee, 'position_id': t.position_id,
+        } for t in trade_rows]
+
+        # Transfers / redeems / sweeps — parsed from BotEvent messages. No
+        # dedicated table; we substring-match the action verbs the bot logs.
+        TRANSFER_KEYWORDS = ('Auto-transferred', 'Pre-close: transferred', 'Pre-close: redeemed', 'Rebalance:', 'Swept ', 'Redeemed ', 'Funded close margin', 'futures→spot', 'spot→futures')
+        seen: set[int] = set()
+        transfers_v: list[dict] = []
+        for keyword in TRANSFER_KEYWORDS:
+            for e in db.scalars(select(BotEvent).where(BotEvent.mode == v, BotEvent.message.like(f'%{keyword}%')).order_by(desc(BotEvent.id)).limit(limit)).all():
+                if e.id in seen:
+                    continue
+                seen.add(e.id)
+                transfers_v.append({'id': e.id, 'ts_raw': e.ts, 'ts': _fmt_ts(e.ts), 'level': e.level, 'message': e.message})
+        transfers_v.sort(key=lambda x: x['ts_raw'], reverse=True)
+        transfers_v = transfers_v[:limit]
+
+        # Capital flows.
+        flow_rows = db.scalars(select(CapitalFlow).where(CapitalFlow.mode == v).order_by(desc(CapitalFlow.id)).limit(limit)).all()
+        flows_v = [{
+            'id': f.id, 'ts': _fmt_ts(f.ts), 'amount_usdt': f.amount_usdt,
+            'kind': f.kind, 'detected_by': f.detected_by, 'note': f.note,
+        } for f in flow_rows]
+
+        ctx.update({'trades': trades_v, 'transfers': transfers_v, 'flows': flows_v, 'limit': limit})
+    response = templates.TemplateResponse(request, 'transactions.html', ctx)
+    response.set_cookie('view', v, max_age=60 * 60 * 24 * 365, httponly=False)
+    return response
 
 
 @app.get('/logs', response_class=HTMLResponse)
