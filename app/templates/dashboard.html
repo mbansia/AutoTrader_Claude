@@ -54,7 +54,14 @@
     <div class="value">{{ '%.2f' % net_capital }} <span class="muted" style="font-size:14px">USDT</span></div>
     <div class="sub">
       {% if net_capital_meta and net_capital_meta.source == 'binance' %}
-        {{ net_capital_meta.deposits_count }} deposits in / {{ net_capital_meta.withdrawals_count }} withdrawals out · last {{ net_capital_meta.lookback_days }}d · live from Binance
+        {% set dep_n = net_capital_meta.deposits_count %}{% set wd_n = net_capital_meta.withdrawals_count %}{% set in_n = net_capital_meta.sub_in_count or 0 %}{% set out_n = net_capital_meta.sub_out_count or 0 %}
+        {% if in_n or out_n %}
+          deposits {{ dep_n }} · sub-in {{ in_n }} · sub-out {{ out_n }} · withdrawals {{ wd_n }} · last {{ net_capital_meta.lookback_days }}d
+        {% else %}
+          {{ dep_n }} deposits in / {{ wd_n }} withdrawals out · last {{ net_capital_meta.lookback_days }}d · live from Binance
+        {% endif %}
+      {% elif net_capital_meta and net_capital_meta.error %}
+        no Binance history visible — falling back to {{ flow_count }} manual flow(s). For sub-accounts, ensure the key has read permission for sub-account transfer history.
       {% else %}
         {{ flow_count }} flow(s) recorded
       {% endif %}

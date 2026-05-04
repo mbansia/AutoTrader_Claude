@@ -157,20 +157,24 @@ def net_capital_in(db, mode: str | None = None, gateway=None) -> tuple[float, di
     plus any breakdown counts for the UI.
     """
     from app.models import MODE_LIVE
+    binance_meta: dict = {}
     if mode == MODE_LIVE and gateway is not None and hasattr(gateway, 'net_injected_capital_usdt'):
         try:
-            value, meta = gateway.net_injected_capital_usdt()
+            value, binance_meta = gateway.net_injected_capital_usdt()
             if value is not None:
-                meta = {**(meta or {}), 'source': 'binance'}
+                meta = {**(binance_meta or {}), 'source': 'binance'}
                 return value, meta
-        except Exception:
-            pass
+        except Exception as e:
+            binance_meta = {'error': str(e)[:120]}
     stmt = select(CapitalFlow)
     if mode is not None:
         stmt = stmt.where(CapitalFlow.mode == mode)
     flows = db.scalars(stmt).all()
     total = sum(f.amount_usdt for f in flows)
-    return total, {'source': 'capital_flows', 'count': len(flows)}
+    meta = {'source': 'capital_flows', 'count': len(flows)}
+    if binance_meta.get('error'):
+        meta['error'] = binance_meta['error']
+    return total, meta
 
 
 def xirr(flows: Iterable[tuple[datetime, float]], guess: float = 0.1, max_iter: int = 200, tol: float = 1e-7) -> float | None:

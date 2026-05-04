@@ -440,6 +440,7 @@ class BinanceGateway:
 
     _deposit_history_cache: dict[str, tuple[list[dict], float]] = {}
     _withdrawal_history_cache: dict[str, tuple[list[dict], float]] = {}
+    _sub_transfer_history_cache: dict[str, tuple[list[dict], float]] = {}
 
     def _walk_history(self, sapi_candidates: tuple[str, ...], asset: str, status_value: int, lookback_days: int) -> list[dict]:
         rows: list[dict] = []
@@ -490,23 +491,93 @@ class BinanceGateway:
         self._withdrawal_history_cache[key] = (rows, time.time())
         return rows
 
+    def sub_account_transfer_history(self, asset: str = 'USDT', incoming: bool = True, lookback_days: int = 365, ttl_seconds: float = 300.0) -> list[dict]:
+        """Sub-account-side view of master ↔ sub transfers.
+        Endpoint: GET /sapi/v1/sub-account/sub/transfer/history
+        type: 1 = transfer in (master → this sub), 2 = transfer out (this sub → master).
+        Returns [] if the API key isn't on a sub-account or the endpoint isn't
+        accessible (e.g., master keys hit a different endpoint)."""
+        key = f'{asset}:{1 if incoming else 2}:{lookback_days}'
+        cached = self._sub_transfer_history_cache.get(key)
+        if cached and (time.time() - cached[1]) < ttl_seconds:
+            return cached[0]
+        rows: list[dict] = []
+        # 30-day window per call on this endpoint historically.
+        chunk_ms = 30 * 86400 * 1000
+        end = int(time.time() * 1000)
+        oldest = end - lookback_days * 86400 * 1000
+        cursor = end
+        while cursor > oldest:
+            start = max(oldest, cursor - chunk_ms)
+            try:
+                resp = self._call_sapi((
+                    'sapiV1GetSubAccountSubTransferHistory',
+                    'sapi_v1_get_sub_account_sub_transfer_history',
+                    'sapiGetSubAccountSubTransferHistory',
+                ), {'asset': asset, 'type': 1 if incoming else 2, 'startTime': start, 'endTime': cursor})
+            except Exception:
+                break
+            if not resp:
+                break
+            chunk = resp if isinstance(resp, list) else resp.get('rows') or resp.get('data') or []
+            if not chunk:
+                break
+            for r in chunk:
+                if (r.get('status') or '').upper() in ('SUCCESS', '') or r.get('status') == 1:
+                    rows.append(r)
+            if cursor - chunk_ms <= oldest:
+                break
+            cursor = start
+        self._sub_transfer_history_cache[key] = (rows, time.time())
+        return rows
+
     def net_injected_capital_usdt(self, lookback_days: int = 365) -> tuple[float | None, dict]:
-        """Sum of completed USDT deposits − completed USDT withdrawals over the
-        lookback window. Returns (net_value, meta) where meta carries deposit/
-        withdraw totals and counts so the UI can show the breakdown. Returns
-        (None, …) if the API call failed (caller falls back to CapitalFlow rows)."""
+        """Sum of all completed USDT inflows − outflows over the lookback window:
+            inflows = external deposits + master→sub transfers (if sub-account)
+            outflows = external withdrawals + sub→master transfers
+        Returns (net_value, meta) where meta carries each component's count and
+        total so the UI can show the breakdown. Each fetch is best-effort; if
+        a particular endpoint isn't accessible (master key hitting sub endpoint
+        and vice-versa) it just returns 0/empty for that component."""
+        deps: list[dict] = []
+        wdrs: list[dict] = []
+        sub_in: list[dict] = []
+        sub_out: list[dict] = []
         try:
             deps = self.deposit_history('USDT', lookback_days=lookback_days)
+        except Exception:
+            pass
+        try:
             wdrs = self.withdrawal_history('USDT', lookback_days=lookback_days)
-        except Exception as e:
-            return None, {'error': str(e)[:120]}
-        total_in = sum(float(d.get('amount') or 0) for d in deps)
-        total_out = sum(float(w.get('amount') or 0) for w in wdrs)
-        return total_in - total_out, {
+        except Exception:
+            pass
+        try:
+            sub_in = self.sub_account_transfer_history('USDT', incoming=True, lookback_days=lookback_days)
+        except Exception:
+            pass
+        try:
+            sub_out = self.sub_account_transfer_history('USDT', incoming=False, lookback_days=lookback_days)
+        except Exception:
+            pass
+        deps_total = sum(float(d.get('amount') or 0) for d in deps)
+        wdrs_total = sum(float(w.get('amount') or 0) for w in wdrs)
+        # Sub-account transfer rows use 'qty' historically and 'amount' in newer responses.
+        sub_in_total = sum(float(r.get('qty') or r.get('amount') or 0) for r in sub_in)
+        sub_out_total = sum(float(r.get('qty') or r.get('amount') or 0) for r in sub_out)
+        net = (deps_total + sub_in_total) - (wdrs_total + sub_out_total)
+        # If literally everything came back empty, signal failure so the caller
+        # falls back to CapitalFlow / manual tracking instead of showing $0.
+        if not deps and not wdrs and not sub_in and not sub_out:
+            return None, {'error': 'no SAPI history available (missing permission, sub-account keys, or no activity)'}
+        return net, {
             'deposits_count': len(deps),
-            'deposits_total': total_in,
+            'deposits_total': deps_total,
             'withdrawals_count': len(wdrs),
-            'withdrawals_total': total_out,
+            'withdrawals_total': wdrs_total,
+            'sub_in_count': len(sub_in),
+            'sub_in_total': sub_in_total,
+            'sub_out_count': len(sub_out),
+            'sub_out_total': sub_out_total,
             'asset': 'USDT',
             'lookback_days': lookback_days,
         }

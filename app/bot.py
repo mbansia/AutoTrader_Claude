@@ -35,7 +35,7 @@ from app.safety import (
 )
 
 
-CAPITAL_FLOW_THRESHOLD_USDT = 50.0
+CAPITAL_FLOW_THRESHOLD_USDT = 1.0  # was 50 — too coarse for the typical $20 starting equity
 
 # Module-level dedup so we only log "live API down" once per outage instead of every cycle.
 _LIVE_API_UNHEALTHY_LOGGED = False
