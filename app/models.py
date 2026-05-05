@@ -187,6 +187,14 @@ class StrategyConfig(Base):
     # Continuous spot ↔ futures rebalance: keep both wallets' free balances near
     # equal each cycle. Threshold is the minimum imbalance (USDT) before we move.
     auto_rebalance_threshold: Mapped[float] = mapped_column(Float, default=1.0)
+    # Liquidation buffer: % of open perp notional kept as free margin in the
+    # futures wallet between cycles. Cross + 1x means used_margin == notional;
+    # this buffer is what absorbs adverse mark-price moves before maintenance
+    # margin triggers. 20% covers roughly a -20% move on the short side, which
+    # is generous for the typical mid/large-cap crypto we trade. Bump higher
+    # for memes/low-liquidity tokens. Cross margin shares this buffer across
+    # all open perps on the same venue, so the safety scales naturally.
+    futures_buffer_pct: Mapped[float] = mapped_column(Float, default=0.20)
     # Subscribe base assets (SOL, ETH, etc.) to Binance Simple Earn Flexible after
     # the spot buy fills. Default off — opt-in because not every asset has a
     # flexible product and redeem-on-close is one extra failure mode.

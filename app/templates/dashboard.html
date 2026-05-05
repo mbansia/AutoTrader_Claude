@@ -60,8 +60,13 @@
             {% for venue_id, vmeta in net_capital_meta.venue_breakdown.items() %}
               {% if vmeta.value is not none %}
                 <li><span class="muted">{{ venue_id }}</span><span class="mono">{{ '%+.2f' % vmeta.value }}</span></li>
+                {% if vmeta.errors %}
+                  {% for endpoint, errmsg in vmeta.errors.items() %}
+                    <li style="padding-left:12px;font-size:10px;"><span class="bad">{{ venue_id }} {{ endpoint }}</span><span class="muted" title="{{ errmsg }}">{{ errmsg|truncate(60) }}</span></li>
+                  {% endfor %}
+                {% endif %}
               {% else %}
-                <li><span class="muted">{{ venue_id }}</span><span class="bad" style="font-size:10px;">history n/a</span></li>
+                <li><span class="muted">{{ venue_id }}</span><span class="bad" style="font-size:10px;" title="{{ vmeta.error or 'API returned no data' }}">history n/a</span></li>
               {% endif %}
             {% endfor %}
             {% if net_capital_meta.manual_count %}
@@ -70,7 +75,7 @@
           </ul>
         </details>
       {% else %}
-        <span class="muted" style="font-size:11px;">{{ flow_count }} manual flow(s) · venue history not yet visible</span>
+        <span class="muted" style="font-size:11px;">{{ flow_count }} flow(s) · venue history not yet visible</span>
       {% endif %}
     </div>
   </div>
@@ -101,7 +106,15 @@
   <div class="kpi">
     <div class="label">In Earn (USDT)</div>
     <div class="value">{{ '%.2f' % earn.deployed }}</div>
-    <div class="sub">yield {{ '%+.4f' % earn.cumulative_yield }} USDT{% if earn.last_error %} · <span class="bad" title="{{ earn.last_error }}">{{ earn.last_error|truncate(28) }}</span>{% endif %}</div>
+    <div class="sub">
+      yield {{ '%+.4f' % earn.cumulative_yield }} USDT
+      {% if earn.last_error %}<br><span class="bad" title="{{ earn.last_error }}" style="font-size:11px;">{{ earn.last_error|truncate(60) }}</span>{% endif %}
+      {% if view == 'live' %}
+      <form action="/admin/force-earn-sweep" method="post" style="margin-top:6px;display:inline;">
+        <button class="btn" type="submit" style="padding:2px 8px;font-size:11px;" title="Bypass the per-asset earn cooldown and sweep idle USDT to earn on every venue right now. Use after a 77505 lock-out or post-deploy.">Sweep now</button>
+      </form>
+      {% endif %}
+    </div>
   </div>
   {% endif %}
   {# Idle ratio: how much of total equity is currently parked in earn vs deployed in trades #}

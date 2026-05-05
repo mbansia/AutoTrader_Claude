@@ -278,17 +278,37 @@ class VenueGateway:
         operations so downstream code sees the post-action state."""
         self._balance_cache = None
 
+    # Per-(symbol, side) ticker cache. Equity composition iterates every
+    # held base asset and called safe_price once each; on a venue with N
+    # spot assets that's N rate-limited ticker calls per dashboard render.
+    # KuCoin returned 429000 ("Too many requests") on this path. Cache
+    # for the same TTL as balances so a single render hits ticker once
+    # per symbol; the worker loop bypasses with force_refresh when it
+    # needs a fresh price for a trade decision.
+    PRICE_CACHE_TTL = 10.0
+
     def price(self, symbol: str) -> float:
         return float(self.spot.fetch_ticker(symbol)['last'])
 
     def perp_price(self, symbol: str) -> float:
         return float(self.futures.fetch_ticker(symbol)['last'])
 
-    def safe_price(self, symbol: str, perp: bool = False) -> float | None:
+    def safe_price(self, symbol: str, perp: bool = False, force_refresh: bool = False) -> float | None:
+        if not hasattr(self, '_price_cache'):
+            self._price_cache = {}  # type: ignore[attr-defined]
+        cache_key = (symbol, perp)
+        cached = self._price_cache.get(cache_key)  # type: ignore[attr-defined]
+        if cached and not force_refresh:
+            ts, value = cached
+            if (time.time() - ts) < self.PRICE_CACHE_TTL:
+                return value
         try:
-            return self.perp_price(symbol) if perp else self.price(symbol)
+            value = self.perp_price(symbol) if perp else self.price(symbol)
         except Exception:
+            self._price_cache[cache_key] = (time.time(), None)  # type: ignore[attr-defined]
             return None
+        self._price_cache[cache_key] = (time.time(), value)  # type: ignore[attr-defined]
+        return value
 
     def market_min_amount(self, symbol: str, perp: bool = False) -> float:
         """Minimum order quantity (LOT_SIZE.minQty on Binance, baseMinSize on

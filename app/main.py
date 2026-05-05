@@ -353,6 +353,39 @@ def run_once(view: str | None = Cookie(default=None), _: None = Depends(auth)):
     return RedirectResponse(url='/dashboard', status_code=303)
 
 
+@app.post('/admin/force-earn-sweep')
+def force_earn_sweep(_: None = Depends(auth)):
+    """Force-bypass the per-asset earn-subscribe cooldown and try to sweep
+    every venue's spot.free → earn right now. Use after a 77505 lock,
+    after a deploy, or any time the user sees idle USDT not flowing to
+    earn. Logs the result of each attempt to /logs so the user can see
+    exactly which venue accepted / refused (and why)."""
+    from app.exchange import make_gateways
+    from app.bot import log_event
+    gateways = make_gateways()
+    with SessionLocal() as db:
+        for gw in gateways:
+            # Clear any per-asset cooldown so the next call hits the API
+            # cleanly. We re-install it on success below via the normal
+            # path, so the rate-limit guard is preserved going forward.
+            cooldown_attr = '_earn_subscribe_cooldown_until'
+            if hasattr(gw, cooldown_attr):
+                getattr(gw, cooldown_attr).clear()
+            bals = gw.safe_balances(force_refresh=True) or {}
+            spot_free = float((bals.get('spot', {}).get('USDT') or {}).get('free') or 0)
+            if spot_free <= 0.10:
+                log_event(db, f'Force-sweep: nothing to sweep (spot.free={spot_free:.4f} ≤ dust)', mode=MODE_LIVE, exchange=gw.venue_id)
+                continue
+            amount = max(0.0, spot_free - 0.10)
+            ok, err = gw.earn_subscribe(amount, paper_mode=False)
+            if ok:
+                log_event(db, f'Force-sweep: {amount:.2f} USDT spot → earn (manual trigger)', mode=MODE_LIVE, exchange=gw.venue_id)
+            else:
+                log_event(db, f'Force-sweep failed: {amount:.2f} USDT — {err}', mode=MODE_LIVE, level='WARN', exchange=gw.venue_id)
+        db.commit()
+    return RedirectResponse(url='/dashboard', status_code=303)
+
+
 @app.post('/admin/reingest-flows')
 def reingest_capital_flows(_: None = Depends(auth)):
     """One-shot: walk every gateway's capital-flow history with a 2-year
@@ -961,6 +994,7 @@ def save_config(
     auto_rebalance_threshold: float = Form(1.0),
     earn_subscribe_spot_assets: int = Form(0),
     perp_leverage: int = Form(1),
+    futures_buffer_pct: float = Form(0.20),
     min_order_book_depth_usdt: float = Form(500.0),
     depth_band_bps: float = Form(10.0),
     _: None = Depends(auth),
@@ -991,6 +1025,7 @@ def save_config(
         cfg.auto_rebalance_threshold = max(0.20, auto_rebalance_threshold)
         cfg.earn_subscribe_spot_assets = bool(earn_subscribe_spot_assets)
         cfg.perp_leverage = max(1, perp_leverage)
+        cfg.futures_buffer_pct = max(0.05, min(1.0, futures_buffer_pct))
         cfg.min_order_book_depth_usdt = max(0.0, min_order_book_depth_usdt)
         cfg.depth_band_bps = max(1.0, depth_band_bps)
         db.commit()

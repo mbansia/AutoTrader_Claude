@@ -1060,9 +1060,14 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                 bals_after = gateway.safe_balances() or {}
                 fut_free_now = float((bals_after.get('futures', {}).get('USDT') or {}).get('free') or 0)
                 if open_ps:
-                    # Keep 10% of open notional as free margin buffer.
+                    # Keep ``cfg.futures_buffer_pct`` of open notional as free
+                    # margin in the futures wallet so the perp short can absorb
+                    # an adverse move before maintenance liquidation. 20% (the
+                    # default) covers roughly a -20% mark-price move; bump
+                    # higher in cfg for high-volatility tokens. Cross margin
+                    # pools the buffer across all open perps on the venue.
                     open_notional = sum((p.quantity or 0) * (p.perp_entry_price or 0) for p in open_ps)
-                    keep = max(0.20, open_notional * 0.10)
+                    keep = max(0.20, open_notional * float(cfg.futures_buffer_pct or 0.20))
                 else:
                     keep = 0.10
                 if fut_free_now > keep + 0.10:
@@ -1089,13 +1094,16 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     ok, err = gateway.earn_subscribe(sweep, paper)
                     if ok:
                         earn.deployed_usdt += sweep
-                        log_event(db, f'Swept {sweep:.2f} USDT idle to earn', mode=mode, exchange=gateway.venue_id)
-                    elif 'cooldown active' in err:
-                        # Per-asset cooldown — expected, don't spam logs.
-                        earn.last_error = err
+                        earn.last_error = ''
+                        log_event(db, f'Swept {sweep:.2f} USDT idle → earn', mode=mode, exchange=gateway.venue_id)
                     else:
+                        # Always log the failure reason at WARN. The user
+                        # should see *why* an idle balance isn't sweeping
+                        # (cooldown countdown, missing earn product, missing
+                        # API permission, etc.) on /logs without having to
+                        # cross-reference dashboard tooltips.
                         earn.last_error = err
-                        log_event(db, f'Earn subscribe USDT failed (sweep={sweep:.4f}): {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                        log_event(db, f'Earn sweep blocked: {sweep:.2f} USDT idle in spot — {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
             # End-of-cycle bookkeeping: ingest any new venue-side capital
             # flows (deposits, withdrawals, sub-transfers) so XIRR and the

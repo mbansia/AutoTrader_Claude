@@ -71,6 +71,7 @@ def run_schema_migrations() -> None:
     # Auto-transfer USDT between spot and futures wallets.
     _add_column_if_missing('strategy_config', 'auto_transfer_enabled', 'BOOLEAN NOT NULL DEFAULT 1')
     _add_column_if_missing('strategy_config', 'auto_rebalance_threshold', 'FLOAT NOT NULL DEFAULT 1.0')
+    _add_column_if_missing('strategy_config', 'futures_buffer_pct', 'FLOAT NOT NULL DEFAULT 0.20')
     _add_column_if_missing('strategy_config', 'earn_subscribe_spot_assets', 'BOOLEAN NOT NULL DEFAULT 0')
     _add_column_if_missing('strategy_config', 'perp_leverage', 'INTEGER NOT NULL DEFAULT 1')
     _add_column_if_missing('strategy_config', 'min_order_book_depth_usdt', 'FLOAT NOT NULL DEFAULT 500.0')
