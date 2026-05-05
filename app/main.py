@@ -590,19 +590,73 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         stuck_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == v, Position.last_close_error != '')).all()
         ctx['stuck_positions'] = [{'symbol': p.symbol, 'err': p.last_close_error[:160]} for p in stuck_positions]
 
-        # Aggregate earn across every venue so the "In Earn" KPI reflects
-        # the whole pool, not just one venue's slice (the prior single-row
-        # EarnState design overwrote earn balances on every cycle).
+        # Earn aggregation. ``deployed`` is read live per venue (single
+        # source of truth — the API) so the dashboard never shows a value
+        # larger than equity due to a stale cache. ``cumulative_yield``
+        # comes from the EarnState rows because that's only place we
+        # accumulate it. The earlier "126% coverage" bug was the deployed
+        # cache drifting above reality after several sweep / refresh
+        # races; reading live API removes the drift entirely.
         earn_states = get_all_earn_states(db, v)
-        earn_total = sum(es.deployed_usdt for es in earn_states)
-        earn_yield_total = sum(es.cumulative_yield_usdt for es in earn_states)
-        earn_errors = '; '.join(es.last_error for es in earn_states if es.last_error)
+        earn_yield_by_venue = {es.exchange: es.cumulative_yield_usdt for es in earn_states}
+        earn_err_by_venue = {es.exchange: es.last_error for es in earn_states if es.last_error}
+        earn_deployed_by_venue: dict[str, float] = {}
+        if v == MODE_LIVE and gateways:
+            for gw in gateways:
+                try:
+                    bal, _ = gw.earn_balance_usdt()
+                    earn_deployed_by_venue[gw.venue_id] = bal or 0.0
+                except Exception:
+                    earn_deployed_by_venue[gw.venue_id] = 0.0
+        else:
+            # Paper mode: trust the EarnState cache (the bot synthesises yield).
+            earn_deployed_by_venue = {es.exchange: es.deployed_usdt for es in earn_states}
+        earn_total = sum(earn_deployed_by_venue.values())
+        earn_yield_total = sum(earn_yield_by_venue.values())
         ctx['earn'] = {
             'enabled': cfg.earn_enabled,
             'deployed': earn_total,
             'cumulative_yield': earn_yield_total,
-            'last_error': earn_errors,
-            'per_venue': {es.exchange: {'deployed': es.deployed_usdt, 'yield': es.cumulative_yield_usdt} for es in earn_states},
+            'last_error': '; '.join(earn_err_by_venue.values()),
+            'per_venue': {
+                vid: {
+                    'deployed': earn_deployed_by_venue.get(vid, 0.0),
+                    'yield': earn_yield_by_venue.get(vid, 0.0),
+                }
+                for vid in set(earn_deployed_by_venue) | set(earn_yield_by_venue)
+            },
+        }
+
+        # Fees paid across every trade in this mode. Avg fee % = total fees
+        # / total notional, the realistic round-trip cost the bot is paying.
+        # Per-(venue, leg) breakdown surfaces whether spot or perp legs
+        # are the dominant cost driver, and which venue charges more.
+        fee_rows = db.scalars(select(Trade).where(Trade.mode == v)).all()
+        total_fees = sum(float(t.fee or 0.0) for t in fee_rows)
+        total_notional = sum(float(t.notional or 0.0) for t in fee_rows) or 1.0
+        avg_fee_pct = (total_fees / total_notional) * 100.0 if total_notional > 0 else 0.0
+        fee_breakdown: dict[tuple[str, str], dict] = {}
+        for t in fee_rows:
+            key = (t.exchange or '?', t.venue or '?')  # ('binance', 'spot') etc.
+            slot = fee_breakdown.setdefault(key, {'fees': 0.0, 'notional': 0.0, 'count': 0})
+            slot['fees'] += float(t.fee or 0.0)
+            slot['notional'] += float(t.notional or 0.0)
+            slot['count'] += 1
+        ctx['fees'] = {
+            'total_usd': total_fees,
+            'avg_pct': avg_fee_pct,
+            'count': len(fee_rows),
+            'breakdown': sorted(
+                ({
+                    'exchange': k[0],
+                    'leg': k[1],
+                    'fees': v_['fees'],
+                    'notional': v_['notional'],
+                    'pct': (v_['fees'] / v_['notional'] * 100.0) if v_['notional'] > 0 else 0.0,
+                    'count': v_['count'],
+                } for k, v_ in fee_breakdown.items()),
+                key=lambda x: x['fees'], reverse=True,
+            ),
         }
 
         breakdown_items = equity_breakdown(db, gateways, v, earn_total)

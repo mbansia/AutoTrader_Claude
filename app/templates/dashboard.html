@@ -102,27 +102,57 @@
     <div class="value">{{ open_count }} / {{ cfg.max_open_positions }}</div>
     <div class="sub">{{ trades_today }} trade(s) today / {{ cfg.max_trades_per_day }} cap</div>
   </div>
+  {# Earn — merged card: deployed + coverage % + cumulative income. #}
   {% if earn.enabled or earn.deployed > 0 %}
+  {% set idle_pct = (earn.deployed / current_equity * 100) if current_equity > 0 else 0 %}
   <div class="kpi">
     <div class="label">In Earn (USDT)</div>
-    <div class="value">{{ '%.2f' % earn.deployed }}</div>
-    <div class="sub">
-      yield {{ '%+.4f' % earn.cumulative_yield }} USDT
-      {% if earn.last_error %}<br><span class="bad" title="{{ earn.last_error }}" style="font-size:11px;">{{ earn.last_error|truncate(60) }}</span>{% endif %}
+    <div class="value">{{ '%.2f' % earn.deployed }} <span class="muted" style="font-size:14px;">USDT</span></div>
+    <div class="sub" style="display:flex;flex-direction:column;gap:3px;">
+      <span>coverage <span class="{{ 'good' if idle_pct > 50 else ('warn' if idle_pct > 20 else 'muted') }}">{{ '%.0f%%' % idle_pct }}</span> of {{ '%.2f' % current_equity }} USDT equity</span>
+      <span>income <span class="{{ 'good' if earn.cumulative_yield > 0 else 'muted' }}">{{ '%+.4f' % earn.cumulative_yield }}</span> USDT</span>
+      {% if earn.per_venue %}
+      <details class="kpi-details" style="margin-top:2px;">
+        <summary>per-venue breakdown</summary>
+        <ul class="kpi-breakdown">
+          {% for vid, pv in earn.per_venue.items() %}
+          <li><span class="muted">{{ vid }}</span><span class="mono">{{ '%.2f' % pv.deployed }} <span class="muted">· yield {{ '%+.4f' % pv.yield }}</span></span></li>
+          {% endfor %}
+        </ul>
+      </details>
+      {% endif %}
+      {% if earn.last_error %}<span class="bad" title="{{ earn.last_error }}" style="font-size:11px;">{{ earn.last_error|truncate(60) }}</span>{% endif %}
       {% if view == 'live' %}
-      <form action="/admin/force-earn-sweep" method="post" style="margin-top:6px;display:inline;">
-        <button class="btn" type="submit" style="padding:2px 8px;font-size:11px;" title="Bypass the per-asset earn cooldown and sweep idle USDT to earn on every venue right now. Use after a 77505 lock-out or post-deploy.">Sweep now</button>
+      <form action="/admin/force-earn-sweep" method="post" style="margin-top:4px;">
+        <button class="btn" type="submit" style="padding:2px 8px;font-size:11px;" title="Bypass the per-asset earn cooldown and sweep idle USDT to earn on every venue right now.">Sweep now</button>
       </form>
       {% endif %}
     </div>
   </div>
   {% endif %}
-  {# Idle ratio: how much of total equity is currently parked in earn vs deployed in trades #}
-  {% set idle_pct = (earn.deployed / current_equity * 100) if current_equity > 0 else 0 %}
+  {# Fees paid (taker + funding) across every trade — total + avg fee per
+     txn as % of notional. Drop-down breaks out by venue + leg type. #}
   <div class="kpi">
-    <div class="label">Earn coverage</div>
-    <div class="value {{ 'good' if idle_pct > 50 else ('warn' if idle_pct > 20 else '') }}">{{ '%.0f%%' % idle_pct }}</div>
-    <div class="sub">{{ '%.2f' % earn.deployed }} of {{ '%.2f' % current_equity }} USDT idle in earn</div>
+    <div class="label">Fees paid (USD)</div>
+    <div class="value">{{ '%.4f' % fees.total_usd }} <span class="muted" style="font-size:14px;">USDT</span></div>
+    <div class="sub" style="display:flex;flex-direction:column;gap:3px;">
+      <span>avg <span class="mono">{{ '%.4f%%' % fees.avg_pct }}</span> per txn ({{ fees.count }} trade{{ '' if fees.count == 1 else 's' }})</span>
+      {% if fees.breakdown %}
+      <details class="kpi-details" style="margin-top:2px;">
+        <summary>per venue · leg</summary>
+        <ul class="kpi-breakdown">
+          {% for b in fees.breakdown %}
+          <li>
+            <span class="muted">{{ b.exchange }} · {{ b.leg }} <span style="font-size:9px;">({{ b.count }})</span></span>
+            <span class="mono">{{ '%.4f' % b.fees }} <span class="muted">· {{ '%.4f%%' % b.pct }}</span></span>
+          </li>
+          {% endfor %}
+        </ul>
+      </details>
+      {% else %}
+      <span class="muted" style="font-size:11px;">no trades yet</span>
+      {% endif %}
+    </div>
   </div>
   {# Free deployable: idle cash the bot can route into a new trade — that's
      spot.free + fut.free + earn (we redeem from earn pre-trade), i.e.
