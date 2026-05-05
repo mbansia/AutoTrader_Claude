@@ -545,12 +545,14 @@ class BinanceGateway(VenueGateway):
     # instances share the cooldown (the bot creates fresh gateways
     # frequently for HTTP routes).
     _earn_subscribe_cooldown_until: dict[str, float] = {}
-    # Time between earn subscribes per asset. 10 min keeps us well under
-    # Binance's 77505 rate-limit (subscriptions/day per product) while
-    # letting the earn-first sweep converge quickly when capital is freed
-    # by trades or transfers. The 24h punishment cooldown only kicks in if
-    # Binance actually returns 77505.
-    EARN_SUBSCRIBE_DEFAULT_COOLDOWN_S = 600.0         # 10 min between subscribes per asset
+    # Earn subscribe is event-driven, not periodic — the bot only sweeps
+    # when capital comes free (a position closes, a deposit lands, a
+    # transfer settles). Those events are rare on a funding-arb strategy
+    # (a handful per day max), so a default cooldown would just leave
+    # idle USDT stranded. Defense in depth: if Binance actually returns
+    # 77505 ("subscribed too many times"), we install a 24h punishment
+    # cooldown for that asset and back off until the next day.
+    EARN_SUBSCRIBE_DEFAULT_COOLDOWN_S = 0.0           # no proactive cooldown
     EARN_SUBSCRIBE_RATE_LIMITED_COOLDOWN_S = 86400.0  # 24h after Binance signals 77505
 
     # Caches — instance-scoped so they survive across method calls but die
@@ -854,52 +856,52 @@ class BinanceGateway(VenueGateway):
         return rows
 
     def net_injected_capital_usdt(self, lookback_days: int = 365) -> tuple[float | None, dict]:
-        """Sum of completed USDT inflows − outflows over the lookback window:
-            inflows  = external deposits + master→sub transfers (if sub-account)
-            outflows = external withdrawals + sub→master transfers
-        Returns ``(net, meta)`` where meta carries per-component count and total
-        for the UI. Returns ``(None, {'error': ...})`` if every history endpoint
-        came back empty so the caller falls back to manual CapitalFlow rows."""
-        deps: list[dict] = []
-        wdrs: list[dict] = []
-        sub_in: list[dict] = []
-        sub_out: list[dict] = []
-        try:
-            deps = self.deposit_history('USDT', lookback_days=lookback_days)
-        except Exception:
-            pass
-        try:
-            wdrs = self.withdrawal_history('USDT', lookback_days=lookback_days)
-        except Exception:
-            pass
-        try:
-            sub_in = self.sub_account_transfer_history('USDT', incoming=True, lookback_days=lookback_days)
-        except Exception:
-            pass
-        try:
-            sub_out = self.sub_account_transfer_history('USDT', incoming=False, lookback_days=lookback_days)
-        except Exception:
-            pass
-        deps_total = sum(float(d.get('amount') or 0) for d in deps)
-        wdrs_total = sum(float(w.get('amount') or 0) for w in wdrs)
-        # Sub-account transfer rows use 'qty' historically and 'amount' in newer responses.
-        sub_in_total = sum(float(r.get('qty') or r.get('amount') or 0) for r in sub_in)
-        sub_out_total = sum(float(r.get('qty') or r.get('amount') or 0) for r in sub_out)
-        net = (deps_total + sub_in_total) - (wdrs_total + sub_out_total)
-        if not deps and not wdrs and not sub_in and not sub_out:
-            return None, {'error': 'no SAPI history available (missing permission, sub-account keys, or no activity)'}
-        return net, {
-            'deposits_count': len(deps),
-            'deposits_total': deps_total,
-            'withdrawals_count': len(wdrs),
-            'withdrawals_total': wdrs_total,
-            'sub_in_count': len(sub_in),
-            'sub_in_total': sub_in_total,
-            'sub_out_count': len(sub_out),
-            'sub_out_total': sub_out_total,
+        """Sum of completed USDT inflows − outflows over the lookback window.
+        Single source of truth: delegate to :meth:`list_capital_flow_records`
+        which already walks every Binance endpoint we know about (chain
+        deposits / withdrawals + master↔sub transfers + universal-transfer
+        history). Returns ``(net, meta)`` where ``meta`` carries the
+        per-endpoint error map and per-kind row counts.
+
+        Returns ``(None, meta)`` only when every endpoint raised — that's
+        the signal for the caller to fall back to manual CapitalFlow rows.
+        An endpoint that returned zero rows is still "API answered" and
+        produces ``(0.0, meta)`` so the dashboard shows "0 USDT (no
+        activity)" rather than "venue API not visible"."""
+        rows = self.list_capital_flow_records(lookback_days=lookback_days)
+        errors = dict(self.last_history_errors or {})
+        if errors and not rows:
+            # Distinguish "every endpoint failed" from "endpoints succeeded
+            # with 0 rows". The historical contract: None means caller
+            # should fall back to manual flows. Only fall back if at least
+            # one error AND zero rows came back across the board.
+            if all(k in errors for k in ('deposits', 'withdrawals', 'sub_in', 'sub_out')):
+                return None, {'error': '; '.join(f'{k}: {v}' for k, v in errors.items())[:240]}
+        counts: dict[str, int] = {}
+        totals: dict[str, float] = {}
+        net = 0.0
+        for r in rows:
+            kind = r.get('kind') or 'deposit'
+            counts[kind] = counts.get(kind, 0) + 1
+            totals[kind] = totals.get(kind, 0.0) + r.get('amount', 0.0)
+            net += r.get('amount', 0.0)
+        meta: dict = {
+            'deposits_count': counts.get('deposit', 0),
+            'deposits_total': totals.get('deposit', 0.0),
+            'withdrawals_count': counts.get('withdrawal', 0),
+            'withdrawals_total': totals.get('withdrawal', 0.0),
+            'sub_in_count': counts.get('sub_in', 0),
+            'sub_in_total': totals.get('sub_in', 0.0),
+            'sub_out_count': counts.get('sub_out', 0),
+            'sub_out_total': totals.get('sub_out', 0.0),
+            'transfers_count': counts.get('transfer', 0),
+            'transfers_total': totals.get('transfer', 0.0),
             'asset': 'USDT',
             'lookback_days': lookback_days,
         }
+        if errors:
+            meta['errors'] = errors
+        return net, meta
 
     def list_capital_flow_records(self, lookback_days: int = 365) -> list[dict]:
         """Binance: external deposits, external withdrawals, master→sub
@@ -940,6 +942,31 @@ class BinanceGateway(VenueGateway):
                 rows.append({'ts': ts, 'amount': amt, 'kind': 'sub_out', 'external_id': ext, 'note': 'Sub → master transfer'})
         except Exception as e:
             self.last_history_errors['sub_out'] = str(e)[:160]
+        # Universal transfer history (ccxt's fetch_transfers). For sub-account
+        # API keys, master ↔ sub moves often surface here under types like
+        # MAIN_FUNDING / FUNDING_MAIN (different envelope than the dedicated
+        # sub-transfer endpoint). Folded in as ``transfer`` rows so we don't
+        # double-count: when we see the same tranId in both sub_in/out and
+        # here, the dedup-by-external_id keeps the first one.
+        since_ms = int((datetime.utcnow() - timedelta(days=lookback_days)).timestamp() * 1000)
+        try:
+            for t in (self.spot.fetch_transfers('USDT', since=since_ms) or []):
+                ts = _ms_to_dt(t.get('timestamp'))
+                raw_amt = float(t.get('amount') or 0)
+                # Direction inference: status 'ok' + a positive amount could
+                # be in either direction depending on type. Use 'fromAccount'
+                # to disambiguate when present.
+                from_a = (t.get('fromAccount') or '').lower()
+                to_a = (t.get('toAccount') or '').lower()
+                signed = raw_amt
+                if 'sub' in from_a and 'main' in to_a:
+                    signed = -abs(raw_amt)
+                elif 'main' in to_a and 'funding' not in from_a and 'spot' not in from_a:
+                    signed = abs(raw_amt)
+                ext = str(t.get('id') or '') or _row_hash('binance', 'transfer', ts, signed)
+                rows.append({'ts': ts, 'amount': signed, 'kind': 'transfer', 'external_id': ext, 'note': f'Universal transfer {from_a}→{to_a}'})
+        except Exception as e:
+            self.last_history_errors['transfers'] = str(e)[:160]
         return [r for r in rows if r['ts'] is not None and abs(r['amount']) > 1e-9]
 
 
@@ -1236,6 +1263,23 @@ class KuCoinGateway(VenueGateway):
             break
         if sub_endpoint_used is None:
             self.last_history_errors['sub_transfer'] = 'no sub-transfer endpoint exposed by this ccxt build'
+        # ccxt's unified fetch_transfers — KuCoin's universal-transfer log
+        # surfaces master ↔ sub moves and inner-account moves. Cheap
+        # fallback if the bespoke sub-transfer endpoints don't exist or
+        # were rejected by the API key.
+        try:
+            for t in (self.spot.fetch_transfers('USDT', since=since_ms) or []):
+                ts = _ms_to_dt(t.get('timestamp'))
+                raw_amt = float(t.get('amount') or 0)
+                from_a = (t.get('fromAccount') or '').lower()
+                to_a = (t.get('toAccount') or '').lower()
+                # KuCoin labels: 'main' / 'trade' / 'contract' / 'sub'.
+                # A row whose toAccount is on this account = inflow.
+                signed = abs(raw_amt) if 'sub' not in to_a else -abs(raw_amt)
+                ext = str(t.get('id') or '') or _row_hash('kucoin', 'transfer', ts, signed)
+                rows.append({'ts': ts, 'amount': signed, 'kind': 'transfer', 'external_id': ext, 'note': f'Universal transfer {from_a}→{to_a}'})
+        except Exception as e:
+            self.last_history_errors['transfers'] = str(e)[:160]
         return [r for r in rows if r['ts'] is not None and abs(r['amount']) > 1e-9]
 
 

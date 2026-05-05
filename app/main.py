@@ -344,6 +344,31 @@ def run_once(view: str | None = Cookie(default=None), _: None = Depends(auth)):
     return RedirectResponse(url='/dashboard', status_code=303)
 
 
+@app.post('/admin/reingest-flows')
+def reingest_capital_flows(_: None = Depends(auth)):
+    """One-shot: walk every gateway's capital-flow history with a 2-year
+    lookback and ingest any rows we don't already have. Used when the
+    user expects a known deposit (e.g. master→sub transfer) to show up
+    on the dashboard but per-cycle ingest hasn't surfaced it yet.
+
+    Logs a per-endpoint diagnostic to /logs so the user can see exactly
+    what each Binance/KuCoin endpoint returned (or refused). Idempotent
+    via ``CapitalFlow.external_id`` — safe to call repeatedly."""
+    from app.exchange import make_gateways
+    from app.bot import _ingest_api_capital_flows, log_event
+    gateways = make_gateways()
+    with SessionLocal() as db:
+        for gw in gateways:
+            inserted = _ingest_api_capital_flows(db, gw, MODE_LIVE, lookback_days=730)
+            errors = gw.last_history_errors or {}
+            if errors:
+                err_summary = '; '.join(f'{k}={v[:80]}' for k, v in errors.items())
+                log_event(db, f'Re-ingest errors: {err_summary}', mode=MODE_LIVE, level='WARN', exchange=gw.venue_id)
+            log_event(db, f'Re-ingest complete · {inserted} new row(s)', mode=MODE_LIVE, exchange=gw.venue_id)
+        db.commit()
+    return RedirectResponse(url='/dashboard', status_code=303)
+
+
 # Legacy /mode toggle kept for backward compat — now just sets the view cookie.
 @app.post('/mode')
 def set_mode(mode: str = Form(...), _: None = Depends(auth)):

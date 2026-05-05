@@ -611,7 +611,7 @@ def _compute_equity_and_free(db, gateway: VenueGateway, mode: str, cfg: Strategy
     return total_equity, min(spot_free, fut_free)
 
 
-def _ingest_api_capital_flows(db, gateway: VenueGateway, mode: str) -> int:
+def _ingest_api_capital_flows(db, gateway: VenueGateway, mode: str, lookback_days: int = 365) -> int:
     """Pull the venue's deposit / withdrawal / sub-transfer history and
     persist any rows we haven't seen before as ``CapitalFlow`` records. The
     natural key is ``(exchange, external_id)``; rows with that pair already
@@ -625,7 +625,7 @@ def _ingest_api_capital_flows(db, gateway: VenueGateway, mode: str) -> int:
     if mode != MODE_LIVE:
         return 0
     try:
-        rows = gateway.list_capital_flow_records()
+        rows = gateway.list_capital_flow_records(lookback_days=lookback_days)
     except Exception as e:
         log_event(db, f'capital-flow ingest failed: {e}', mode=mode, level='WARN', exchange=gateway.venue_id)
         return 0

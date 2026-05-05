@@ -408,6 +408,10 @@
 <div class="card">
   <h3>Capital flows <span class="muted" style="font-size:13px;font-weight:400;">— ingested live from each venue's deposit / withdrawal / sub-transfer history</span></h3>
   <div class="body">
+    <form action="/admin/reingest-flows" method="post" style="margin-bottom:12px;">
+      <button class="btn" type="submit" title="Walks each venue's full 2-year history and ingests any rows we don't have. Use after credentialing a new API key or when a known transfer hasn't surfaced yet.">Re-ingest from venue APIs (2y lookback)</button>
+      <span class="muted" style="font-size:11px;margin-left:8px;">Idempotent · safe to spam · check Logs for per-endpoint diagnostics</span>
+    </form>
     {% if flows %}
     <table>
       <thead><tr><th>Date</th><th>Venue</th><th class="num">Amount (USDT)</th><th>Kind</th><th>Source</th><th>Note</th></tr></thead>
