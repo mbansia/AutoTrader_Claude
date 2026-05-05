@@ -48,6 +48,7 @@ from sqlalchemy import desc, func, select
 
 from app.bot import (
     _position_leg_states,
+    get_all_earn_states,
     get_earn_state,
     get_mode_state,
     get_runtime_state,
@@ -137,14 +138,22 @@ def _gateway_for(venue_id: str):
 
 @app.on_event('startup')
 def startup() -> None:
-    Base.metadata.create_all(bind=engine)
+    # Migrations first (drops/widens columns on existing tables), then
+    # create_all to recreate any tables migrations dropped and to add new
+    # tables introduced since the last deploy.
     run_schema_migrations()
+    Base.metadata.create_all(bind=engine)
     with SessionLocal() as db:
         get_runtime_state(db)
         get_strategy_config(db)
         for m in ALL_MODES:
             get_mode_state(db, m)
-            get_earn_state(db, m)
+            # Bootstrap one EarnState row per venue so the per-(mode, venue)
+            # composite key is populated and the dashboard finds something
+            # to read on first render. Live venues we know about explicitly
+            # plus a 'paper' pseudo-venue for the paper mode display.
+            for vid in ('binance', 'kucoin', 'paper'):
+                get_earn_state(db, m, exchange=vid)
         db.commit()
     if os.environ.get('BOT_WORKER_ENABLED', '1') not in ('0', 'false', 'False', ''):
         _start_worker()
@@ -548,15 +557,22 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         stuck_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == v, Position.last_close_error != '')).all()
         ctx['stuck_positions'] = [{'symbol': p.symbol, 'err': p.last_close_error[:160]} for p in stuck_positions]
 
-        earn = get_earn_state(db, v)
+        # Aggregate earn across every venue so the "In Earn" KPI reflects
+        # the whole pool, not just one venue's slice (the prior single-row
+        # EarnState design overwrote earn balances on every cycle).
+        earn_states = get_all_earn_states(db, v)
+        earn_total = sum(es.deployed_usdt for es in earn_states)
+        earn_yield_total = sum(es.cumulative_yield_usdt for es in earn_states)
+        earn_errors = '; '.join(es.last_error for es in earn_states if es.last_error)
         ctx['earn'] = {
             'enabled': cfg.earn_enabled,
-            'deployed': earn.deployed_usdt,
-            'cumulative_yield': earn.cumulative_yield_usdt,
-            'last_error': earn.last_error,
+            'deployed': earn_total,
+            'cumulative_yield': earn_yield_total,
+            'last_error': earn_errors,
+            'per_venue': {es.exchange: {'deployed': es.deployed_usdt, 'yield': es.cumulative_yield_usdt} for es in earn_states},
         }
 
-        breakdown_items = equity_breakdown(db, gateways, v, earn.deployed_usdt)
+        breakdown_items = equity_breakdown(db, gateways, v, earn_total)
         if v == MODE_PAPER:
             tracked = sum(max(0.0, i['value']) for i in breakdown_items)
             free_cash = max(0.0, current_equity - tracked)
@@ -1175,8 +1191,14 @@ def _render_export_md(v: str) -> str:
         cfg = get_strategy_config(db)
         paper_state = get_mode_state(db, MODE_PAPER)
         live_state = get_mode_state(db, MODE_LIVE)
-        paper_earn = get_earn_state(db, MODE_PAPER)
-        live_earn = get_earn_state(db, MODE_LIVE)
+        # Aggregate across venues so the export captures the full pool,
+        # not just one venue's slice.
+        paper_earn_states = get_all_earn_states(db, MODE_PAPER)
+        live_earn_states = get_all_earn_states(db, MODE_LIVE)
+        paper_earn_deployed = sum(es.deployed_usdt for es in paper_earn_states)
+        paper_earn_yield = sum(es.cumulative_yield_usdt for es in paper_earn_states)
+        live_earn_deployed = sum(es.deployed_usdt for es in live_earn_states)
+        live_earn_yield = sum(es.cumulative_yield_usdt for es in live_earn_states)
 
         # ---- Configuration ----
         parts.append('## Strategy configuration\n')
@@ -1216,11 +1238,11 @@ def _render_export_md(v: str) -> str:
             [[m.mode, m.entry_enabled, m.exit_enabled, m.maintenance_mode, m.updated_at]
              for m in (paper_state, live_state)],
         ))
-        parts.append('\n## Earn states\n')
+        parts.append('\n## Earn states (per mode + venue)\n')
         parts.append(_md_table(
-            ['mode', 'deployed_usdt', 'cumulative_yield_usdt', 'last_accrual_ts', 'last_error'],
-            [[e.mode, e.deployed_usdt, e.cumulative_yield_usdt, e.last_accrual_ts, e.last_error or '']
-             for e in (paper_earn, live_earn)],
+            ['mode', 'venue', 'deployed_usdt', 'cumulative_yield_usdt', 'last_accrual_ts', 'last_error'],
+            [[e.mode, e.exchange, e.deployed_usdt, e.cumulative_yield_usdt, e.last_accrual_ts, e.last_error or '']
+             for e in (*paper_earn_states, *live_earn_states)],
         ))
 
         # ---- Live wallet snapshot, per venue ----
@@ -1248,9 +1270,9 @@ def _render_export_md(v: str) -> str:
                 parts.append(_md_table(['wallet', 'asset', 'free', 'used', 'total'], bal_rows))
 
         # ---- Equity composition for current view ----
-        earn_for_view = live_earn if v == MODE_LIVE else paper_earn
+        earn_deployed_for_view = live_earn_deployed if v == MODE_LIVE else paper_earn_deployed
         try:
-            breakdown = equity_breakdown(db, gateways, v, earn_for_view.deployed_usdt)
+            breakdown = equity_breakdown(db, gateways, v, earn_deployed_for_view)
         except Exception as e:
             breakdown = []
             parts.append(f'\n_equity breakdown failed: {e}_\n')

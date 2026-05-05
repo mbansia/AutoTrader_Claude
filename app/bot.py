@@ -113,13 +113,25 @@ def get_mode_state(db, mode: str) -> ModeState:
     return state
 
 
-def get_earn_state(db, mode: str) -> EarnState:
-    state = db.scalar(select(EarnState).where(EarnState.mode == mode))
+def get_earn_state(db, mode: str, exchange: str = 'binance') -> EarnState:
+    """Per-(mode, venue) earn tracker. Each venue gets its own row so the
+    Binance flexible balance and KuCoin funding-wallet balance don't
+    overwrite each other on the same shared key."""
+    state = db.scalar(select(EarnState).where(
+        EarnState.mode == mode,
+        EarnState.exchange == exchange,
+    ))
     if state is None:
-        state = EarnState(mode=mode, deployed_usdt=0.0, cumulative_yield_usdt=0.0)
+        state = EarnState(mode=mode, exchange=exchange, deployed_usdt=0.0, cumulative_yield_usdt=0.0)
         db.add(state)
         db.flush()
     return state
+
+
+def get_all_earn_states(db, mode: str) -> list[EarnState]:
+    """Every venue's EarnState row for ``mode``. Used by the dashboard to
+    aggregate earn balances across venues without missing any."""
+    return list(db.scalars(select(EarnState).where(EarnState.mode == mode)).all())
 
 
 def _accrue_paper_yield(earn: EarnState, apr: float) -> None:
@@ -683,7 +695,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
         with SessionLocal() as db:
             cfg = get_strategy_config(db)
             mstate = get_mode_state(db, mode)
-            earn = get_earn_state(db, mode)
+            earn = get_earn_state(db, mode, exchange=gateway.venue_id)
 
             # Paper-mode funding income accrual on open positions (live is auto-credited
             # by Binance into the futures wallet, which our equity calc already sees).

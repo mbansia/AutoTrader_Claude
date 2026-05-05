@@ -86,6 +86,24 @@ def run_schema_migrations() -> None:
     # Stable per-venue id for auto-ingested capital flows (so re-runs don't
     # duplicate the same deposit / withdrawal / sub-transfer row).
     _add_column_if_missing('capital_flows', 'external_id', "VARCHAR(128) NOT NULL DEFAULT ''")
+    # Per-venue earn-state. Without this column, Binance and KuCoin shared
+    # a single row keyed only by mode — the second gateway each cycle
+    # overwrote the first, producing aggregate-earn nonsense (e.g., the
+    # dashboard's "In Earn" showing only the last venue's value, plus a
+    # cumulative_yield that grew by the cross-venue diff every cycle).
+    #
+    # SQLite can't widen a primary key in place (no ALTER COLUMN), so we
+    # drop the old table when it lacks ``exchange`` and let SQLAlchemy's
+    # create_all recreate it with the new composite PK. The data we lose
+    # (cumulative_yield, last_accrual_ts) was wrong anyway from the
+    # cross-venue overwrite bug — the next refresh cycle re-derives
+    # deployed_usdt from live API per venue.
+    insp = inspect(engine)
+    if 'earn_state' in insp.get_table_names():
+        cols = {c['name'] for c in insp.get_columns('earn_state')}
+        if 'exchange' not in cols:
+            with engine.begin() as conn:
+                conn.execute(text('DROP TABLE earn_state'))
 
     # One-shot cleanup: the *old* auto-detect heuristic created CapitalFlow
     # rows whenever the live wallet drifted from the previous snapshot —

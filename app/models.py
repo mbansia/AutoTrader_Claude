@@ -249,9 +249,14 @@ class ScanResult(Base):
 
 
 class EarnState(Base):
-    """Per-mode tracking of USDT swept into Binance Simple Earn (or paper-simulated)."""
+    """Per-(mode, venue) tracking of USDT in earn surfaces (Binance Simple
+    Earn flexible, KuCoin funding-wallet auto-lend, paper-simulated). The
+    composite primary key is critical: a single shared row across venues
+    causes each gateway's refresh to overwrite the previous, producing
+    nonsense aggregate balances and runaway cumulative_yield deltas."""
     __tablename__ = 'earn_state'
     mode: Mapped[str] = mapped_column(String(8), primary_key=True)
+    exchange: Mapped[str] = mapped_column(String(16), primary_key=True, default=VENUE_BINANCE)
     deployed_usdt: Mapped[float] = mapped_column(Float, default=0.0)
     cumulative_yield_usdt: Mapped[float] = mapped_column(Float, default=0.0)
     last_accrual_ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

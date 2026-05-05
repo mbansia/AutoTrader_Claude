@@ -111,16 +111,18 @@
     <div class="value {{ 'good' if idle_pct > 50 else ('warn' if idle_pct > 20 else '') }}">{{ '%.0f%%' % idle_pct }}</div>
     <div class="sub">{{ '%.2f' % earn.deployed }} of {{ '%.2f' % current_equity }} USDT idle in earn</div>
   </div>
-  {# Free deployable: cash currently sitting in spot/futures wallets, ready for a trade #}
+  {# Free deployable: idle cash the bot can route into a new trade — that's
+     spot.free + fut.free + earn (we redeem from earn pre-trade), i.e.
+     everything except capital tied up in open positions and dust. #}
   {% if view == 'live' and live_spot_free is not none %}
-    {% set free_deployable = live_spot_free + live_fut_free %}
+    {% set free_deployable = live_spot_free + live_fut_free + earn.deployed %}
   {% else %}
-    {% set free_deployable = (current_equity - earn.deployed) %}
+    {% set free_deployable = (current_equity - (in_positions_value or 0)) %}
   {% endif %}
   <div class="kpi">
     <div class="label">Free deployable</div>
     <div class="value">{{ '%.2f' % free_deployable }} <span class="muted" style="font-size:14px">USDT</span></div>
-    <div class="sub">{% if view == 'live' and live_spot_free is not none %}spot {{ '%.2f' % live_spot_free }} · fut {{ '%.2f' % live_fut_free }}{% else %}equity − earn{% endif %}</div>
+    <div class="sub">{% if view == 'live' and live_spot_free is not none %}spot {{ '%.2f' % live_spot_free }} · fut {{ '%.2f' % live_fut_free }} · earn {{ '%.2f' % earn.deployed }}{% else %}equity − open positions{% endif %}</div>
   </div>
 </div>
 
