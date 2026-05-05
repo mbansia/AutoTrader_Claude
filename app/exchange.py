@@ -827,6 +827,54 @@ class KuCoinGateway(VenueGateway):
         self.spot = ccxt.kucoin(common)
         self.futures = ccxt.kucoinfutures(common)
 
+    # KuCoin keeps spot cash split across two wallet types: ``trade`` (the
+    # "Trading Account" in the UI, used by spot orders) and ``main`` (the
+    # "Main / Funding Account", where deposits land before being moved to
+    # trade). ccxt's default ``fetch_balance()`` only returns ``trade``, so a
+    # user who parked 10 USDT in main would appear to have zero equity. We
+    # query both wallets and merge them so the gateway sees the full pool.
+    def safe_balances(self) -> dict | None:
+        try:
+            trade_bal = self.spot.fetch_balance({'type': 'trade'})
+            main_bal = self.spot.fetch_balance({'type': 'main'})
+            futures_bal = self.futures.fetch_balance()
+        except Exception as e:
+            self.last_balance_error = str(e)
+            return None
+        merged_spot = self._merge_balances(trade_bal, main_bal)
+        self.last_balance_error = ''
+        return {'spot': merged_spot, 'futures': futures_bal}
+
+    @staticmethod
+    def _merge_balances(a: dict, b: dict) -> dict:
+        """Sum the per-asset ``free`` / ``used`` / ``total`` numbers from two
+        ccxt balance dicts (same shape ccxt returns for fetch_balance). Top-
+        level meta keys (``info``, ``timestamp``, ...) come from ``a``."""
+        META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
+        out: dict = {k: a.get(k) for k in ('info', 'timestamp', 'datetime')}
+        assets = {k for k in a.keys() if k not in META_KEYS}
+        assets |= {k for k in b.keys() if k not in META_KEYS}
+        for asset in assets:
+            ax = a.get(asset) or {}
+            bx = b.get(asset) or {}
+            if not isinstance(ax, dict): ax = {}
+            if not isinstance(bx, dict): bx = {}
+            free = float(ax.get('free') or 0) + float(bx.get('free') or 0)
+            used = float(ax.get('used') or 0) + float(bx.get('used') or 0)
+            total = float(ax.get('total') or 0) + float(bx.get('total') or 0)
+            out[asset] = {'free': free, 'used': used, 'total': total}
+        # Aggregate dicts ccxt also exposes:
+        for key in ('free', 'used', 'total'):
+            ax = a.get(key) or {}
+            bx = b.get(key) or {}
+            if not isinstance(ax, dict): ax = {}
+            if not isinstance(bx, dict): bx = {}
+            merged = {}
+            for asset in set(ax.keys()) | set(bx.keys()):
+                merged[asset] = float(ax.get(asset) or 0) + float(bx.get(asset) or 0)
+            out[key] = merged
+        return out
+
     # ─── Spot ↔ futures transfer (KuCoin innerTransfer) ───────────────────
 
     def _inner_transfer(self, from_account: str, to_account: str, amount_usdt: float) -> tuple[bool, str]:

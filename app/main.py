@@ -1067,7 +1067,8 @@ def _gather_exchange_status() -> list[dict]:
     kc_balance_err = ''
     if kc_configured:
         kgw = KuCoinGateway()
-        kc_probes.append(_probe('Spot fetch_balance()', lambda: kgw.spot.fetch_balance()))
+        kc_probes.append(_probe('Spot fetch_balance(trade)', lambda: kgw.spot.fetch_balance({'type': 'trade'})))
+        kc_probes.append(_probe('Spot fetch_balance(main)', lambda: kgw.spot.fetch_balance({'type': 'main'})))
         kc_probes.append(_probe('Futures fetch_balance()', lambda: kgw.futures.fetch_balance()))
         kc_probes.append(_probe('Funding rates', lambda: kgw.futures.fetch_funding_rates()))
         kc_probes.append(_probe('Open perp positions', lambda: kgw.open_perp_positions_raw()))
