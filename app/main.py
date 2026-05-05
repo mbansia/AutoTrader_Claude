@@ -58,7 +58,7 @@ from app.bot import (
 )
 from app.config import settings
 from app.db import Base, SessionLocal, engine, run_schema_migrations
-from app.exchange import BinanceGateway, annualize_rate
+from app.exchange import BinanceGateway, KuCoinGateway, annualize_rate, make_gateways
 from app.finance import (
     effective_position_apy,
     equity_breakdown,
@@ -123,6 +123,18 @@ def _resolve_view(view_qs: str | None, view_cookie: str | None) -> str:
     return candidate if candidate in ALL_MODES else MODE_PAPER
 
 
+def _gateway_for(venue_id: str):
+    """Return the configured gateway whose ``venue_id`` matches, or a fresh
+    BinanceGateway as a safe default. Used when an action targets a single
+    Position/Trade and the route needs the right venue's API client."""
+    for gw in make_gateways():
+        if gw.venue_id == venue_id:
+            return gw
+    if venue_id == 'kucoin':
+        return KuCoinGateway()
+    return BinanceGateway()
+
+
 @app.on_event('startup')
 def startup() -> None:
     Base.metadata.create_all(bind=engine)
@@ -177,9 +189,41 @@ def _fmt_age(delta: timedelta) -> str:
     return f'{seconds // 86400}d{(seconds % 86400) // 3600}h'
 
 
-def _current_equity(db, mode: str) -> tuple[float, str, bool]:
-    """Returns (equity, source_label_html, is_stale). Stale = no snapshot in last 5 minutes."""
+def _current_equity(db, mode: str, gateways=None) -> tuple[float, str, bool]:
+    """Returns (equity, source_label_html, is_stale).
+
+    Live mode aggregates across every configured gateway to honour the
+    single-pool / multi-venue framing — the snapshot table only carries one
+    row per cycle per gateway, so reading just the latest would silently
+    drop venues. Paper mode still reads from BalanceSnapshot since there's
+    only one virtual book.
+    Stale = no fresh data in last 5 minutes."""
     now = datetime.utcnow()
+    if mode == MODE_LIVE and gateways:
+        total = 0.0
+        venues_seen: list[str] = []
+        for gw in gateways:
+            bals = gw.safe_balances() or {}
+            spot_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
+            fut_usdt = float((bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
+            spot_assets = 0.0
+            META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
+            for asset, bal in (bals.get('spot') or {}).items():
+                if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+                    continue
+                qty = float(bal.get('total') or 0)
+                if qty <= 0:
+                    continue
+                px = gw.safe_price(f'{asset}/USDT') or 0
+                spot_assets += qty * px
+            try:
+                earn_usdt, _ = gw.earn_balance_usdt()
+                earn_usdt = earn_usdt or 0.0
+            except Exception:
+                earn_usdt = 0.0
+            total += spot_usdt + fut_usdt + spot_assets + earn_usdt
+            venues_seen.append(gw.venue_id)
+        return total, f'live aggregate across {", ".join(venues_seen)}', False
     snap = db.scalar(select(BalanceSnapshot).where(BalanceSnapshot.source == mode).order_by(desc(BalanceSnapshot.id)).limit(1))
     if snap:
         stale = (now - snap.ts).total_seconds() > 300
@@ -191,12 +235,21 @@ def _current_equity(db, mode: str) -> tuple[float, str, bool]:
     return 0.0, 'no data yet', True
 
 
-def _unrealized_for_open(db, gateway: BinanceGateway, mode: str) -> float:
+def _unrealized_for_open(db, gateways, mode: str) -> float:
+    """Multi-venue unrealized PnL — pulls each open position's marks from the
+    gateway that owns it. Falls back to the first gateway if the position's
+    venue isn't currently configured (e.g., credentials revoked)."""
+    if not isinstance(gateways, list):
+        gateways = [gateways]
+    if not gateways:
+        return 0.0
+    gw_by_venue = {g.venue_id: g for g in gateways}
     open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all()
     total = 0.0
     for p in open_positions:
-        spot_now = gateway.safe_price(p.spot_symbol) or 0.0
-        perp_now = gateway.safe_price(p.perp_symbol, perp=True) or 0.0
+        pgw = gw_by_venue.get(p.exchange, gateways[0])
+        spot_now = pgw.safe_price(p.spot_symbol) or 0.0
+        perp_now = pgw.safe_price(p.perp_symbol, perp=True) or 0.0
         if spot_now and perp_now:
             total += position_unrealized_pnl(p, spot_now, perp_now)
     return total
@@ -271,7 +324,7 @@ def position_close(position_id: int = Path(...), _: None = Depends(auth)):
         if p is None or p.status != 'open':
             raise HTTPException(404, 'open position not found')
         cfg = get_strategy_config(db)
-        gw = BinanceGateway()
+        gw = _gateway_for(p.exchange)
         try:
             gw.load_markets()
         except Exception:
@@ -307,7 +360,11 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         ctx['active'] = 'dashboard'
         cfg = get_strategy_config(db)
         ctx['cfg'] = cfg
-        gw = BinanceGateway()
+        gateways = make_gateways() or [BinanceGateway()]
+        # Default gateway used for symbol price lookups + open-position rendering.
+        # Per-position rows below switch to the position's own venue gateway
+        # when computing leg states.
+        gw = gateways[0]
 
         equity_points = list(reversed(db.scalars(select(EquityCurve).where(EquityCurve.mode == v).order_by(desc(EquityCurve.id)).limit(60)).all()))
         equity_polyline = ''
@@ -331,7 +388,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
                 c['apr'] = annualize_rate(c.get('fr', 0.0), c.get('interval_h', 8.0))
             c['effective_apy'] = effective_position_apy(c['apr'], cfg.perp_leverage or 1)
 
-        current_equity, equity_source, equity_stale = _current_equity(db, v)
+        current_equity, equity_source, equity_stale = _current_equity(db, v, gateways)
         balances_error = None
         if v == MODE_LIVE:
             bals = gw.safe_balances()
@@ -340,7 +397,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
 
         trade_realized = total_realized_pnl(db, mode=v)
         funding_income_tracked = total_funding_income(db, mode=v)
-        unrealized = _unrealized_for_open(db, gw, v)
+        unrealized = _unrealized_for_open(db, gateways, v)
         net_capital, net_capital_meta = net_capital_in(db, mode=v, gateway=gw)
         flow_count_n = db.scalar(select(func.count(CapitalFlow.id)).where(CapitalFlow.mode == v)) or 0
         xirr_value = portfolio_xirr(db, current_equity, mode=v)
@@ -384,7 +441,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             'last_error': earn.last_error,
         }
 
-        breakdown_items = equity_breakdown(db, gw, v, earn.deployed_usdt)
+        breakdown_items = equity_breakdown(db, gateways, v, earn.deployed_usdt)
         if v == MODE_PAPER:
             tracked = sum(max(0.0, i['value']) for i in breakdown_items)
             free_cash = max(0.0, current_equity - tracked)
@@ -402,22 +459,32 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         ctx['breakdown_items'] = breakdown_items
         ctx['breakdown_donut'] = equity_donut_svg(breakdown_items)
         ctx['equity_stale'] = equity_stale
-        # Surface the actual deployable free balances so the user can see what the bot sees.
+        # Surface the actual deployable free balances aggregated across venues
+        # — this is what the bot can deploy on a fresh entry.
         if v == MODE_LIVE:
-            bals_for_display = gw.safe_balances() or {}
-            ctx['live_spot_free'] = float((bals_for_display.get('spot', {}).get('USDT') or {}).get('free') or 0)
-            ctx['live_fut_free'] = float((bals_for_display.get('futures', {}).get('USDT') or {}).get('free') or 0)
+            spot_free_total = 0.0
+            fut_free_total = 0.0
+            for g in gateways:
+                bals_for_display = g.safe_balances() or {}
+                spot_free_total += float((bals_for_display.get('spot', {}).get('USDT') or {}).get('free') or 0)
+                fut_free_total += float((bals_for_display.get('futures', {}).get('USDT') or {}).get('free') or 0)
+            ctx['live_spot_free'] = spot_free_total
+            ctx['live_fut_free'] = fut_free_total
         else:
             ctx['live_spot_free'] = ctx['live_fut_free'] = None
 
         # Open positions rows + leg detail (formerly /positions).
         open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == v)).all()
+        gw_by_venue = {g.venue_id: g for g in gateways}
         rows = []
         for p in open_positions:
-            spot_now = gw.safe_price(p.spot_symbol) or 0.0
-            perp_now = gw.safe_price(p.perp_symbol, perp=True) or 0.0
+            # Pick the gateway that owns this position so prices and leg states
+            # come from the right venue's API.
+            pgw = gw_by_venue.get(p.exchange, gw)
+            spot_now = pgw.safe_price(p.spot_symbol) or 0.0
+            perp_now = pgw.safe_price(p.perp_symbol, perp=True) or 0.0
             interval_h = p.funding_interval_hours or 8.0
-            leg_states = _position_leg_states(gw, p) if v == MODE_LIVE else {'spot_alive': True, 'perp_alive': True, 'spot_actual': p.quantity, 'perp_actual': p.quantity}
+            leg_states = _position_leg_states(pgw, p) if v == MODE_LIVE else {'spot_alive': True, 'perp_alive': True, 'spot_actual': p.quantity, 'perp_actual': p.quantity}
             entry_trades = db.scalars(select(Trade).where(Trade.position_id == p.id, Trade.side == 'buy', Trade.venue == 'spot')).all() + \
                            db.scalars(select(Trade).where(Trade.position_id == p.id, Trade.side == 'sell', Trade.venue == 'futures')).all()
             spot_entry_trade = next((t for t in entry_trades if t.venue == 'spot'), None)
@@ -876,22 +943,53 @@ def _gather_exchange_status() -> list[dict]:
         'role': 'spot + USDM-perp arb (active)',
     })
 
-    # ---- KuCoin (gateway pending) ----
+    # ---- KuCoin ----
     kc_key = getattr(settings, 'kucoin_api_key', '')
     kc_secret = getattr(settings, 'kucoin_api_secret', '')
     kc_pass = getattr(settings, 'kucoin_api_passphrase', '')
+    kc_configured = bool(kc_key and kc_secret and kc_pass)
+    kc_probes: list[dict] = []
+    kc_capital_subtotal = 0.0
+    kc_capital_breakdown: list[dict] = []
+    kc_balance_err = ''
+    if kc_configured:
+        kgw = KuCoinGateway()
+        kc_probes.append(_probe('Spot fetch_balance()', lambda: kgw.spot.fetch_balance()))
+        kc_probes.append(_probe('Futures fetch_balance()', lambda: kgw.futures.fetch_balance()))
+        kc_probes.append(_probe('Funding rates', lambda: kgw.futures.fetch_funding_rates()))
+        kc_probes.append(_probe('Open perp positions', lambda: kgw.open_perp_positions_raw()))
+        kc_bals = kgw.safe_balances() or {}
+        kc_balance_err = kgw.last_balance_error
+        kc_spot_usdt = float((kc_bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
+        kc_fut_usdt = float((kc_bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
+        kc_spot_assets = 0.0
+        META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
+        for asset, bal in (kc_bals.get('spot') or {}).items():
+            if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+                continue
+            qty = float(bal.get('total') or 0)
+            if qty <= 0:
+                continue
+            px = kgw.safe_price(f'{asset}/USDT') or 0
+            kc_spot_assets += qty * px
+        kc_capital_breakdown = [
+            {'label': 'Spot · USDT', 'value': kc_spot_usdt},
+            {'label': 'Spot · assets', 'value': kc_spot_assets},
+            {'label': 'Futures · USDT', 'value': kc_fut_usdt},
+        ]
+        kc_capital_subtotal = kc_spot_usdt + kc_spot_assets + kc_fut_usdt
     sections.append({
         'name': 'KuCoin',
         'venue_id': 'kucoin',
-        'configured': bool(kc_key and kc_secret and kc_pass),
+        'configured': kc_configured,
         'key_masked': _mask(kc_key),
         'secret_masked': _mask(kc_secret),
         'extra_creds': [{'label': 'Passphrase', 'value': _mask(kc_pass)}],
-        'probes': [],
-        'last_balance_error': '',
-        'capital_subtotal_usdt': 0.0,
-        'capital_breakdown': [],
-        'role': 'spot + USDM-perp arb (gateway pending — see docs/kucoin-integration-plan.md)',
+        'probes': kc_probes,
+        'last_balance_error': kc_balance_err,
+        'capital_subtotal_usdt': kc_capital_subtotal,
+        'capital_breakdown': kc_capital_breakdown,
+        'role': 'spot + USDT-perp arb' + (' (active)' if kc_configured else ' (set credentials to activate)'),
     })
 
     # ---- Interactive Brokers (future — for cross-asset arb / equities) ----

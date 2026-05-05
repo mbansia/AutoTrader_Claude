@@ -48,7 +48,7 @@ from sqlalchemy import func, select
 
 from app.config import settings
 from app.db import SessionLocal
-from app.exchange import BINANCE_ERR_NO_EARN_POSITION, BinanceGateway, _interval_hours, annualize_rate
+from app.exchange import BINANCE_ERR_NO_EARN_POSITION, BinanceGateway, _interval_hours, annualize_rate, make_gateways
 from app.finance import position_realized_pnl, position_unrealized_pnl, total_realized_pnl
 from app.models import (
     ALL_MODES,
@@ -132,14 +132,15 @@ def _accrue_paper_yield(earn: EarnState, apr: float) -> None:
     earn.last_accrual_ts = now
 
 
-def _accrue_paper_funding(db, mode: str) -> None:
+def _accrue_paper_funding(db, gateway, mode: str) -> None:
     """Linearly accrue funding income on every open paper position based on the wall-clock
     elapsed since last accrual. Funding payments are real cash that lands in the trader's
-    wallet — credit them so the next cycle's % sizing can deploy the larger equity."""
+    wallet — credit them so the next cycle's % sizing can deploy the larger equity.
+    Scoped to ``gateway.venue_id`` so multi-venue paper books don't double-accrue."""
     if mode != MODE_PAPER:
         return
     now = datetime.utcnow()
-    for p in db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all():
+    for p in db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)).all():
         last = p.last_funding_accrual_ts or p.opened_at
         elapsed_seconds = (now - last).total_seconds()
         if elapsed_seconds <= 0:
@@ -391,13 +392,13 @@ def _position_leg_states(gateway: BinanceGateway, p: Position, tolerance: float 
 
 
 def _reconcile_open_position_state(db, gateway: BinanceGateway, mode: str) -> None:
-    """For each open position in this mode, check Binance's actual leg state.
-    If both legs are flat on Binance (e.g., the user closed manually, or a
-    previous partial close fully completed externally), mark the row closed
-    in DB so the UI matches reality. Live mode only."""
+    """For each open position on this gateway's venue, check actual leg state.
+    If both legs are flat (e.g., the user closed manually, or a previous
+    partial close fully completed externally), mark the row closed in DB so
+    the UI matches reality. Live mode only."""
     if mode != MODE_LIVE:
         return
-    for p in db.scalars(select(Position).where(Position.status == 'open', Position.mode == MODE_LIVE)).all():
+    for p in db.scalars(select(Position).where(Position.status == 'open', Position.mode == MODE_LIVE, Position.exchange == gateway.venue_id)).all():
         st = _position_leg_states(gateway, p)
         if not st['spot_alive'] and not st['perp_alive']:
             p.status = 'closed'
@@ -405,7 +406,7 @@ def _reconcile_open_position_state(db, gateway: BinanceGateway, mode: str) -> No
             p.last_close_error = ''
             _CLOSE_ERROR_CACHE.pop((p.id, 'spot'), None)
             _CLOSE_ERROR_CACHE.pop((p.id, 'perp'), None)
-            log_event(db, f'Reconciled {p.perp_symbol}: both legs flat on Binance — marking closed', mode=mode)
+            log_event(db, f'Reconciled {p.perp_symbol} on {gateway.name}: both legs flat — marking closed', mode=mode)
 
 
 def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyConfig, reason: str) -> None:
@@ -536,17 +537,17 @@ def manual_close(db, gateway: BinanceGateway, p: Position, cfg: StrategyConfig) 
 
 
 def reconcile_positions(gateway: BinanceGateway) -> None:
-    """Rehydrate any perp positions on Binance that aren't tracked locally as live positions."""
+    """Rehydrate any perp positions on this gateway's venue that aren't tracked locally."""
     with SessionLocal() as db:
         for p in gateway.open_perp_positions_raw():
             symbol = p.get('symbol')
             pos_amt = float(p.get('contracts') or p.get('info', {}).get('positionAmt') or 0)
-            existing = db.scalar(select(Position).where(Position.perp_symbol == symbol, Position.status == 'open', Position.mode == MODE_LIVE))
+            existing = db.scalar(select(Position).where(Position.perp_symbol == symbol, Position.status == 'open', Position.mode == MODE_LIVE, Position.exchange == gateway.venue_id))
             if existing or pos_amt == 0:
                 continue
             base = symbol.split('/')[0]
-            db.add(Position(mode=MODE_LIVE, exchange=VENUE_BINANCE, symbol=base, spot_symbol=f'{base}/USDT', perp_symbol=symbol, quantity=abs(pos_amt), entry_funding_rate=0.0))
-            log_event(db, f'Rehydrated orphan position {symbol} qty={pos_amt}', mode=MODE_LIVE)
+            db.add(Position(mode=MODE_LIVE, exchange=gateway.venue_id, symbol=base, spot_symbol=f'{base}/USDT', perp_symbol=symbol, quantity=abs(pos_amt), entry_funding_rate=0.0))
+            log_event(db, f'Rehydrated orphan position {symbol} on {gateway.name} qty={pos_amt}', mode=MODE_LIVE)
         db.commit()
 
 
@@ -557,7 +558,7 @@ def _compute_equity_and_free(db, gateway: BinanceGateway, mode: str, cfg: Strate
     sits in a separate Binance wallet so it's already excluded from spot.free."""
     if mode == MODE_PAPER:
         realized = total_realized_pnl(db, mode=mode)
-        open_ps = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all()
+        open_ps = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)).all()
         unrealized = 0.0
         open_notional = 0.0
         open_funding = 0.0
@@ -570,7 +571,7 @@ def _compute_equity_and_free(db, gateway: BinanceGateway, mode: str, cfg: Strate
         # Funding on already-closed positions is part of total_realized_pnl (added below);
         # open positions' accrued funding is tracked separately so it can be treated as
         # liquid cash for the free-balance calc — this is what makes "auto-reinvest" work.
-        closed_funding = db.scalar(select(func.coalesce(func.sum(Position.funding_income_accrued), 0.0)).where(Position.status == 'closed', Position.mode == mode)) or 0.0
+        closed_funding = db.scalar(select(func.coalesce(func.sum(Position.funding_income_accrued), 0.0)).where(Position.status == 'closed', Position.mode == mode, Position.exchange == gateway.venue_id)) or 0.0
         capital_in = db.scalar(select(func.coalesce(func.sum(CapitalFlow.amount_usdt), 0.0)).where(CapitalFlow.mode == mode)) or 0.0
         total_equity = (cfg.paper_starting_equity + capital_in + realized + unrealized
                         + open_funding + closed_funding + earn.cumulative_yield_usdt)
@@ -651,7 +652,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
 
             # Paper-mode funding income accrual on open positions (live is auto-credited
             # by Binance into the futures wallet, which our equity calc already sees).
-            _accrue_paper_funding(db, mode)
+            _accrue_paper_funding(db, gateway, mode)
 
             # Live API health probe — bail out cleanly if Binance is rejecting our auth.
             # Without this, every unwrapped order call below hits -2015 and spams the log
@@ -694,19 +695,19 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                         pos_amt = abs(float(raw.get('contracts') or raw.get('info', {}).get('positionAmt') or 0))
                         if not sym or pos_amt == 0:
                             continue
-                        existing = db.scalar(select(Position).where(Position.perp_symbol == sym, Position.status == 'open', Position.mode == MODE_LIVE))
+                        existing = db.scalar(select(Position).where(Position.perp_symbol == sym, Position.status == 'open', Position.mode == MODE_LIVE, Position.exchange == gateway.venue_id))
                         if existing:
                             continue
                         base = sym.split('/')[0]
                         db.add(Position(
-                            mode=MODE_LIVE, exchange=VENUE_BINANCE, symbol=base,
+                            mode=MODE_LIVE, exchange=gateway.venue_id, symbol=base,
                             spot_symbol=f'{base}/USDT', perp_symbol=sym,
                             quantity=pos_amt, entry_funding_rate=0.0,
                             last_funding_accrual_ts=datetime.utcnow(),
                         ))
-                        log_event(db, f'Rehydrated orphan position {sym} qty={pos_amt}', mode=MODE_LIVE, level='WARN')
+                        log_event(db, f'Rehydrated orphan position {sym} on {gateway.name} qty={pos_amt}', mode=MODE_LIVE, level='WARN')
                 except Exception as e:
-                    log_event(db, f'Reconcile failed: {str(e)[:120]}', mode=MODE_LIVE, level='WARN')
+                    log_event(db, f'Reconcile failed on {gateway.name}: {str(e)[:120]}', mode=MODE_LIVE, level='WARN')
                 # And the inverse direction: if a position is open in our DB but
                 # both legs are actually flat on Binance (user closed manually,
                 # or a partial close fully completed outside the bot), mark it
@@ -720,13 +721,13 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
             # auto-transfer to do, skip the API hits entirely.
             if (mode == MODE_LIVE and not mstate.entry_enabled and not mstate.maintenance_mode
                     and not cfg.earn_enabled and not cfg.auto_transfer_enabled):
-                open_count = db.scalar(select(func.count(Position.id)).where(Position.status == 'open', Position.mode == mode)) or 0
+                open_count = db.scalar(select(func.count(Position.id)).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)) or 0
                 if open_count == 0:
                     return
 
             # Maintenance — close everything in this mode and disable entries.
             if mstate.maintenance_mode:
-                for p in db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all():
+                for p in db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)).all():
                     _force_close_both(db, gateway, p, cfg, 'maintenance')
                 if mstate.entry_enabled:
                     mstate.entry_enabled = False
@@ -735,7 +736,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                 db.commit()
                 return
 
-            open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all()
+            open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)).all()
 
             # Phase A: per-position safety — live mode only (paper has no authoritative state to verify against).
             if mode == MODE_LIVE and open_positions:
@@ -749,7 +750,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                         hedged, hedge_reason, surviving_leg = check_hedge(gateway, p)
                         if not hedged:
                             _close_naked_leg(db, gateway, p, cfg, surviving_leg, hedge_reason)
-                open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all()
+                open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)).all()
 
             # Phase B: voluntary exits.
             if mstate.exit_enabled and open_positions:
@@ -787,7 +788,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                     if exit_reason:
                         _force_close_both(db, gateway, p, cfg, exit_reason)
 
-            open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all()
+            open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)).all()
             today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
             daily_trades = db.scalar(select(func.count(Trade.id)).where(Trade.ts >= today_start, Trade.mode == mode)) or 0
 
@@ -872,7 +873,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                     # though the perp symbol formally matches; a clean default for the
                     # max_open_positions > 1 case.
                     held_bases = {p.spot_symbol.split('/')[0] for p in db.scalars(
-                        select(Position).where(Position.status == 'open', Position.mode == mode)
+                        select(Position).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)
                     ).all()}
                     for c in passing[:5]:
                         base = c.spot_symbol.split('/')[0]
@@ -911,7 +912,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                         # rollback path (or next-cycle hedge check) has a row to attach to.
                         pos = Position(
                             mode=mode,
-                            exchange=VENUE_BINANCE,
+                            exchange=gateway.venue_id,
                             symbol=c.spot_symbol.split('/')[0],
                             spot_symbol=c.spot_symbol,
                             perp_symbol=c.perp_symbol,
@@ -994,7 +995,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
             # wallet back to spot so the Earn sweep below can pick it up. Only safe to
             # drain when there are no open positions (otherwise we'd starve their margin).
             if mode == MODE_LIVE and cfg.auto_transfer_enabled:
-                still_open = db.scalar(select(func.count(Position.id)).where(Position.status == 'open', Position.mode == mode)) or 0
+                still_open = db.scalar(select(func.count(Position.id)).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)) or 0
                 if still_open == 0:
                     bals_after = gateway.safe_balances() or {}
                     fut_free_now = float((bals_after.get('futures', {}).get('USDT') or {}).get('free') or 0)
@@ -1043,35 +1044,42 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
             db.commit()
 
 
-def run_one_cycle(gateway: BinanceGateway | None = None, mode: str | None = None) -> int:
-    """Run one cycle. If `mode` is given, only that mode runs. Otherwise both."""
-    if gateway is None:
-        gateway = BinanceGateway()
-        try:
-            gateway.load_markets()
-        except Exception as e:
-            with SessionLocal() as db:
-                log_event(db, f'load_markets failed: {e}', mode=MODE_PAPER, level='ERROR')
-                db.commit()
+def run_one_cycle(gateways: list | None = None, mode: str | None = None) -> int:
+    """Run one cycle across every configured venue. If `mode` is given, only
+    that mode runs. Otherwise both. ``gateways`` is the ordered list returned
+    by :func:`app.exchange.make_gateways` — each cycle scans, opens, and
+    closes per venue independently. Cross-venue capital movement is Phase 2."""
+    if gateways is None:
+        gateways = make_gateways()
+        for gw in gateways:
+            try:
+                gw.load_markets()
+            except Exception as e:
+                with SessionLocal() as db:
+                    log_event(db, f'{gw.name} load_markets failed: {e}', mode=MODE_PAPER, level='ERROR')
+                    db.commit()
     sleep_seconds = 30
     with SessionLocal() as db:
         cfg = get_strategy_config(db)
         sleep_seconds = max(5, int(cfg.loop_seconds))
     targets = (mode,) if mode else ALL_MODES
     for m in targets:
-        run_one_cycle_for_mode(gateway, m)
+        for gw in gateways:
+            run_one_cycle_for_mode(gw, m)
     return sleep_seconds
 
 
 def run_loop() -> None:
-    gateway = BinanceGateway()
-    try:
-        gateway.load_markets()
-    except Exception as e:
-        with SessionLocal() as db:
-            log_event(db, f'load_markets failed: {e}', mode=MODE_PAPER, level='ERROR')
-            db.commit()
-    reconcile_positions(gateway)
+    gateways = make_gateways()
+    for gw in gateways:
+        try:
+            gw.load_markets()
+        except Exception as e:
+            with SessionLocal() as db:
+                log_event(db, f'{gw.name} load_markets failed: {e}', mode=MODE_PAPER, level='ERROR')
+                db.commit()
+    for gw in gateways:
+        reconcile_positions(gw)
     while True:
-        sleep_seconds = run_one_cycle(gateway)
+        sleep_seconds = run_one_cycle(gateways)
         time.sleep(sleep_seconds)

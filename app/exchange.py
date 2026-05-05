@@ -1,10 +1,17 @@
-"""Binance gateway — single point of contact for all exchange operations.
+"""Venue gateways — single point of contact for all exchange operations.
 
-The :class:`BinanceGateway` wraps two ccxt clients (spot + USDM-futures) and
-provides a uniform façade the bot uses for every cross-cutting concern:
-balances, prices, market scanning, order placement, universal transfer between
-spot/futures wallets, Simple Earn (subscribe / redeem / list), order-book
-depth measurement, and historical capital-flow lookup.
+The bot manages a single pool of capital distributed across venues. Each
+venue (Binance today, KuCoin from Phase 1, Interactive Brokers later)
+exposes the same surface so the bot loop can iterate uniformly:
+
+* :class:`BinanceGateway` wraps ``ccxt.binance`` (spot) + ``ccxt.binanceusdm``
+  (USDM-perp). Earn / transfer / deposit-history / sub-transfer are
+  Binance-specific and live here.
+* :class:`KuCoinGateway` wraps ``ccxt.kucoin`` (spot) + ``ccxt.kucoinfutures``
+  (USDT-margined perps). Transfers use KuCoin's ``innerTransfer`` SAPI;
+  Earn (Pool-X) is deferred to a later phase.
+* :func:`make_gateways` is the factory the bot uses — it returns the
+  ordered list of currently-configured venues based on env credentials.
 
 Design notes
 ------------
@@ -109,6 +116,9 @@ def _interval_hours(row: dict) -> float:
 
 
 class BinanceGateway:
+    venue_id = 'binance'
+    name = 'Binance'
+
     def __init__(self) -> None:
         self.spot = ccxt.binance({'apiKey': settings.binance_api_key, 'secret': settings.binance_api_secret, 'enableRateLimit': True})
         self.futures = ccxt.binanceusdm({'apiKey': settings.binance_api_key, 'secret': settings.binance_api_secret, 'enableRateLimit': True})
@@ -658,3 +668,319 @@ class BinanceGateway:
             'asset': 'USDT',
             'lookback_days': lookback_days,
         }
+
+
+# ─── KuCoin gateway ─────────────────────────────────────────────────────────
+# Same surface as :class:`BinanceGateway` so the bot loop can iterate over a
+# list of gateways without conditional logic. Significant differences vs
+# Binance:
+#   * Spot ↔ futures transfers go through KuCoin's ``innerTransfer`` SAPI on
+#     the spot client (Binance uses ``sapiPostAssetTransfer``).
+#   * Earn / Pool-X is deferred — KuCoin's flexible-lend product pays in the
+#     deposited asset rather than USDT, breaking the "compounded APY in USDT"
+#     accounting the bot uses today. earn_* methods all return safely-no-op.
+#   * Net-injected-capital history is venue-specific and not yet implemented;
+#     callers fall back to the manual CapitalFlow table.
+#   * Symbol shape: ccxt normalises both KuCoin's perp suffix (e.g. ``XBTUSDTM``
+#     → ``BTC/USDT:USDT``) and Binance's, so the bot's symbol handling is
+#     unchanged.
+
+class KuCoinGateway:
+    venue_id = 'kucoin'
+    name = 'KuCoin'
+
+    def __init__(self) -> None:
+        common = {
+            'apiKey': settings.kucoin_api_key,
+            'secret': settings.kucoin_api_secret,
+            'password': settings.kucoin_api_passphrase,
+            'enableRateLimit': True,
+        }
+        self.spot = ccxt.kucoin(common)
+        self.futures = ccxt.kucoinfutures(common)
+        self.last_balance_error: str = ''
+
+    def load_markets(self) -> None:
+        self.spot.load_markets()
+        self.futures.load_markets()
+
+    # ─── Read-only helpers ───────────────────────────────────────────────
+    # These are ccxt-uniform across venues, so the implementations mirror
+    # :class:`BinanceGateway` byte-for-byte. They exist on the gateway
+    # rather than as free functions so the bot can pass a single object
+    # into per-venue code paths.
+
+    def order_book_depth_usdt(self, symbol: str, side: str = 'ask', band_bps: float = 10.0, perp: bool = False) -> float:
+        try:
+            ex = self.futures if perp else self.spot
+            ob = ex.fetch_order_book(symbol, limit=50)
+        except Exception:
+            return 0.0
+        bids = ob.get('bids') or []
+        asks = ob.get('asks') or []
+        if not bids or not asks:
+            return 0.0
+        try:
+            mid = (float(bids[0][0]) + float(asks[0][0])) / 2.0
+        except Exception:
+            return 0.0
+        if mid <= 0:
+            return 0.0
+        threshold = band_bps / 10000.0
+        if side == 'ask':
+            cutoff = mid * (1 + threshold)
+            levels = asks
+            within = lambda p: p <= cutoff
+        else:
+            cutoff = mid * (1 - threshold)
+            levels = bids
+            within = lambda p: p >= cutoff
+        total = 0.0
+        for lvl in levels:
+            try:
+                p, q = float(lvl[0]), float(lvl[1])
+            except Exception:
+                continue
+            if not within(p):
+                break
+            total += p * q
+        return total
+
+    def safe_balances(self) -> dict | None:
+        try:
+            result = {'spot': self.spot.fetch_balance(), 'futures': self.futures.fetch_balance()}
+            self.last_balance_error = ''
+            return result
+        except Exception as e:
+            self.last_balance_error = str(e)
+            return None
+
+    def price(self, symbol: str) -> float:
+        return float(self.spot.fetch_ticker(symbol)['last'])
+
+    def perp_price(self, symbol: str) -> float:
+        return float(self.futures.fetch_ticker(symbol)['last'])
+
+    def safe_price(self, symbol: str, perp: bool = False) -> float | None:
+        try:
+            return self.perp_price(symbol) if perp else self.price(symbol)
+        except Exception:
+            return None
+
+    def market_min_amount(self, symbol: str, perp: bool = False) -> float:
+        ex = self.futures if perp else self.spot
+        try:
+            market = ex.market(symbol)
+        except Exception:
+            return 0.0
+        try:
+            return float((market.get('limits') or {}).get('amount', {}).get('min') or 0.0)
+        except Exception:
+            return 0.0
+
+    def open_perp_positions_raw(self) -> list[dict]:
+        try:
+            positions = self.futures.fetch_positions()
+        except Exception:
+            return []
+        return [p for p in positions if abs(float(p.get('contracts') or p.get('info', {}).get('positionAmt') or 0)) > 0]
+
+    # ─── Funding scan ───────────────────────────────────────────────────
+    # KuCoin's fetch_funding_rates exposes the same shape as Binance's.
+    # ccxt fills in interval, fundingRate, etc. We re-use _interval_hours
+    # + annualize_rate from the module level so the math is consistent.
+
+    def scan_funding(self, entry_apr_threshold: float, min_quote_volume: float, min_depth_usdt: float = 0.0, depth_band_bps: float = 10.0, include_earn_apr: bool = False) -> tuple[list[Candidate], int, list[tuple[str, str, float]]]:
+        try:
+            rates = self.futures.fetch_funding_rates()
+        except Exception:
+            return [], 0, []
+        passing: list[Candidate] = []
+        rejected: list[tuple[str, str, float]] = []
+        total = 0
+        for symbol, row in rates.items():
+            fr = row.get('fundingRate')
+            if fr is None or not symbol.endswith(':USDT'):
+                continue
+            total += 1
+            interval_h = _interval_hours(row)
+            apr = annualize_rate(float(fr), interval_h)
+            if apr < entry_apr_threshold:
+                continue
+            base = symbol.split('/')[0]
+            spot_symbol = f'{base}/USDT'
+            if spot_symbol not in self.spot.markets:
+                rejected.append((symbol, 'no_spot_market', apr))
+                continue
+            try:
+                t = self.spot.fetch_ticker(spot_symbol)
+            except Exception:
+                rejected.append((symbol, 'ticker_error', apr))
+                continue
+            qv = float(t.get('quoteVolume') or 0)
+            if qv < min_quote_volume:
+                rejected.append((symbol, f'volume<{min_quote_volume:.0f}', apr))
+                continue
+            spot_depth = perp_depth = 0.0
+            if min_depth_usdt > 0:
+                spot_depth = self.order_book_depth_usdt(spot_symbol, side='ask', band_bps=depth_band_bps, perp=False)
+                perp_depth = self.order_book_depth_usdt(symbol, side='bid', band_bps=depth_band_bps, perp=True)
+                tight = min(spot_depth, perp_depth)
+                if tight < min_depth_usdt:
+                    rejected.append((symbol, f'depth<{min_depth_usdt:.0f} (spot {spot_depth:.0f} / perp {perp_depth:.0f} @ ±{depth_band_bps:.0f}bps)', apr))
+                    continue
+            # KuCoin Earn / Pool-X deferred — pass 0.0 so the candidate's
+            # combined_apy is just the funding APY for now.
+            passing.append(Candidate(
+                spot_symbol=spot_symbol,
+                perp_symbol=symbol,
+                funding_rate=float(fr),
+                funding_interval_hours=interval_h,
+                quote_volume=qv,
+                spot_depth_usdt=spot_depth,
+                perp_depth_usdt=perp_depth,
+                spot_earn_apr=0.0,
+            ))
+        passing.sort(key=lambda c: (c.combined_apy, c.min_depth_usdt), reverse=True)
+        return passing, total, rejected
+
+    # ─── Order placement ────────────────────────────────────────────────
+
+    def _market_order(self, venue: str, symbol: str, side: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float):
+        if paper_mode:
+            mid = self.perp_price(symbol) if venue == 'futures' else self.price(symbol)
+            slip = slippage_bps / 10000.0
+            fill_price = mid * (1 + slip) if side == 'buy' else mid * (1 - slip)
+            fee_cost = fill_price * amount * (fee_bps / 10000.0)
+            return {'id': 'paper', 'symbol': symbol, 'side': side, 'amount': amount, 'venue': venue, 'status': 'closed', 'price': fill_price, 'fee': {'cost': fee_cost}}
+        if venue == 'spot':
+            return self.spot.create_order(symbol, 'market', side, amount)
+        return self.futures.create_order(symbol, 'market', side, amount)
+
+    def create_spot_buy(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float):
+        return self._market_order('spot', symbol, 'buy', amount, paper_mode, slippage_bps, fee_bps)
+
+    def create_perp_short(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float):
+        return self._market_order('futures', symbol, 'sell', amount, paper_mode, slippage_bps, fee_bps)
+
+    def close_spot(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float):
+        return self._market_order('spot', symbol, 'sell', amount, paper_mode, slippage_bps, fee_bps)
+
+    def close_perp(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float):
+        return self._market_order('futures', symbol, 'buy', amount, paper_mode, slippage_bps, fee_bps)
+
+    # ─── Margin mode + leverage configuration ───────────────────────────
+    # CROSS + 1x leverage matches Binance's setup. Both calls are
+    # idempotent; KuCoin returns a benign error string when the symbol
+    # is already on the requested setting.
+
+    def configure_perp_for_arb(self, symbol: str) -> tuple[bool, str]:
+        margin_ok = leverage_ok = True
+        margin_err = leverage_err = ''
+        try:
+            self.futures.set_margin_mode('cross', symbol)
+        except Exception as e:
+            msg = str(e)
+            if 'no need' not in msg.lower() and 'already' not in msg.lower():
+                margin_ok, margin_err = False, msg
+        try:
+            self.futures.set_leverage(1, symbol)
+        except Exception as e:
+            msg = str(e)
+            if 'no need' not in msg.lower() and 'already' not in msg.lower():
+                leverage_ok, leverage_err = False, msg
+        if margin_ok and leverage_ok:
+            return True, ''
+        return False, '; '.join(filter(None, [margin_err, leverage_err]))
+
+    # ─── Spot ↔ futures transfer (KuCoin innerTransfer) ─────────────────
+
+    def _inner_transfer(self, from_account: str, to_account: str, amount_usdt: float) -> tuple[bool, str]:
+        # ccxt method names for KuCoin's transfer. We probe several
+        # naming variants for ccxt-version drift, same pattern as the
+        # SAPI lookup on Binance.
+        for name in ('privatePostAccountsInnerTransfer', 'private_post_accounts_inner_transfer', 'privatePostAccountsUniversalTransfer'):
+            fn = getattr(self.spot, name, None)
+            if callable(fn):
+                try:
+                    fn({
+                        'currency': 'USDT',
+                        'from': from_account,
+                        'to': to_account,
+                        'amount': f'{amount_usdt:.2f}',
+                        'clientOid': f'autotrader-{int(time.time() * 1000)}',
+                    })
+                    return True, ''
+                except Exception as e:
+                    return False, str(e)
+        return False, 'KuCoin innerTransfer not available in this ccxt build'
+
+    def transfer_spot_to_futures(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        if paper_mode:
+            return True, 'paper'
+        if amount_usdt <= 0:
+            return True, 'noop'
+        return self._inner_transfer('main', 'contract', amount_usdt)
+
+    def transfer_futures_to_spot(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        if paper_mode:
+            return True, 'paper'
+        if amount_usdt <= 0:
+            return True, 'noop'
+        return self._inner_transfer('contract', 'main', amount_usdt)
+
+    # ─── Earn / Pool-X (deferred — Phase 1 doesn't subscribe on KuCoin) ─
+
+    def earn_balance_usdt(self) -> tuple[float | None, str]:
+        return 0.0, ''
+
+    def earn_balance(self, asset: str = 'USDT') -> tuple[float | None, str]:
+        return 0.0, ''
+
+    def earn_subscribe(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        if paper_mode:
+            return True, 'paper'
+        return False, 'KuCoin Earn (Pool-X) not yet wired — see docs/kucoin-integration-plan.md'
+
+    def earn_subscribe_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:
+        if paper_mode:
+            return True, 'paper'
+        return False, f'{asset}: KuCoin Earn (Pool-X) not yet wired'
+
+    def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        if paper_mode:
+            return True, 'paper'
+        return False, 'KuCoin Earn not subscribed'
+
+    def earn_redeem_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:
+        if paper_mode:
+            return True, 'paper'
+        return False, f'{asset}: KuCoin Earn not subscribed'
+
+    def flexible_earn_apr(self, asset: str, ttl_seconds: float = 3600.0) -> float:
+        return 0.0
+
+    # ─── Capital-flow history (deferred — manual CapitalFlow only) ──────
+
+    def net_injected_capital_usdt(self, lookback_days: int = 365) -> tuple[float | None, dict]:
+        return None, {'error': 'KuCoin deposit/withdrawal history not yet wired'}
+
+
+# ─── Multi-venue factory ────────────────────────────────────────────────
+# The bot calls :func:`make_gateways` to discover which venues are live.
+# A venue is "live" iff its credentials are present in the environment.
+# Order matters: gateways earlier in the list are scanned first each
+# cycle, so they get first pick of capital and candidates. Binance leads
+# by default since it has the most mature integration and the most
+# liquidity.
+
+def make_gateways() -> list:
+    """Return the ordered list of gateways the bot should drive this run.
+    Empty list means no venue is configured — the bot loop becomes a
+    no-op until credentials are set."""
+    gws: list = []
+    if settings.binance_api_key and settings.binance_api_secret:
+        gws.append(BinanceGateway())
+    if settings.kucoin_api_key and settings.kucoin_api_secret and settings.kucoin_api_passphrase:
+        gws.append(KuCoinGateway())
+    return gws

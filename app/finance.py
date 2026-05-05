@@ -123,14 +123,20 @@ def total_funding_income(db, mode: str | None = None, status: str | None = None)
     return float(db.scalar(stmt) or 0.0)
 
 
-def equity_breakdown(db, gateway, mode: str, earn_deployed: float) -> list[dict]:
+def equity_breakdown(db, gateways, mode: str, earn_deployed: float) -> list[dict]:
     """Return a per-component slice of total equity for the donut chart.
     Each item: ``{label, value, color, venue}``. ``venue`` tags the bucket to
     the exchange / broker it lives on so the dashboard can group buckets by
-    venue and show a "single pool, multiple venues" breakdown. Today every
-    bucket is on Binance (or the synthetic ``paper`` book); KuCoin and
-    Interactive Brokers slot in here once their gateways land."""
-    from app.models import Position, MODE_LIVE, VENUE_BINANCE
+    venue and show a "single pool, multiple venues" breakdown.
+
+    ``gateways`` is the list of configured venue gateways. In LIVE mode this
+    walks every gateway and contributes its own buckets, so KuCoin balances
+    and Binance balances both appear in one pool. In paper mode the breakdown
+    is a single virtual book — gateways are unused.
+
+    For backwards compatibility ``gateways`` may be a single gateway object;
+    older callers pre-Phase-1 passed one in directly."""
+    from app.models import Position, MODE_LIVE
     PALETTE = {
         'spot_usdt': '#38bdf8',
         'fut_usdt': '#fbbf24',
@@ -139,34 +145,52 @@ def equity_breakdown(db, gateway, mode: str, earn_deployed: float) -> list[dict]
         'free_cash': '#38bdf8',
         'in_positions': '#818cf8',
     }
+    # Normalise gateways into a list — tolerate the old single-arg signature.
+    if not isinstance(gateways, list):
+        gateways = [gateways] if gateways is not None else []
     items: list[dict] = []
     if mode == MODE_LIVE:
-        bals = gateway.safe_balances() or {}
-        spot_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
-        fut_usdt = float((bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
-        # Walk every non-USDT spot asset; price each.
-        spot_assets = 0.0
-        META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
-        for asset, bal in (bals.get('spot') or {}).items():
-            if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
-                continue
-            qty = float(bal.get('total') or 0)
-            if qty <= 0:
-                continue
-            px = gateway.safe_price(f'{asset}/USDT') or 0
-            spot_assets += qty * px
-        items.append({'label': 'Binance · Spot USDT', 'value': spot_usdt, 'color': PALETTE['spot_usdt'], 'venue': VENUE_BINANCE})
-        items.append({'label': 'Binance · Futures USDT', 'value': fut_usdt, 'color': PALETTE['fut_usdt'], 'venue': VENUE_BINANCE})
-        items.append({'label': 'Binance · Spot assets', 'value': spot_assets, 'color': PALETTE['spot_assets'], 'venue': VENUE_BINANCE})
-        items.append({'label': 'Binance · Earn', 'value': earn_deployed, 'color': PALETTE['earn'], 'venue': VENUE_BINANCE})
+        for gw in gateways:
+            bals = gw.safe_balances() or {}
+            spot_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
+            fut_usdt = float((bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
+            spot_assets = 0.0
+            META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
+            for asset, bal in (bals.get('spot') or {}).items():
+                if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+                    continue
+                qty = float(bal.get('total') or 0)
+                if qty <= 0:
+                    continue
+                px = gw.safe_price(f'{asset}/USDT') or 0
+                spot_assets += qty * px
+            # Earn balance is venue-specific; KuCoin's gateway returns 0 for now
+            # (Pool-X deferred), Binance returns the real flexible-USDT figure.
+            try:
+                gw_earn, _ = gw.earn_balance_usdt()
+                gw_earn = gw_earn or 0.0
+            except Exception:
+                gw_earn = 0.0
+            # Override Binance earn with the locally tracked figure when caller
+            # passed it (avoids a duplicate SAPI roundtrip on the hot path).
+            if gw.venue_id == 'binance' and earn_deployed:
+                gw_earn = earn_deployed
+            items.append({'label': f'{gw.name} · Spot USDT', 'value': spot_usdt, 'color': PALETTE['spot_usdt'], 'venue': gw.venue_id})
+            items.append({'label': f'{gw.name} · Futures USDT', 'value': fut_usdt, 'color': PALETTE['fut_usdt'], 'venue': gw.venue_id})
+            items.append({'label': f'{gw.name} · Spot assets', 'value': spot_assets, 'color': PALETTE['spot_assets'], 'venue': gw.venue_id})
+            if gw_earn > 0:
+                items.append({'label': f'{gw.name} · Earn', 'value': gw_earn, 'color': PALETTE['earn'], 'venue': gw.venue_id})
     else:
+        # Paper mode — use the first gateway (typically Binance) for price lookups.
+        price_gw = gateways[0] if gateways else None
         open_ps = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all()
         in_positions = sum(p.quantity * p.spot_entry_price for p in open_ps)
         unrealized = 0.0
-        for p in open_ps:
-            spot_now = gateway.safe_price(p.spot_symbol) or p.spot_entry_price or 0
-            perp_now = gateway.safe_price(p.perp_symbol, perp=True) or p.perp_entry_price or 0
-            unrealized += position_unrealized_pnl(p, spot_now, perp_now)
+        if price_gw is not None:
+            for p in open_ps:
+                spot_now = price_gw.safe_price(p.spot_symbol) or p.spot_entry_price or 0
+                perp_now = price_gw.safe_price(p.perp_symbol, perp=True) or p.perp_entry_price or 0
+                unrealized += position_unrealized_pnl(p, spot_now, perp_now)
         # Free cash for paper = total_equity - earn - in_positions - unrealized.
         # Caller computes total_equity separately; we expose the raw components.
         # We don't include realized + funding in items because they're already
