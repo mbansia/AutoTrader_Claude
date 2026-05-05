@@ -69,9 +69,13 @@
     </div>
   </div>
   <div class="kpi">
-    <div class="label">Total PnL</div>
-    <div class="value {{ 'good' if total_pnl >= 0 else 'bad' }}">{{ '%+.2f' % total_pnl }} USDT</div>
-    <div class="sub">trade {{ '%+.2f' % trade_pnl }} · funding {{ '%+.2f' % funding_income }} · MTM {{ '%+.2f' % unrealized_pnl }}</div>
+    <div class="label">Total PnL (USDT)</div>
+    <div class="value {{ 'good' if total_pnl >= 0 else 'bad' }}">{{ '%+.2f' % total_pnl }}</div>
+    <div class="sub">
+      equity − net injected · breakdown:
+      trade {{ '%+.2f' % trade_pnl }} · funding {{ '%+.2f' % funding_income }}{% if view == 'live' %}*{% endif %} · MTM {{ '%+.2f' % unrealized_pnl }}
+      {% if view == 'live' %}<br><span class="muted" style="font-size:11px;">* live funding is inferred as residual since Binance auto-credits it into the futures wallet</span>{% endif %}
+    </div>
   </div>
   <div class="kpi">
     <div class="label">XIRR (compounded)</div>

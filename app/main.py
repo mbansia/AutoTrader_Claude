@@ -339,8 +339,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
                 balances_error = 'unable to fetch from Binance'
 
         trade_realized = total_realized_pnl(db, mode=v)
-        funding_income = total_funding_income(db, mode=v)
-        realized = trade_realized + funding_income
+        funding_income_tracked = total_funding_income(db, mode=v)
         unrealized = _unrealized_for_open(db, gw, v)
         net_capital, net_capital_meta = net_capital_in(db, mode=v, gateway=gw)
         flow_count_n = db.scalar(select(func.count(CapitalFlow.id)).where(CapitalFlow.mode == v)) or 0
@@ -348,6 +347,28 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         open_count = db.scalar(select(func.count(Position.id)).where(Position.status == 'open', Position.mode == v)) or 0
         today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         trades_today_n = db.scalar(select(func.count(Trade.id)).where(Trade.ts >= today_start, Trade.mode == v)) or 0
+
+        # Total PnL is the **observed** number: how much the live wallet has
+        # grown beyond the capital injected. This is the only PnL figure we
+        # can guarantee is correct because it doesn't depend on per-row
+        # bookkeeping. Trade and funding components are the explanatory
+        # breakdown — they sum to total_pnl by construction (see funding
+        # inference below).
+        total_pnl = current_equity - net_capital
+
+        # In LIVE mode, Binance auto-credits funding payments into the
+        # futures wallet — they never appear in the trades table, so
+        # total_funding_income() returns 0. Without inferring it, the UI
+        # would display "trade -142, funding 0, total -142" while the user's
+        # equity is up. Infer funding as the residual:
+        #   funding_income = total_pnl - trade_realized - unrealized
+        # In paper mode we trust the per-position funding accruals because
+        # the bot synthesises them; only live needs the inference.
+        if v == MODE_LIVE:
+            funding_income = total_pnl - trade_realized - unrealized
+        else:
+            funding_income = funding_income_tracked
+        realized = trade_realized + funding_income
 
         last_cycle_ts = latest_scan.ts if latest_scan else (equity_points[-1].ts if equity_points else None)
         last_cycle_age = _fmt_age(datetime.utcnow() - last_cycle_ts) if last_cycle_ts else None
@@ -482,7 +503,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             'trade_pnl': trade_realized,
             'funding_income': funding_income,
             'unrealized_pnl': unrealized,
-            'total_pnl': realized + unrealized,
+            'total_pnl': total_pnl,
             'net_capital': net_capital,
             'net_capital_meta': net_capital_meta,
             'flow_count': flow_count_n,
