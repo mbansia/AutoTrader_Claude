@@ -84,3 +84,15 @@ def run_schema_migrations() -> None:
     # taken on ``trades`` (it's the spot/futures leg label).
     _add_column_if_missing('positions', 'exchange', "VARCHAR(16) NOT NULL DEFAULT 'binance'")
     _add_column_if_missing('trades', 'exchange', "VARCHAR(16) NOT NULL DEFAULT 'binance'")
+
+    # One-shot cleanup: the old auto-detect heuristic created CapitalFlow rows
+    # with detected_by='auto' whenever the live wallet drifted from the previous
+    # snapshot. That was wrong — funding payments and mark-price moves both
+    # showed up as phantom "withdrawals". The heuristic was removed but rows it
+    # already created sit in the table as fake history. Purge them on startup.
+    # Manual rows (detected_by='manual') and Binance-history-derived rows are
+    # untouched.
+    insp = inspect(engine)
+    if 'capital_flows' in insp.get_table_names():
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM capital_flows WHERE detected_by = 'auto'"))
