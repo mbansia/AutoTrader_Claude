@@ -261,7 +261,7 @@ def _ensure_close_readiness(db, gateway: BinanceGateway, p: Position, cfg: Strat
             elif BINANCE_ERR_NO_EARN_POSITION in err or "doesn't exist" in err.lower() or 'no flexible product' in err.lower():
                 pass  # nothing was subscribed; close_spot will use whatever's already in spot
             else:
-                log_event(db, f'Pre-close: redeem {base} failed: {err[:120]}', mode=p.mode, level='WARN')
+                log_event(db, f'Pre-close: redeem {base} for {p.perp_symbol} failed: {err[:120]}', mode=p.mode, level='WARN')
 
     # ---- Perp leg margin side ----
     fut_free = float((bals.get('futures', {}).get('USDT') or {}).get('free') or 0)
@@ -289,7 +289,7 @@ def _ensure_close_readiness(db, gateway: BinanceGateway, p: Position, cfg: Strat
                 gap -= transfer
                 log_event(db, f'Pre-close: transferred {transfer:.2f} USDT spot→futures (margin top-up for {p.perp_symbol})', mode=p.mode)
             else:
-                log_event(db, f'Pre-close: spot→futures transfer failed: {err[:120]}', mode=p.mode, level='WARN')
+                log_event(db, f'Pre-close: spot→futures transfer for {p.perp_symbol} failed: {err[:120]}', mode=p.mode, level='WARN')
 
     # Step 2: redeem USDT from Earn → spot → futures
     if gap >= 0.20 and cfg.earn_enabled and cfg.auto_transfer_enabled:
@@ -306,7 +306,7 @@ def _ensure_close_readiness(db, gateway: BinanceGateway, p: Position, cfg: Strat
                     if ok2:
                         log_event(db, f'Pre-close: transferred {transfer:.2f} USDT to futures (Earn → spot → futures)', mode=p.mode)
                     else:
-                        log_event(db, f'Pre-close: post-redeem transfer failed: {err2[:120]}', mode=p.mode, level='WARN')
+                        log_event(db, f'Pre-close: post-redeem transfer for {p.perp_symbol} failed: {err2[:120]}', mode=p.mode, level='WARN')
 
 
 def _rebalance_spot_fut(db, gateway: BinanceGateway, cfg: StrategyConfig, mode: str) -> None:
@@ -853,7 +853,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                                 log_event(db, f'Redeemed {need:.4f} USDT from earn before opening', mode=mode)
                             else:
                                 earn.last_error = err
-                                log_event(db, f'Earn redeem failed: {err}', mode=mode, level='WARN')
+                                log_event(db, f'Earn redeem USDT (need={need:.4f}) failed: {err}', mode=mode, level='WARN')
 
                     # Transfer spot→futures so the perp leg has margin (once per cycle).
                     if mode == MODE_LIVE and cfg.auto_transfer_enabled and fut_free < desired_notional and spot_free > desired_notional:
@@ -960,9 +960,11 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                             base = c.spot_symbol.split('/')[0]
                             ok_e, err_e = gateway.earn_subscribe_asset(base, qty, False)
                             if ok_e:
-                                log_event(db, f'Subscribed {qty:.6f} {base} to flexible Earn', mode=mode)
+                                log_event(db, f'Subscribed {qty:.6f} {base} to flexible Earn ({c.perp_symbol})', mode=mode)
+                            elif 'cooldown active' in err_e:
+                                log_event(db, f'Earn subscribe for {base} skipped (cooldown — {c.perp_symbol})', mode=mode)
                             else:
-                                log_event(db, f'Earn subscribe for {base} skipped: {err_e[:120]}', mode=mode, level='WARN')
+                                log_event(db, f'Earn subscribe for {base} on {c.perp_symbol} skipped: {err_e[:120]}', mode=mode, level='WARN')
 
                         # Both legs filled — finalize.
                         pos.perp_entry_price = float(f.get('price') or 0)
@@ -1017,9 +1019,12 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                     if ok:
                         earn.deployed_usdt += sweep
                         log_event(db, f'Swept {sweep:.2f} USDT idle to earn', mode=mode)
+                    elif 'cooldown active' in err:
+                        # Per-asset cooldown — expected, don't spam logs. Surface on the dashboard via earn.last_error only.
+                        earn.last_error = err
                     else:
                         earn.last_error = err
-                        log_event(db, f'Earn subscribe failed: {err}', mode=mode, level='WARN')
+                        log_event(db, f'Earn subscribe USDT failed (sweep={sweep:.4f}): {err}', mode=mode, level='WARN')
 
             prev_snap = db.scalar(select(BalanceSnapshot).where(BalanceSnapshot.source == mode).order_by(BalanceSnapshot.id.desc()).limit(1))
             snap = _take_balance_snapshot(db, gateway, mode, cfg, earn)

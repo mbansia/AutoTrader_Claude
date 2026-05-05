@@ -42,6 +42,7 @@ BINANCE_ERR_INVALID_API = '-2015'           # bad key / IP not whitelisted / mis
 BINANCE_ERR_INSUFFICIENT_MARGIN = '-2019'   # futures order can't be placed for lack of free margin
 BINANCE_ERR_MALFORMED_AMOUNT = '-1102'      # amount param missing/empty/zero on a SAPI call
 BINANCE_ERR_NO_EARN_POSITION = '-6053'      # trying to redeem from a flexible product with no balance
+BINANCE_ERR_EARN_TOO_MANY_SUBS = '77505'    # subscribed too many times for this token (rate-limit)
 
 
 @dataclass
@@ -404,15 +405,32 @@ class BinanceGateway:
     def earn_balance_usdt(self) -> tuple[float | None, str]:
         return self.earn_balance('USDT')
 
+    # Earn subscribe is rate-limited per (asset, day) on Binance — too many
+    # subscribes returns 77505. We track the last attempt per asset and apply
+    # a cooldown locally so we never spam Binance, and bump the cooldown if
+    # Binance ever does return 77505.
+    _earn_subscribe_cooldown_until: dict[str, float] = {}
+    EARN_SUBSCRIBE_DEFAULT_COOLDOWN_S = 3600.0      # 1h between subscribes per asset
+    EARN_SUBSCRIBE_RATE_LIMITED_COOLDOWN_S = 86400.0  # 24h after Binance signals 77505
+
     def earn_subscribe_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:
         """Subscribe `amount` of `asset` to Binance Simple Earn Flexible. Asset can be
         USDT or any base coin that has a flexible product (Binance offers flexible
         for most major listings). Caller must pre-format `amount` to the asset's
-        precision; here we use 6 decimals as a conservative cap."""
+        precision; here we use 6 decimals as a conservative cap.
+
+        Cooldown: each successful subscribe pins a per-asset cooldown so the
+        bot doesn't spam the SAPI every 30s loop. 77505 from Binance bumps
+        the cooldown to 24h for that asset."""
         if paper_mode:
             return True, 'paper'
         if amount <= 0:
-            return False, 'zero amount'
+            return False, f'{asset}: zero amount'
+        cool_until = self._earn_subscribe_cooldown_until.get(asset, 0.0)
+        now = time.time()
+        if now < cool_until:
+            remaining = int(cool_until - now)
+            return False, f'{asset}: subscribe cooldown active ({remaining}s remaining; avoids Binance 77505 rate-limit)'
         pid = self.earn_product_id(asset)
         if not pid:
             return False, f'no flexible product for {asset}'
@@ -423,9 +441,15 @@ class BinanceGateway:
                 'sapiPostSimpleEarnFlexibleSubscribe',
             ), {'productId': pid, 'amount': f'{amount:.6f}'})
         except Exception as e:
-            return False, str(e)
+            err = str(e)
+            if BINANCE_ERR_EARN_TOO_MANY_SUBS in err:
+                self._earn_subscribe_cooldown_until[asset] = now + self.EARN_SUBSCRIBE_RATE_LIMITED_COOLDOWN_S
+                return False, f'{asset}: Binance rate-limited (77505). Backing off 24h before retrying. {err[:120]}'
+            return False, f'{asset}: {err}'
         if resp is None:
-            return False, 'sapi method not available in ccxt'
+            return False, f'{asset}: sapi method not available in ccxt'
+        # Success — install standard cooldown so we don't immediately retry next cycle.
+        self._earn_subscribe_cooldown_until[asset] = now + self.EARN_SUBSCRIBE_DEFAULT_COOLDOWN_S
         return bool(resp.get('success', True)), ''
 
     def earn_redeem_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:

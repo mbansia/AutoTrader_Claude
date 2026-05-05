@@ -36,13 +36,45 @@ from app.models import CapitalFlow, Position, Trade
 
 
 def position_realized_pnl(db, position: Position) -> float:
+    """Closed-position trade PnL.
+
+    Computed as the matched-fraction PnL on each leg: only the buy/sell
+    pair that actually offset each other counts. Unmatched fills (e.g., a
+    spot buy whose corresponding sell was skipped because Binance's
+    LOT_SIZE filter made it un-tradeable dust, or a rehydrated orphan perp
+    that has no recorded entry) are treated as inventory adjustments —
+    they show up in the equity composition (as base-asset balances or
+    futures wallet drift) and must not also pollute realized PnL.
+
+    Without this matching, dust-skipped closes inflate realized PnL by
+    -spot_buy_notional per position because the entry buy is recorded but
+    no sell ever offsets it.
+    """
     trades = db.scalars(select(Trade).where(Trade.position_id == position.id)).all()
-    spot_buys = sum(t.price * t.quantity for t in trades if t.venue == 'spot' and t.side == 'buy')
-    spot_sells = sum(t.price * t.quantity for t in trades if t.venue == 'spot' and t.side == 'sell')
-    perp_sells = sum(t.price * t.quantity for t in trades if t.venue == 'futures' and t.side == 'sell')
-    perp_buys = sum(t.price * t.quantity for t in trades if t.venue == 'futures' and t.side == 'buy')
+
+    spot_buy_qty = sum(t.quantity for t in trades if t.venue == 'spot' and t.side == 'buy')
+    spot_buy_val = sum(t.price * t.quantity for t in trades if t.venue == 'spot' and t.side == 'buy')
+    spot_sell_qty = sum(t.quantity for t in trades if t.venue == 'spot' and t.side == 'sell')
+    spot_sell_val = sum(t.price * t.quantity for t in trades if t.venue == 'spot' and t.side == 'sell')
+
+    perp_open_qty = sum(t.quantity for t in trades if t.venue == 'futures' and t.side == 'sell')
+    perp_open_val = sum(t.price * t.quantity for t in trades if t.venue == 'futures' and t.side == 'sell')
+    perp_close_qty = sum(t.quantity for t in trades if t.venue == 'futures' and t.side == 'buy')
+    perp_close_val = sum(t.price * t.quantity for t in trades if t.venue == 'futures' and t.side == 'buy')
+
+    spot_pnl = 0.0
+    if spot_buy_qty > 0 and spot_sell_qty > 0:
+        matched = min(spot_buy_qty, spot_sell_qty)
+        spot_pnl = (spot_sell_val * matched / spot_sell_qty) - (spot_buy_val * matched / spot_buy_qty)
+
+    perp_pnl = 0.0
+    if perp_open_qty > 0 and perp_close_qty > 0:
+        matched = min(perp_open_qty, perp_close_qty)
+        # Short = entry-sell minus close-buy (gain when close < entry).
+        perp_pnl = (perp_open_val * matched / perp_open_qty) - (perp_close_val * matched / perp_close_qty)
+
     fees = sum(t.fee for t in trades)
-    return (spot_sells - spot_buys) + (perp_sells - perp_buys) - fees
+    return spot_pnl + perp_pnl - fees
 
 
 def position_unrealized_pnl(position: Position, spot_now: float, perp_now: float) -> float:
