@@ -83,15 +83,18 @@ def run_schema_migrations() -> None:
     for table in ('positions', 'trades', 'balance_snapshots', 'equity_curve',
                   'rejected_candidates', 'bot_events', 'capital_flows', 'scan_results'):
         _add_column_if_missing(table, 'exchange', "VARCHAR(16) NOT NULL DEFAULT 'binance'")
+    # Stable per-venue id for auto-ingested capital flows (so re-runs don't
+    # duplicate the same deposit / withdrawal / sub-transfer row).
+    _add_column_if_missing('capital_flows', 'external_id', "VARCHAR(128) NOT NULL DEFAULT ''")
 
-    # One-shot cleanup: the old auto-detect heuristic created CapitalFlow rows
-    # with detected_by='auto' whenever the live wallet drifted from the previous
-    # snapshot. That was wrong — funding payments and mark-price moves both
-    # showed up as phantom "withdrawals". The heuristic was removed but rows it
-    # already created sit in the table as fake history. Purge them on startup.
-    # Manual rows (detected_by='manual') and Binance-history-derived rows are
-    # untouched.
+    # One-shot cleanup: the *old* auto-detect heuristic created CapitalFlow
+    # rows whenever the live wallet drifted from the previous snapshot —
+    # which mistook funding payments and mark-price moves for phantom
+    # "withdrawals". Those rows were written without an external_id (the
+    # column didn't exist yet). Purge only those legacy rows; modern auto
+    # rows ingested from venue history carry external_id and are kept so
+    # XIRR survives restarts.
     insp = inspect(engine)
     if 'capital_flows' in insp.get_table_names():
         with engine.begin() as conn:
-            conn.execute(text("DELETE FROM capital_flows WHERE detected_by = 'auto'"))
+            conn.execute(text("DELETE FROM capital_flows WHERE detected_by = 'auto' AND (external_id IS NULL OR external_id = '')"))

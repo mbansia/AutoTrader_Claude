@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 import ccxt
 
@@ -113,6 +114,35 @@ def annualize_rate(period_rate: float, interval_hours: float) -> float:
         return (1.0 + period_rate) ** periods - 1.0
     except OverflowError:
         return float('inf') if period_rate > 0 else -1.0
+
+
+def _ms_to_dt(value) -> datetime | None:
+    """Convert a Binance/KuCoin millisecond-epoch timestamp (or ISO-8601
+    string) to a UTC ``datetime``. Returns None for malformed input so the
+    caller can drop the row."""
+    if value is None:
+        return None
+    try:
+        v = int(value)
+        if v > 1e12:
+            return datetime.utcfromtimestamp(v / 1000.0)
+        if v > 1e9:
+            return datetime.utcfromtimestamp(float(v))
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace('Z', '+00:00')).replace(tzinfo=None)
+        except ValueError:
+            return None
+    return None
+
+
+def _row_hash(venue: str, kind: str, ts: datetime | None, amount: float) -> str:
+    """Synthesize a stable id for a capital-flow row that the venue didn't
+    return one for. Uniqueness is per (venue, kind, ts, rounded amount)."""
+    ts_part = ts.isoformat() if ts else 'no-ts'
+    return f'{venue}-{kind}-{ts_part}-{amount:.6f}'
 
 
 def _interval_hours(row: dict) -> float:
@@ -249,6 +279,17 @@ class VenueGateway:
 
     # ─── Funding scan (ccxt-uniform) ───────────────────────────────────────
 
+    def funding_rates_dict(self) -> dict:
+        """Return ``{symbol: {fundingRate, interval, fundingTimestamp,
+        nextFundingTimestamp}, ...}`` for every USDT-perp on this venue.
+
+        Default implementation uses ccxt's batch ``fetch_funding_rates()`` —
+        works on Binance. Venues whose ccxt client can't batch (e.g. KuCoin
+        futures, where ``fetch_funding_rates`` raises ``NotSupported``)
+        override this to assemble the same shape from per-market info or
+        per-symbol calls."""
+        return self.futures.fetch_funding_rates()
+
     def scan_funding(
         self,
         entry_apr_threshold: float,
@@ -268,7 +309,7 @@ class VenueGateway:
         Each :class:`Candidate` carries ``venue_id`` so when multiple venues'
         results get pooled in the bot loop, the destination is unambiguous."""
         try:
-            rates = self.futures.fetch_funding_rates()
+            rates = self.funding_rates_dict()
         except Exception:
             return [], 0, []
         passing: list[Candidate] = []
@@ -433,6 +474,18 @@ class VenueGateway:
         a per-component breakdown for the UI. ``None`` signals the caller to
         fall back to manual CapitalFlow rows."""
         return None, {'error': f'history not wired on {self.name}'}
+
+    def list_capital_flow_records(self, lookback_days: int = 365) -> list[dict]:
+        """Return per-row capital movements over the lookback window so the bot
+        can ingest them as ``CapitalFlow`` entries for XIRR and the per-flow
+        timeline. Each row is ``{ts, amount, kind, external_id, note}``:
+        * ``ts`` (datetime UTC), ``amount`` (USDT, positive=in, negative=out)
+        * ``kind`` in ``deposit | withdrawal | sub_in | sub_out``
+        * ``external_id`` is the venue's row id (used as the natural key so
+          re-ingesting is idempotent — duplicates collapse)
+        * ``note`` is a short description for the UI
+        Default returns ``[]`` — venues without history simply ingest nothing."""
+        return []
 
 
 # ─── Binance gateway ────────────────────────────────────────────────────────
@@ -797,6 +850,45 @@ class BinanceGateway(VenueGateway):
             'lookback_days': lookback_days,
         }
 
+    def list_capital_flow_records(self, lookback_days: int = 365) -> list[dict]:
+        """Binance: ingest external deposits, external withdrawals, master→sub
+        transfer-in, sub→master transfer-out. ``external_id`` falls back to
+        a synthesized hash when the venue row lacks a stable id."""
+        rows: list[dict] = []
+        try:
+            for d in (self.deposit_history('USDT', lookback_days=lookback_days) or []):
+                ts = _ms_to_dt(d.get('insertTime') or d.get('updateTime') or d.get('time'))
+                amt = float(d.get('amount') or 0)
+                ext = str(d.get('txId') or d.get('id') or '') or _row_hash('binance', 'deposit', ts, amt)
+                rows.append({'ts': ts, 'amount': amt, 'kind': 'deposit', 'external_id': ext, 'note': 'Binance external deposit'})
+        except Exception:
+            pass
+        try:
+            for w in (self.withdrawal_history('USDT', lookback_days=lookback_days) or []):
+                ts = _ms_to_dt(w.get('applyTime') or w.get('completeTime') or w.get('time'))
+                amt = -abs(float(w.get('amount') or 0))
+                ext = str(w.get('id') or w.get('txId') or '') or _row_hash('binance', 'withdrawal', ts, amt)
+                rows.append({'ts': ts, 'amount': amt, 'kind': 'withdrawal', 'external_id': ext, 'note': 'Binance external withdrawal'})
+        except Exception:
+            pass
+        try:
+            for r in (self.sub_account_transfer_history('USDT', incoming=True, lookback_days=lookback_days) or []):
+                ts = _ms_to_dt(r.get('time') or r.get('tranId'))
+                amt = float(r.get('qty') or r.get('amount') or 0)
+                ext = str(r.get('tranId') or r.get('id') or '') or _row_hash('binance', 'sub_in', ts, amt)
+                rows.append({'ts': ts, 'amount': amt, 'kind': 'sub_in', 'external_id': ext, 'note': 'Master → sub transfer'})
+        except Exception:
+            pass
+        try:
+            for r in (self.sub_account_transfer_history('USDT', incoming=False, lookback_days=lookback_days) or []):
+                ts = _ms_to_dt(r.get('time') or r.get('tranId'))
+                amt = -abs(float(r.get('qty') or r.get('amount') or 0))
+                ext = str(r.get('tranId') or r.get('id') or '') or _row_hash('binance', 'sub_out', ts, amt)
+                rows.append({'ts': ts, 'amount': amt, 'kind': 'sub_out', 'external_id': ext, 'note': 'Sub → master transfer'})
+        except Exception:
+            pass
+        return [r for r in rows if r['ts'] is not None and abs(r['amount']) > 1e-9]
+
 
 # ─── KuCoin gateway ─────────────────────────────────────────────────────────
 # Implements the venue-specific overrides; everything else inherits from
@@ -827,53 +919,124 @@ class KuCoinGateway(VenueGateway):
         self.spot = ccxt.kucoin(common)
         self.futures = ccxt.kucoinfutures(common)
 
-    # KuCoin keeps spot cash split across two wallet types: ``trade`` (the
-    # "Trading Account" in the UI, used by spot orders) and ``main`` (the
-    # "Main / Funding Account", where deposits land before being moved to
-    # trade). ccxt's default ``fetch_balance()`` only returns ``trade``, so a
-    # user who parked 10 USDT in main would appear to have zero equity. We
-    # query both wallets and merge them so the gateway sees the full pool.
+    # ccxt's kucoinfutures.fetch_funding_rates() raises NotSupported, so the
+    # base-class scan would silently return zero candidates. KuCoin does
+    # surface ``fundingFeeRate`` + ``nextFundingRateTime`` on every active
+    # contract via ``/api/v1/contracts/active`` (which is what load_markets()
+    # already calls). We rebuild the ccxt-shaped funding-rate dict from the
+    # cached market info — no extra HTTP per scan.
+    def funding_rates_dict(self) -> dict:
+        if not self.futures.markets:
+            self.futures.load_markets()
+        out: dict = {}
+        for symbol, market in self.futures.markets.items():
+            if market.get('type') != 'swap' or market.get('quote') != 'USDT':
+                continue
+            info = market.get('info') or {}
+            fr = info.get('fundingFeeRate')
+            if fr is None:
+                continue
+            try:
+                fr_val = float(fr)
+            except (TypeError, ValueError):
+                continue
+            next_ms = info.get('nextFundingRateTime')  # ms-until-next on KuCoin
+            try:
+                next_ms = int(next_ms) if next_ms is not None else None
+            except (TypeError, ValueError):
+                next_ms = None
+            now_ms = int(time.time() * 1000)
+            next_ts = (now_ms + next_ms) if next_ms else None
+            # KuCoin lists per-contract funding interval implicitly via
+            # ``fundingRateSymbol`` (e.g. ".ETHUSDTMFPI8H"). Parse the trailing
+            # "<n>H" if present, otherwise default to 8h (KuCoin's standard).
+            interval_hours = 8.0
+            frs = info.get('fundingRateSymbol') or ''
+            if isinstance(frs, str) and frs.upper().endswith('H'):
+                head = frs.rstrip('Hh')
+                tail = ''
+                for ch in reversed(head):
+                    if ch.isdigit():
+                        tail = ch + tail
+                    else:
+                        break
+                if tail:
+                    try:
+                        interval_hours = float(tail)
+                    except ValueError:
+                        pass
+            out[symbol] = {
+                'fundingRate': fr_val,
+                'interval': f'{int(interval_hours)}h',
+                'fundingTimestamp': now_ms,
+                'nextFundingTimestamp': next_ts,
+            }
+        return out
+
+    # KuCoin separates cash across three wallet types:
+    #   * ``trade``    — Trading Account (UI label); spot orders execute here.
+    #   * ``main``     — Funding Account (UI label); deposits land here, and
+    #                    KuCoin's auto-lend / Pool-X pulls idle USDT from
+    #                    here. We treat this wallet as the "Earn" surface.
+    #   * ``contract`` — Futures wallet; perp orders consume margin here.
+    #
+    # ccxt's default ``fetch_balance()`` only returns ``trade``. To match
+    # the dashboard's three-bucket model (spot · earn · futures) we expose
+    # ``trade`` as ``bals['spot']`` and the contract balance as
+    # ``bals['futures']``. The funding-wallet balance is surfaced via
+    # :meth:`earn_balance_usdt` so the equity total = spot + earn + futures
+    # without double-counting.
     def safe_balances(self) -> dict | None:
         try:
             trade_bal = self.spot.fetch_balance({'type': 'trade'})
-            main_bal = self.spot.fetch_balance({'type': 'main'})
             futures_bal = self.futures.fetch_balance()
         except Exception as e:
             self.last_balance_error = str(e)
             return None
-        merged_spot = self._merge_balances(trade_bal, main_bal)
         self.last_balance_error = ''
-        return {'spot': merged_spot, 'futures': futures_bal}
+        return {'spot': trade_bal, 'futures': futures_bal}
 
-    @staticmethod
-    def _merge_balances(a: dict, b: dict) -> dict:
-        """Sum the per-asset ``free`` / ``used`` / ``total`` numbers from two
-        ccxt balance dicts (same shape ccxt returns for fetch_balance). Top-
-        level meta keys (``info``, ``timestamp``, ...) come from ``a``."""
-        META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
-        out: dict = {k: a.get(k) for k in ('info', 'timestamp', 'datetime')}
-        assets = {k for k in a.keys() if k not in META_KEYS}
-        assets |= {k for k in b.keys() if k not in META_KEYS}
-        for asset in assets:
-            ax = a.get(asset) or {}
-            bx = b.get(asset) or {}
-            if not isinstance(ax, dict): ax = {}
-            if not isinstance(bx, dict): bx = {}
-            free = float(ax.get('free') or 0) + float(bx.get('free') or 0)
-            used = float(ax.get('used') or 0) + float(bx.get('used') or 0)
-            total = float(ax.get('total') or 0) + float(bx.get('total') or 0)
-            out[asset] = {'free': free, 'used': used, 'total': total}
-        # Aggregate dicts ccxt also exposes:
-        for key in ('free', 'used', 'total'):
-            ax = a.get(key) or {}
-            bx = b.get(key) or {}
-            if not isinstance(ax, dict): ax = {}
-            if not isinstance(bx, dict): bx = {}
-            merged = {}
-            for asset in set(ax.keys()) | set(bx.keys()):
-                merged[asset] = float(ax.get(asset) or 0) + float(bx.get(asset) or 0)
-            out[key] = merged
-        return out
+    def _main_wallet_usdt(self) -> tuple[float | None, str]:
+        """Read the USDT balance of the ``main`` (Funding) wallet. Used by
+        :meth:`earn_balance_usdt` since KuCoin's auto-lend operates on
+        funding-wallet cash."""
+        try:
+            bal = self.spot.fetch_balance({'type': 'main'})
+        except Exception as e:
+            return None, str(e)
+        return float((bal.get('USDT') or {}).get('total') or 0), ''
+
+    # ─── Earn-equivalent on KuCoin: park idle cash in the funding wallet ──
+    # KuCoin doesn't expose a single "Simple Earn Flexible" endpoint that
+    # behaves like Binance's. The clean equivalent is to keep idle USDT in
+    # the ``main`` wallet so KuCoin's account-level auto-lend (the user
+    # toggles this in the KuCoin UI) collects interest on it. The bot
+    # therefore models earn_subscribe / earn_redeem as inner-transfers
+    # between trade ↔ main; the displayed "Earn balance" is the main
+    # wallet's USDT total. Cumulative yield is left at 0 because KuCoin
+    # credits lend interest into the same main wallet — there's no
+    # separate yield ledger to read without a per-day diff routine.
+    def earn_balance_usdt(self) -> tuple[float | None, str]:
+        return self._main_wallet_usdt()
+
+    def earn_balance(self, asset: str = 'USDT') -> tuple[float | None, str]:
+        if asset != 'USDT':
+            return 0.0, ''  # only USDT auto-lend is wired
+        return self._main_wallet_usdt()
+
+    def earn_subscribe(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        if paper_mode:
+            return True, 'paper'
+        if amount_usdt <= 0:
+            return True, 'noop'
+        return self._inner_transfer('trade', 'main', amount_usdt)
+
+    def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        if paper_mode:
+            return True, 'paper'
+        if amount_usdt <= 0:
+            return True, 'noop'
+        return self._inner_transfer('main', 'trade', amount_usdt)
 
     # ─── Spot ↔ futures transfer (KuCoin innerTransfer) ───────────────────
 
@@ -901,19 +1064,121 @@ class KuCoinGateway(VenueGateway):
                     return False, str(e)
         return False, 'KuCoin innerTransfer not available in this ccxt build'
 
+    # KuCoin's spot orders execute against the ``trade`` wallet (UI label
+    # "Trading Account"); ``main`` is the funding wallet (deposits land here).
+    # ``contract`` is the futures wallet. Spot↔futures transfers therefore
+    # move trade↔contract; idle cash is parked in main (so Pool-X / earn
+    # subscribe sees it). The bot calls ``stage_for_spot()`` before placing a
+    # spot order to guarantee the trade wallet is funded.
     def transfer_spot_to_futures(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
         if paper_mode:
             return True, 'paper'
         if amount_usdt <= 0:
             return True, 'noop'
-        return self._inner_transfer('main', 'contract', amount_usdt)
+        return self._inner_transfer('trade', 'contract', amount_usdt)
 
     def transfer_futures_to_spot(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
         if paper_mode:
             return True, 'paper'
         if amount_usdt <= 0:
             return True, 'noop'
-        return self._inner_transfer('contract', 'main', amount_usdt)
+        return self._inner_transfer('contract', 'trade', amount_usdt)
+
+    # ─── Capital-injection history (KuCoin) ───────────────────────────────
+    # KuCoin sub-accounts: master→sub transfers come in via the
+    # ``/api/v1/accounts/sub-transfer`` audit endpoint, and external
+    # deposits via ``fetch_deposits``. ccxt exposes both. We sum USDT
+    # inflows minus outflows over the lookback. Returns ``(None, meta)`` if
+    # no endpoint returned anything, so the caller falls back to manual
+    # CapitalFlow rows.
+    def net_injected_capital_usdt(self, lookback_days: int = 365) -> tuple[float | None, dict]:
+        since_ms = int((datetime.utcnow() - timedelta(days=lookback_days)).timestamp() * 1000)
+        deps: list[dict] = []
+        wdrs: list[dict] = []
+        sub_xfers: list[dict] = []
+        try:
+            deps = self.spot.fetch_deposits('USDT', since=since_ms) or []
+        except Exception:
+            pass
+        try:
+            wdrs = self.spot.fetch_withdrawals('USDT', since=since_ms) or []
+        except Exception:
+            pass
+        # Sub-account transfer history — endpoint name varies by ccxt vintage.
+        for name in (
+            'privateGetSubTransferRecord',
+            'private_get_sub_transfer_record',
+            'privateGetAccountsSubTransfer',
+        ):
+            fn = getattr(self.spot, name, None)
+            if callable(fn):
+                try:
+                    resp = fn({'currency': 'USDT', 'startAt': since_ms})
+                    sub_xfers = ((resp or {}).get('data') or {}).get('items') or []
+                except Exception:
+                    sub_xfers = []
+                break
+        deps_total = sum(float(d.get('amount') or 0) for d in deps)
+        wdrs_total = sum(float(w.get('amount') or 0) for w in wdrs)
+        # Sub-transfer rows carry direction='in'/'out' and amount.
+        sub_in_total = sum(float(r.get('amount') or 0) for r in sub_xfers if r.get('direction') == 'in')
+        sub_out_total = sum(float(r.get('amount') or 0) for r in sub_xfers if r.get('direction') == 'out')
+        if not deps and not wdrs and not sub_xfers:
+            return None, {'error': 'no KuCoin deposit/withdrawal/sub-transfer history (missing General permission, sub-account isolation, or no activity)'}
+        net = (deps_total + sub_in_total) - (wdrs_total + sub_out_total)
+        return net, {
+            'deposits_count': len(deps),
+            'deposits_total': deps_total,
+            'withdrawals_count': len(wdrs),
+            'withdrawals_total': wdrs_total,
+            'sub_in_count': sum(1 for r in sub_xfers if r.get('direction') == 'in'),
+            'sub_in_total': sub_in_total,
+            'sub_out_count': sum(1 for r in sub_xfers if r.get('direction') == 'out'),
+            'sub_out_total': sub_out_total,
+            'asset': 'USDT',
+            'lookback_days': lookback_days,
+        }
+
+    def list_capital_flow_records(self, lookback_days: int = 365) -> list[dict]:
+        since_ms = int((datetime.utcnow() - timedelta(days=lookback_days)).timestamp() * 1000)
+        rows: list[dict] = []
+        try:
+            for d in (self.spot.fetch_deposits('USDT', since=since_ms) or []):
+                ts = _ms_to_dt(d.get('timestamp'))
+                amt = float(d.get('amount') or 0)
+                ext = str(d.get('id') or d.get('txid') or '') or _row_hash('kucoin', 'deposit', ts, amt)
+                rows.append({'ts': ts, 'amount': amt, 'kind': 'deposit', 'external_id': ext, 'note': 'KuCoin external deposit'})
+        except Exception:
+            pass
+        try:
+            for w in (self.spot.fetch_withdrawals('USDT', since=since_ms) or []):
+                ts = _ms_to_dt(w.get('timestamp'))
+                amt = -abs(float(w.get('amount') or 0))
+                ext = str(w.get('id') or w.get('txid') or '') or _row_hash('kucoin', 'withdrawal', ts, amt)
+                rows.append({'ts': ts, 'amount': amt, 'kind': 'withdrawal', 'external_id': ext, 'note': 'KuCoin external withdrawal'})
+        except Exception:
+            pass
+        # Sub-account transfer audit (master ↔ sub). Only one ccxt entrypoint
+        # name is likely to exist, so probe and stop on first hit.
+        for name in ('privateGetSubTransferRecord', 'private_get_sub_transfer_record', 'privateGetAccountsSubTransfer'):
+            fn = getattr(self.spot, name, None)
+            if not callable(fn):
+                continue
+            try:
+                resp = fn({'currency': 'USDT', 'startAt': since_ms})
+                items = ((resp or {}).get('data') or {}).get('items') or []
+            except Exception:
+                items = []
+            for r in items:
+                direction = r.get('direction') or ''
+                ts = _ms_to_dt(r.get('createdAt') or r.get('time'))
+                amt_raw = float(r.get('amount') or 0)
+                if direction == 'in':
+                    rows.append({'ts': ts, 'amount': amt_raw, 'kind': 'sub_in', 'external_id': str(r.get('id') or _row_hash('kucoin', 'sub_in', ts, amt_raw)), 'note': 'Master → KuCoin sub transfer'})
+                elif direction == 'out':
+                    rows.append({'ts': ts, 'amount': -abs(amt_raw), 'kind': 'sub_out', 'external_id': str(r.get('id') or _row_hash('kucoin', 'sub_out', ts, -amt_raw)), 'note': 'KuCoin sub → master transfer'})
+            break
+        return [r for r in rows if r['ts'] is not None and abs(r['amount']) > 1e-9]
 
 
 # ─── Multi-venue factory ────────────────────────────────────────────────────

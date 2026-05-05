@@ -349,13 +349,36 @@ def xirr(flows: Iterable[tuple[datetime, float]], guess: float = 0.1, max_iter: 
 
 
 def portfolio_xirr(db, current_equity: float, mode: str | None = None, now: datetime | None = None) -> float | None:
+    """Annualised return across the capital-flow stream + present equity.
+
+    Deduplication: when a venue has both auto-ingested (API-derived) and
+    manual rows, the auto rows are authoritative — manual rows for that
+    venue are dropped to avoid double-counting the same deposit. Venues
+    without any auto rows fall through to their manual rows.
+
+    Returns ``None`` (rendered "—" in the UI) when XIRR is meaningless:
+    too few flows, mixed signs missing, or the holding period is shorter
+    than 7 days — the latter cap matters because annualising a tiny gain
+    over minutes produces astronomical numbers (the user reported a 30+
+    digit XIRR after a same-day deposit). Magnitudes >100 (±10000%) are
+    also clamped to ``None`` so the UI never renders junk."""
     now = now or datetime.utcnow()
     stmt = select(CapitalFlow)
     if mode is not None:
         stmt = stmt.where(CapitalFlow.mode == mode)
     flows = db.scalars(stmt).all()
-    cf: list[tuple[datetime, float]] = []
-    for f in flows:
-        cf.append((f.ts, -f.amount_usdt))
+    if not flows:
+        return None
+    venues_with_auto = {f.exchange for f in flows if f.detected_by == 'auto'}
+    flows = [f for f in flows if not (f.detected_by == 'manual' and f.exchange in venues_with_auto)]
+    if not flows:
+        return None
+    earliest = min(f.ts for f in flows)
+    if (now - earliest).total_seconds() < 7 * 86400:
+        return None
+    cf: list[tuple[datetime, float]] = [(f.ts, -f.amount_usdt) for f in flows]
     cf.append((now, current_equity))
-    return xirr(cf)
+    rate = xirr(cf)
+    if rate is None or abs(rate) > 100.0:
+        return None
+    return rate

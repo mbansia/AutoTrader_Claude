@@ -164,11 +164,22 @@ def _accrue_paper_funding(db, gateway, mode: str) -> None:
 def _refresh_live_earn_balance(gateway: VenueGateway, earn: EarnState) -> None:
     bal, err = gateway.earn_balance_usdt()
     if bal is not None:
-        # Compute realized yield since last refresh (deposits/redeems make this approximate
-        # but still useful as a directional indicator).
+        # Yield = balance increase between refreshes. Two cases we explicitly
+        # do NOT credit as yield:
+        #   1. Bootstrap — first refresh after a fresh install or a venue
+        #      that didn't have earn wired before. ``earn.deployed_usdt`` is
+        #      0 but the wallet may already hold cash (e.g. user deposited
+        #      to KuCoin's funding wallet directly). Crediting ``+bal`` as
+        #      yield would skew cumulative_yield by the deposit size.
+        #   2. Direct deposit into the funding wallet between refreshes —
+        #      detected as a delta larger than what plausibly compounds in
+        #      one cycle. We cap the credited delta at 1% of the prior
+        #      balance per cycle, which on a flexible product paying 5%
+        #      APR is ~50× the realistic per-cycle accrual.
         delta = bal - earn.deployed_usdt
-        if delta > 0:
-            earn.cumulative_yield_usdt += delta
+        if earn.deployed_usdt > 0 and delta > 0:
+            credit = min(delta, max(0.05, earn.deployed_usdt * 0.01))
+            earn.cumulative_yield_usdt += credit
         earn.deployed_usdt = bal
         earn.last_error = ''
     elif err:
@@ -627,6 +638,52 @@ def _compute_equity_and_free(db, gateway: VenueGateway, mode: str, cfg: Strategy
     return total_equity, min(spot_free, fut_free)
 
 
+def _ingest_api_capital_flows(db, gateway: VenueGateway, mode: str) -> int:
+    """Pull the venue's deposit / withdrawal / sub-transfer history and
+    persist any rows we haven't seen before as ``CapitalFlow`` records. The
+    natural key is ``(exchange, external_id)``; rows with that pair already
+    in the DB are skipped, so this is safe to run every cycle. Returns the
+    number of new rows inserted.
+
+    LIVE mode only. Paper mode treats CapitalFlow as user-managed virtual
+    flows. Each auto-ingested row carries ``detected_by='auto'`` so the UI
+    can mark it as venue-derived (vs. ``'manual'`` for user-entered rows)."""
+    if mode != MODE_LIVE:
+        return 0
+    try:
+        rows = gateway.list_capital_flow_records()
+    except Exception as e:
+        log_event(db, f'capital-flow ingest failed: {e}', mode=mode, level='WARN', exchange=gateway.venue_id)
+        return 0
+    if not rows:
+        return 0
+    seen_ids = {x for (x,) in db.execute(select(CapitalFlow.external_id).where(
+        CapitalFlow.exchange == gateway.venue_id,
+        CapitalFlow.external_id != '',
+    )).all()}
+    inserted = 0
+    for r in rows:
+        ext = r.get('external_id') or ''
+        if not ext or ext in seen_ids:
+            continue
+        db.add(CapitalFlow(
+            mode=mode,
+            exchange=gateway.venue_id,
+            ts=r['ts'],
+            amount_usdt=r['amount'],
+            kind=r.get('kind') or 'deposit',
+            detected_by='auto',
+            note=r.get('note') or '',
+            external_id=ext,
+        ))
+        seen_ids.add(ext)
+        inserted += 1
+    if inserted:
+        db.flush()
+        log_event(db, f'Ingested {inserted} capital-flow row(s) from venue API', mode=mode, exchange=gateway.venue_id)
+    return inserted
+
+
 def _take_balance_snapshot(db, gateway: VenueGateway, mode: str, cfg: StrategyConfig, earn: EarnState) -> BalanceSnapshot:
     # Both modes share the live/paper-aware equity calc which already includes
     # spot asset values for tracked positions in live mode.
@@ -1029,11 +1086,12 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         earn.last_error = err
                         log_event(db, f'Earn subscribe USDT failed (sweep={sweep:.4f}): {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
-            # End-of-cycle bookkeeping: snapshot the per-(mode, venue) balance
-            # and append an equity-curve point. Live capital flows come from
-            # gateway.net_injected_capital_usdt(); the CapitalFlow table is
-            # manual-only (we removed the buggy auto-detect heuristic that
-            # mistook funding payments for withdrawals).
+            # End-of-cycle bookkeeping: ingest any new venue-side capital
+            # flows (deposits, withdrawals, sub-transfers) so XIRR and the
+            # capital-flow timeline stay in sync with reality without manual
+            # entry; then snapshot the per-(mode, venue) balance and append
+            # an equity-curve point. Idempotent via ``CapitalFlow.external_id``.
+            _ingest_api_capital_flows(db, gateway, mode)
             snap = _take_balance_snapshot(db, gateway, mode, cfg, earn)
             db.add(EquityCurve(mode=mode, exchange=gateway.venue_id, equity_usdt=snap.total_usdt))
             db.commit()

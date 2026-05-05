@@ -48,41 +48,57 @@
   <div class="kpi">
     <div class="label">Current equity</div>
     <div class="value">{{ '%.2f' % current_equity }} <span class="muted" style="font-size:14px">USDT</span></div>
-    <div class="sub">{% for it in breakdown_items %}{% if it.value > 0 %}{{ it.label }} {{ '%.2f' % it.value }}{% if not loop.last %} · {% endif %}{% endif %}{% endfor %}</div>
+    <details class="kpi-details">
+      <summary>{{ breakdown_items|selectattr('value', '>', 0)|list|length }} bucket(s) — show breakdown</summary>
+      <ul class="kpi-breakdown">
+        {% for it in breakdown_items %}{% if it.value > 0 %}
+        <li><span class="muted">{{ it.label }}</span><span class="mono">{{ '%.2f' % it.value }}</span></li>
+        {% endif %}{% endfor %}
+      </ul>
+    </details>
   </div>
   <div class="kpi">
     <div class="label">Net injected capital (USDT)</div>
     <div class="value">{{ '%.2f' % net_capital }}</div>
     <div class="sub">
       {% if net_capital_meta and net_capital_meta.source == 'venues' %}
-        {% for venue_id, vmeta in net_capital_meta.venue_breakdown.items() %}
-          {% if vmeta.value is not none %}
-            <span class="tag" style="font-size:10px;">{{ venue_id }} {{ '%+.2f' % vmeta.value }} USDT</span>
-          {% else %}
-            <span class="tag warn" style="font-size:10px;">{{ venue_id }} (history not wired)</span>
-          {% endif %}
-        {% endfor %}
-        {% if net_capital_meta.manual_count %}
-          + {{ net_capital_meta.manual_count }} manual flow(s) {{ '%+.2f' % net_capital_meta.manual_total }} USDT
-        {% endif %}
+        <details class="kpi-details">
+          <summary>per-venue breakdown</summary>
+          <ul class="kpi-breakdown">
+            {% for venue_id, vmeta in net_capital_meta.venue_breakdown.items() %}
+              {% if vmeta.value is not none %}
+                <li><span class="muted">{{ venue_id }}</span><span class="mono">{{ '%+.2f' % vmeta.value }}</span></li>
+              {% else %}
+                <li><span class="muted">{{ venue_id }}</span><span class="bad" style="font-size:10px;">history n/a</span></li>
+              {% endif %}
+            {% endfor %}
+            {% if net_capital_meta.manual_count %}
+              <li><span class="muted">manual ({{ net_capital_meta.manual_count }})</span><span class="mono">{{ '%+.2f' % net_capital_meta.manual_total }}</span></li>
+            {% endif %}
+          </ul>
+        </details>
       {% else %}
-        {{ flow_count }} manual flow(s) — venue API history not yet visible
+        <span class="muted" style="font-size:11px;">{{ flow_count }} manual flow(s) · venue history not yet visible</span>
       {% endif %}
     </div>
   </div>
   <div class="kpi">
     <div class="label">Total PnL (USDT)</div>
     <div class="value {{ 'good' if total_pnl >= 0 else 'bad' }}">{{ '%+.2f' % total_pnl }}</div>
-    <div class="sub">
-      equity − net injected · breakdown:
-      trade {{ '%+.2f' % trade_pnl }} · funding {{ '%+.2f' % funding_income }}{% if view == 'live' %}*{% endif %} · MTM {{ '%+.2f' % unrealized_pnl }}
-      {% if view == 'live' %}<br><span class="muted" style="font-size:11px;">* live funding is inferred as residual since Binance auto-credits it into the futures wallet</span>{% endif %}
-    </div>
+    <details class="kpi-details">
+      <summary>equity − net injected · components</summary>
+      <ul class="kpi-breakdown">
+        <li><span class="muted">trade</span><span class="mono">{{ '%+.2f' % trade_pnl }}</span></li>
+        <li><span class="muted">funding{% if view == 'live' %}*{% endif %}</span><span class="mono">{{ '%+.2f' % funding_income }}</span></li>
+        <li><span class="muted">MTM unrealized</span><span class="mono">{{ '%+.2f' % unrealized_pnl }}</span></li>
+        {% if view == 'live' %}<li class="muted" style="font-size:10px;">* funding inferred as residual (Binance auto-credits into futures wallet)</li>{% endif %}
+      </ul>
+    </details>
   </div>
   <div class="kpi">
     <div class="label">XIRR (compounded)</div>
-    <div class="value {{ 'good' if (xirr_value or 0) >= 0 else 'bad' }}">{{ '%.2f%%' % (xirr_value * 100) if xirr_value is not none else '—' }}</div>
-    <div class="sub">over {{ flow_count }} flow(s)</div>
+    <div class="value {{ 'good' if (xirr_value or 0) >= 0 else 'bad' }}">{% if xirr_value is not none %}{{ '%+.2f%%' % (xirr_value * 100) }}{% else %}—{% endif %}</div>
+    <div class="sub">{% if xirr_value is not none %}over {{ flow_count }} flow(s){% else %}needs ≥7d & ≥1 flow{% endif %}</div>
   </div>
   <div class="kpi">
     <div class="label">Open positions</div>
@@ -93,9 +109,27 @@
   <div class="kpi">
     <div class="label">In Earn (USDT)</div>
     <div class="value">{{ '%.2f' % earn.deployed }}</div>
-    <div class="sub">cumulative yield {{ '%+.4f' % earn.cumulative_yield }} USDT{% if earn.last_error %} · <span class="bad">{{ earn.last_error|truncate(40) }}</span>{% endif %}</div>
+    <div class="sub">yield {{ '%+.4f' % earn.cumulative_yield }} USDT{% if earn.last_error %} · <span class="bad" title="{{ earn.last_error }}">{{ earn.last_error|truncate(28) }}</span>{% endif %}</div>
   </div>
   {% endif %}
+  {# Idle ratio: how much of total equity is currently parked in earn vs deployed in trades #}
+  {% set idle_pct = (earn.deployed / current_equity * 100) if current_equity > 0 else 0 %}
+  <div class="kpi">
+    <div class="label">Earn coverage</div>
+    <div class="value {{ 'good' if idle_pct > 50 else ('warn' if idle_pct > 20 else '') }}">{{ '%.0f%%' % idle_pct }}</div>
+    <div class="sub">{{ '%.2f' % earn.deployed }} of {{ '%.2f' % current_equity }} USDT idle in earn</div>
+  </div>
+  {# Free deployable: cash currently sitting in spot/futures wallets, ready for a trade #}
+  {% if view == 'live' and live_spot_free is not none %}
+    {% set free_deployable = live_spot_free + live_fut_free %}
+  {% else %}
+    {% set free_deployable = (current_equity - earn.deployed) %}
+  {% endif %}
+  <div class="kpi">
+    <div class="label">Free deployable</div>
+    <div class="value">{{ '%.2f' % free_deployable }} <span class="muted" style="font-size:14px">USDT</span></div>
+    <div class="sub">{% if view == 'live' and live_spot_free is not none %}spot {{ '%.2f' % live_spot_free }} · fut {{ '%.2f' % live_fut_free }}{% else %}equity − earn{% endif %}</div>
+  </div>
 </div>
 
 {# ========== EQUITY COMPOSITION + CURVE ========== #}

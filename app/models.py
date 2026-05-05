@@ -227,6 +227,10 @@ class CapitalFlow(Base):
     kind: Mapped[str] = mapped_column(String(16), default='deposit')
     detected_by: Mapped[str] = mapped_column(String(16), default='auto')
     note: Mapped[str] = mapped_column(Text, default='')
+    # Stable per-venue id for the underlying transaction. Set for rows
+    # ingested from venue APIs so re-running the ingest is idempotent;
+    # blank for manual rows (which have no venue-side identifier).
+    external_id: Mapped[str] = mapped_column(String(128), default='', index=True)
 
 
 class ScanResult(Base):
