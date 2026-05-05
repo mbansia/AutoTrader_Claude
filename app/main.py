@@ -256,7 +256,9 @@ def _unrealized_for_open(db, gateways, mode: str) -> float:
 
 
 def _shared_ctx(request, view: str, db) -> dict:
-    """Context every page needs: view, both mode states (for sidebar tabs), worker alive."""
+    """Context every page needs: view, both mode states (for sidebar tabs),
+    worker alive, configured venue list (used by base.html sidebar /
+    LIVE banner so neither hard-codes "Binance")."""
     paper_state = get_mode_state(db, MODE_PAPER)
     live_state = get_mode_state(db, MODE_LIVE)
     return {
@@ -265,6 +267,7 @@ def _shared_ctx(request, view: str, db) -> dict:
         'paper_state': paper_state,
         'live_state': live_state,
         'worker_alive': _worker_alive(),
+        'configured_venues': [g.name for g in make_gateways()],
     }
 
 
@@ -670,7 +673,11 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             'last_cycle_age': last_cycle_age,
             'rows': rows,
             'closed': closed,
-            'flows': [{'id': f.id, 'ts': _fmt_ts(f.ts), 'amount_usdt': f.amount_usdt, 'kind': f.kind, 'detected_by': f.detected_by, 'note': f.note} for f in flows],
+            'flows': [{
+                'id': f.id, 'ts': _fmt_ts(f.ts), 'venue': f.exchange,
+                'amount_usdt': f.amount_usdt, 'kind': f.kind,
+                'detected_by': f.detected_by, 'note': f.note,
+            } for f in flows],
         })
     response = templates.TemplateResponse(request, 'dashboard.html', ctx)
     response.set_cookie('view', v, max_age=60 * 60 * 24 * 365, httponly=False)
@@ -690,17 +697,29 @@ def portfolio_page_redirect(_: None = Depends(auth)):
 
 
 @app.post('/capital-flow')
-def add_capital_flow(ts: str = Form(...), amount: float = Form(...), note: str = Form(''), view_cookie: str | None = Cookie(default=None, alias='view'), _: None = Depends(auth)):
+def add_capital_flow(
+    ts: str = Form(...),
+    amount: float = Form(...),
+    venue: str = Form('binance'),
+    note: str = Form(''),
+    view_cookie: str | None = Cookie(default=None, alias='view'),
+    _: None = Depends(auth),
+):
     v = _resolve_view(None, view_cookie)
     try:
         ts_dt = datetime.fromisoformat(ts)
     except ValueError:
         raise HTTPException(status_code=400, detail='invalid date')
+    venue = venue.lower().strip() or 'binance'
     with SessionLocal() as db:
-        cf = CapitalFlow(mode=v, ts=ts_dt, amount_usdt=amount, kind='deposit' if amount > 0 else 'withdrawal', detected_by='manual', note=note)
+        cf = CapitalFlow(
+            mode=v, exchange=venue, ts=ts_dt, amount_usdt=amount,
+            kind='deposit' if amount > 0 else 'withdrawal',
+            detected_by='manual', note=note,
+        )
         db.add(cf)
         db.commit()
-    return RedirectResponse(url='/portfolio', status_code=303)
+    return RedirectResponse(url='/dashboard', status_code=303)
 
 
 @app.post('/capital-flow/delete')
@@ -799,8 +818,9 @@ def transactions_page(request: Request, view: str | None = None, limit: int = 10
         # Capital flows.
         flow_rows = db.scalars(select(CapitalFlow).where(CapitalFlow.mode == v).order_by(desc(CapitalFlow.id)).limit(limit)).all()
         flows_v = [{
-            'id': f.id, 'ts': _fmt_ts(f.ts), 'amount_usdt': f.amount_usdt,
-            'kind': f.kind, 'detected_by': f.detected_by, 'note': f.note,
+            'id': f.id, 'ts': _fmt_ts(f.ts), 'venue': f.exchange,
+            'amount_usdt': f.amount_usdt, 'kind': f.kind,
+            'detected_by': f.detected_by, 'note': f.note,
         } for f in flow_rows]
 
         ctx.update({'positions': positions_v, 'trades': trades_v, 'transfers': transfers_v, 'flows': flows_v, 'limit': limit})

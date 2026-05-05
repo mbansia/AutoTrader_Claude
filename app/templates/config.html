@@ -82,19 +82,19 @@
           <option value="1" {{ 'selected' if cfg.earn_enabled }}>yes</option>
           <option value="0" {{ 'selected' if not cfg.earn_enabled }}>no</option>
         </select>
-        <span class="hint">when on, idle USDT is swept into Binance Simple Earn (Flexible USDT) after each cycle. The bot redeems automatically before opening a position. Live mode requires API key Earn permission.</span></div>
+        <span class="hint">when on, idle USDT is swept into the venue's Earn product (Binance Simple Earn today; KuCoin Pool-X is deferred so it's a no-op there) after each cycle. The bot redeems automatically before opening a position. Live mode requires API key Earn permission on the venue.</span></div>
       <div class="form-row"><label>Idle threshold (USDT)</label>
         <input type="number" step="0.1" name="earn_idle_threshold_usdt" value="{{ cfg.earn_idle_threshold_usdt }}">
         <span class="hint">only sweep when idle USDT exceeds this floor. Avoids sweeping dust.</span></div>
       <div class="form-row"><label>Paper APR (decimal)</label>
         <input type="number" step="0.001" name="earn_paper_apr" value="{{ '%.4f' % cfg.earn_paper_apr }}">
-        <span class="hint">simulated yield rate for paper mode. 0.05 = 5% APR. Live mode reads the real Binance balance instead.</span></div>
+        <span class="hint">simulated yield rate for paper mode. 0.05 = 5% APR. Live mode reads the real Earn balance from the configured venue.</span></div>
       <div class="form-row"><label>Subscribe spot leg to Earn</label>
         <select name="earn_subscribe_spot_assets">
           <option value="1" {{ 'selected' if cfg.earn_subscribe_spot_assets }}>yes</option>
           <option value="0" {{ 'selected' if not cfg.earn_subscribe_spot_assets }}>no</option>
         </select>
-        <span class="hint">Opt-in. After buying SOL/ETH/etc. on the spot leg, also subscribes that asset to Binance Simple Earn Flexible (immediately redeemable). Auto-redeems before close. Skips silently if no flexible product exists for the asset.</span></div>
+        <span class="hint">Opt-in. On Binance, subscribes the base asset (SOL, ETH…) to Simple Earn Flexible after the spot buy (immediately redeemable). Auto-redeems before close. KuCoin: no-op until Pool-X is wired. Skips silently if no flexible product exists for the asset.</span></div>
     </div>
   </div>
 </div>
@@ -127,7 +127,7 @@
         <span class="hint">defer voluntary exits (funding decay, max hold) until basis ≤ this. Stop-loss, naked-leg and delisting bypass this gate.</span></div>
       <div class="form-row"><label>Hedge check each loop</label>
         <select name="enforce_hedge_check"><option value="1" {{ 'selected' if cfg.enforce_hedge_check }}>yes</option><option value="0" {{ 'selected' if not cfg.enforce_hedge_check }}>no</option></select>
-        <span class="hint">verify both legs exist on Binance every cycle; flatten any naked leg immediately. Live mode only.</span></div>
+        <span class="hint">verify both legs exist on the position's venue every cycle; flatten any naked leg immediately. Live mode only.</span></div>
       <div class="form-row"><label>Delisting / market-status check</label>
         <select name="delisting_check"><option value="1" {{ 'selected' if cfg.delisting_check }}>yes</option><option value="0" {{ 'selected' if not cfg.delisting_check }}>no</option></select>
         <span class="hint">force close if either leg's market is no longer in TRADING status (delisting, halt, settlement).</span></div>

@@ -85,11 +85,17 @@ def position_unrealized_pnl(position: Position, spot_now: float, perp_now: float
     return spot_leg + perp_leg
 
 
-def total_realized_pnl(db, mode: str | None = None) -> float:
-    """Closed-position trade PnL only. Does not include funding income — see total_funding_income."""
+def total_realized_pnl(db, mode: str | None = None, exchange: str | None = None) -> float:
+    """Closed-position trade PnL only. Does not include funding income — see total_funding_income.
+
+    ``exchange`` (optional) scopes the sum to a single venue. Used by the
+    per-venue cycle's equity calc; the dashboard's headline PnL leaves it
+    ``None`` to sum across all venues."""
     stmt = select(Position).where(Position.status == 'closed')
     if mode is not None:
         stmt = stmt.where(Position.mode == mode)
+    if exchange is not None:
+        stmt = stmt.where(Position.exchange == exchange)
     closed = db.scalars(stmt).all()
     return sum(position_realized_pnl(db, p) for p in closed)
 
@@ -111,15 +117,18 @@ def effective_position_apy(funding_apy: float, leverage: int = 1) -> float:
     return funding_apy * (leverage / (leverage + 1.0))
 
 
-def total_funding_income(db, mode: str | None = None, status: str | None = None) -> float:
+def total_funding_income(db, mode: str | None = None, status: str | None = None, exchange: str | None = None) -> float:
     """Sum of funding payments (accrued in paper, would-be auto-credited in live).
-    Pass status='open' or 'closed' to scope; default is all."""
+    Pass status='open' or 'closed' to scope; default is all. ``exchange`` scopes
+    to a single venue."""
     from sqlalchemy import func as _func
     stmt = select(_func.coalesce(_func.sum(Position.funding_income_accrued), 0.0))
     if mode is not None:
         stmt = stmt.where(Position.mode == mode)
     if status is not None:
         stmt = stmt.where(Position.status == status)
+    if exchange is not None:
+        stmt = stmt.where(Position.exchange == exchange)
     return float(db.scalar(stmt) or 0.0)
 
 

@@ -6,10 +6,15 @@
 </div>
 
 <div class="card">
-  <h3>Binance API key — outbound IP</h3>
+  <h3>API key whitelisting — outbound IP</h3>
   <div class="body">
     {% if outbound_ip %}
-      <p class="muted" style="margin:0 0 10px;">Paste this into Binance → API Management → your key → "Edit restrictions" → trusted-IP list. The bot resolves this through a public lookup service and caches it for an hour.</p>
+      <p class="muted" style="margin:0 0 10px;">Each venue's sub-account API key needs this IP whitelisted so the bot can authenticate. Paste it into:</p>
+      <ul class="muted" style="margin:0 0 10px 20px;font-size:13px;line-height:1.7;">
+        <li><strong>Binance</strong> → API Management → your key → "Edit restrictions" → trusted-IP list</li>
+        <li><strong>KuCoin</strong> → API Management → your key → IP Restriction</li>
+        <li><strong>Interactive Brokers</strong> (future) → IP whitelist on the gateway/TWS connection</li>
+      </ul>
       <div class="row-flex" style="gap:10px;">
         <code id="outbound-ip" class="mono" style="background:var(--panel-2);padding:8px 14px;border-radius:6px;font-size:15px;border:1px solid var(--border-strong);">{{ outbound_ip }}</code>
         <button type="button" class="btn" onclick="navigator.clipboard.writeText('{{ outbound_ip }}'); this.textContent='Copied'; setTimeout(()=>{this.textContent='Copy'}, 1200);">Copy</button>
@@ -18,6 +23,7 @@
           <button type="submit" class="btn">Refresh</button>
         </form>
       </div>
+      <p class="muted" style="font-size:12px;margin-top:8px;">Resolved via public IP lookup (ipify) and cached for an hour.</p>
     {% else %}
       <div class="alert alert-error">
         Couldn't determine outbound IP{% if outbound_ip_error %}: <span class="mono">{{ outbound_ip_error|truncate(120) }}</span>{% endif %}.
@@ -65,20 +71,20 @@
       <tr><th>Max trades per day</th><td class="num">{{ cfg.max_trades_per_day }}</td><td>Hard cap on trade rows recorded per UTC day.</td></tr>
       <tr><th>Min position size</th><td class="num">{{ '%.2f%%' % (cfg.min_position_pct * 100) }} of equity</td><td>Skip candidates whose available size is below this fraction of total portfolio.</td></tr>
       <tr><th>Max position size</th><td class="num">{{ '%.2f%%' % (cfg.max_position_pct * 100) }} of equity</td><td>Cap any single open position at this fraction of total portfolio.</td></tr>
-      <tr><th>Earn sweep</th><td><span class="tag {{ 'good' if cfg.earn_enabled else 'warn' }}">{{ 'enabled' if cfg.earn_enabled else 'OFF' }}</span></td><td>{% if cfg.earn_enabled %}Idle USDT &gt; {{ '%.2f' % cfg.earn_idle_threshold_usdt }} swept into Binance Simple Earn each cycle; redeemed before entries. Paper APR {{ '%.2f%%' % (cfg.earn_paper_apr * 100) }}.{% else %}Disabled — idle USDT stays in spot wallet.{% endif %}</td></tr>
-      <tr><th>Wallet auto-transfer</th><td><span class="tag {{ 'good' if cfg.auto_transfer_enabled else 'warn' }}">{{ 'enabled' if cfg.auto_transfer_enabled else 'OFF' }}</span></td><td>{% if cfg.auto_transfer_enabled %}Continuously rebalances spot.free ≈ fut.free each cycle (threshold {{ '%.2f' % cfg.auto_rebalance_threshold }} USDT). Before opening, tops up the short side from Earn or the surplus wallet. After all positions close, drains futures→spot. Live mode only.{% else %}Disabled — you must manually transfer USDT spot↔futures via the Binance app.{% endif %}</td></tr>
-      <tr><th>Perp margin mode</th><td><span class="tag good">CROSS · {{ cfg.perp_leverage }}x</span></td><td>Bot calls Binance's set-margin-mode and set-leverage on every perp before opening. CROSS shares margin across positions (no single-leg liquidation); 1x keeps the perp's used margin equal to its notional, matching the spot leg.</td></tr>
-      <tr><th>Spot-leg Earn</th><td><span class="tag {{ 'good' if cfg.earn_subscribe_spot_assets else 'warn' }}">{{ 'enabled' if cfg.earn_subscribe_spot_assets else 'OFF' }}</span></td><td>{% if cfg.earn_subscribe_spot_assets %}Subscribes the base asset (SOL, ETH, MAV…) to Binance Simple Earn Flexible after spot buy; auto-redeems before any close. Earns yield on the spot leg too instead of leaving it idle.{% else %}Disabled — spot leg sits in the wallet earning nothing.{% endif %}</td></tr>
+      <tr><th>Earn sweep</th><td><span class="tag {{ 'good' if cfg.earn_enabled else 'warn' }}">{{ 'enabled' if cfg.earn_enabled else 'OFF' }}</span></td><td>{% if cfg.earn_enabled %}Idle USDT &gt; {{ '%.2f' % cfg.earn_idle_threshold_usdt }} swept into the venue's Earn product each cycle (Binance Simple Earn today; KuCoin Pool-X is deferred and is a no-op there); redeemed before entries. Paper APR {{ '%.2f%%' % (cfg.earn_paper_apr * 100) }}.{% else %}Disabled — idle USDT stays in spot wallet.{% endif %}</td></tr>
+      <tr><th>Wallet auto-transfer</th><td><span class="tag {{ 'good' if cfg.auto_transfer_enabled else 'warn' }}">{{ 'enabled' if cfg.auto_transfer_enabled else 'OFF' }}</span></td><td>{% if cfg.auto_transfer_enabled %}Continuously rebalances spot.free ≈ fut.free per venue each cycle (threshold {{ '%.2f' % cfg.auto_rebalance_threshold }} USDT). Before opening, tops up the short side from Earn or the surplus wallet. After all positions close, drains futures→spot. Cross-venue rebalancing is Phase 2.{% else %}Disabled — you must manually transfer USDT spot↔futures on each venue.{% endif %}</td></tr>
+      <tr><th>Perp margin mode</th><td><span class="tag good">CROSS · {{ cfg.perp_leverage }}x</span></td><td>Bot calls each venue's set-margin-mode and set-leverage on every perp before opening. CROSS shares margin across positions (no single-leg liquidation); 1x keeps the perp's used margin equal to its notional, matching the spot leg.</td></tr>
+      <tr><th>Spot-leg Earn</th><td><span class="tag {{ 'good' if cfg.earn_subscribe_spot_assets else 'warn' }}">{{ 'enabled' if cfg.earn_subscribe_spot_assets else 'OFF' }}</span></td><td>{% if cfg.earn_subscribe_spot_assets %}On Binance, subscribes the base asset (SOL, ETH…) to Simple Earn Flexible after spot buy; auto-redeems before any close. KuCoin: no-op until Pool-X is wired.{% else %}Disabled — spot leg sits in the wallet earning nothing.{% endif %}</td></tr>
       <tr><th>Min 24h quote volume</th><td class="num">{{ '{:,.0f}'.format(cfg.min_24h_quote_volume) }} USDT</td><td>Liquidity filter on spot leg.</td></tr>
       <tr><th>Min order-book depth</th><td class="num">{{ '${:,.0f}'.format(cfg.min_order_book_depth_usdt) }} @ ±{{ '%.0f' % cfg.depth_band_bps }}bps</td><td>Reject if min(spot ask depth, perp bid depth) within the band is below this — protects against thin books that would cause large slippage on entry.</td></tr>
       <tr><th>Allocation tiebreak</th><td>combined APY desc, then depth</td><td>When multiple candidates pass all filters, the bot picks the highest "funding APY + spot Earn APR" first; ties go to the deeper book. Diversity rule skips any candidate whose base asset is already held open.</td></tr>
       <tr><th>Max entry basis</th><td class="num">±{{ '%.1f' % cfg.max_entry_basis_bps }} bps</td><td>Refuse to open when |perp − spot| / spot exceeds this — protects against entering during a dislocation.</td></tr>
       <tr><th>Max exit basis</th><td class="num">{{ '%.1f' % cfg.max_exit_basis_bps }} bps</td><td>Defer voluntary exits (funding decay, max hold) until basis is favorable. Stop-loss, naked-leg, delisting and maintenance bypass this gate.</td></tr>
-      <tr><th>Hedge integrity check</th><td><span class="tag {{ 'good' if cfg.enforce_hedge_check else 'warn' }}">{{ 'every loop' if cfg.enforce_hedge_check else 'OFF' }}</span></td><td>Verify both spot and perp legs exist on Binance with the expected size; flatten any naked leg automatically.</td></tr>
+      <tr><th>Hedge integrity check</th><td><span class="tag {{ 'good' if cfg.enforce_hedge_check else 'warn' }}">{{ 'every loop' if cfg.enforce_hedge_check else 'OFF' }}</span></td><td>Verify both spot and perp legs exist on the position's venue with the expected size; flatten any naked leg automatically.</td></tr>
       <tr><th>Market-status check</th><td><span class="tag {{ 'good' if cfg.delisting_check else 'warn' }}">{{ 'every loop' if cfg.delisting_check else 'OFF' }}</span></td><td>Force-close if either leg's market is not in <span class="mono">TRADING</span> status (delisting, halt, settlement).</td></tr>
       <tr><th>Loop interval</th><td class="num">{{ cfg.loop_seconds }}s</td><td>Frequency of scan / exit / safety / snapshot cycle.</td></tr>
       <tr><th>LIVE mode confirmation</th><td>required word: <span class="mono">LIVE</span></td><td>Switching out of paper requires typing the word LIVE.</td></tr>
-      <tr><th>Position reconciliation</th><td>on startup</td><td>Untracked perp positions detected on Binance are rehydrated.</td></tr>
+      <tr><th>Position reconciliation</th><td>on startup + every cycle</td><td>Untracked perp positions detected on any venue are rehydrated. Positions that show flat on the exchange but open in DB are auto-closed.</td></tr>
     </tbody>
   </table>
 </div>

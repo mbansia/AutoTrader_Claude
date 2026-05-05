@@ -31,7 +31,7 @@
 <div class="alert alert-error">
   <strong>Close blocked on {{ stuck_positions|length }} position(s):</strong>
   {% for sp in stuck_positions %}<span class="mono">{{ sp.symbol }}</span> — {{ sp.err|truncate(120) }}{% if not loop.last %}; {% endif %}{% endfor %}
-  <span class="muted" style="display:block;margin-top:4px;">The bot is retrying every cycle. To unstick: top up futures wallet on Binance (~$2 USDT usually enough), or close manually from the Binance app and let reconcile catch up next cycle.</span>
+  <span class="muted" style="display:block;margin-top:4px;">The bot is retrying every cycle. To unstick: top up the futures wallet on the relevant venue (~$2 USDT usually enough), or close manually on that venue and let reconcile catch up next cycle.</span>
 </div>
 {% endif %}
 
@@ -377,16 +377,24 @@
     <form action="/capital-flow" method="post" class="row-flex" style="margin-bottom:14px;">
       <div class="form-row" style="min-width:140px;"><label>Date (UTC)</label><input type="datetime-local" name="ts" required></div>
       <div class="form-row" style="min-width:140px;"><label>Amount (USDT)</label><input type="number" step="0.01" name="amount" required placeholder="positive=deposit"></div>
+      <div class="form-row" style="min-width:120px;"><label>Venue</label>
+        <select name="venue">
+          {% for v in (configured_venues or ['Binance']) %}
+          <option value="{{ v.lower() }}">{{ v }}</option>
+          {% endfor %}
+        </select>
+      </div>
       <div class="form-row" style="min-width:200px;"><label>Note</label><input name="note" placeholder="optional"></div>
       <button type="submit" class="btn btn-primary">Add manual flow</button>
     </form>
     {% if flows %}
     <table>
-      <thead><tr><th>Date</th><th class="num">Amount (USDT)</th><th>Kind</th><th>Detected</th><th>Note</th><th></th></tr></thead>
+      <thead><tr><th>Date</th><th>Venue</th><th class="num">Amount (USDT)</th><th>Kind</th><th>Detected</th><th>Note</th><th></th></tr></thead>
       <tbody>
       {% for f in flows %}
         <tr>
           <td class="muted">{{ f.ts }}</td>
+          <td><span class="tag">{{ f.venue }}</span></td>
           <td class="num {{ 'good' if f.amount_usdt > 0 else 'bad' }}">{{ '%+.2f' % f.amount_usdt }}</td>
           <td><span class="tag">{{ f.kind }}</span></td>
           <td><span class="tag {{ 'warn' if f.detected_by == 'auto' else 'good' }}">{{ f.detected_by }}</span></td>
@@ -402,7 +410,7 @@
       </tbody>
     </table>
     {% else %}
-    <div class="empty">No manual capital flows recorded. Live mode reads net injected from Binance directly; this section is for paper or for manually overriding.</div>
+    <div class="empty">No manual capital flows recorded. Live mode reads net-injected capital per venue from each exchange's API; this section is for paper, manual overrides, or venues whose history isn't yet wired (e.g. KuCoin).</div>
     {% endif %}
   </div>
 </div>

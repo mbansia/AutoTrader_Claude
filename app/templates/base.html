@@ -26,7 +26,7 @@
 <div class="app">
   <aside class="sidebar">
     <h1>Funding Arb</h1>
-    <div class="subtitle">Binance · Spot/Perp</div>
+    <div class="subtitle">{% if configured_venues %}{{ configured_venues|join(' · ') }}{% else %}No venue configured{% endif %}</div>
     <div class="view-tabs">
       <form action="/view/paper" method="post">
         <button type="submit" class="view-tab {{ 'active' if view == 'paper' }}">PAPER</button>
@@ -63,7 +63,7 @@
         {% if view == 'paper' %}
           synthetic fills with modeled slippage and fees. No real funds at risk.
         {% else %}
-          real money on Binance. Every entry, exit and balance is live.
+          real money on {% if configured_venues %}{{ configured_venues|join(' + ') }}{% else %}configured venues{% endif %}. Every entry, exit and balance is live.
         {% endif %}
       </span>
       <form action="/mode/{{ view }}/stop" method="post">

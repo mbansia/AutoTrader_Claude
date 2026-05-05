@@ -556,13 +556,27 @@ def reconcile_positions(gateway: VenueGateway) -> None:
 
 
 def _compute_equity_and_free(db, gateway: VenueGateway, mode: str, cfg: StrategyConfig, earn: EarnState) -> tuple[float, float]:
-    """Total portfolio equity in USDT and the amount currently free for opening a position.
-    For paper, free = total − earn_deployed − sum(open spot notionals). For live, free is the
-    smaller of spot.free and futures.free since both legs of an arb need margin; earn money
-    sits in a separate Binance wallet so it's already excluded from spot.free."""
+    """Total portfolio equity in USDT and the amount currently free for opening
+    a position **on this venue**.
+
+    Per-venue scoping: every query filters by ``Position.exchange == gateway.venue_id``
+    so two venues sharing the same StrategyConfig can size positions correctly
+    against their own capital. Cross-venue capital movement is Phase 2.
+
+    Paper mode:  total = paper_starting_equity + manual_flows + realized + unrealized
+                       + open_funding + closed_funding + earn_yield
+                 free  = total − earn_deployed − open_notional − unrealized
+    Live mode:   total = spot.USDT + fut.USDT + Σ (non-USDT spot assets × ticker)
+                       + venue's Earn balance
+                 free  = min(spot.free, fut.free)   (both legs need margin)
+    """
     if mode == MODE_PAPER:
         realized = total_realized_pnl(db, mode=mode, exchange=gateway.venue_id)
-        open_ps = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)).all()
+        open_ps = db.scalars(select(Position).where(
+            Position.status == 'open',
+            Position.mode == mode,
+            Position.exchange == gateway.venue_id,
+        )).all()
         unrealized = 0.0
         open_notional = 0.0
         open_funding = 0.0
@@ -572,15 +586,21 @@ def _compute_equity_and_free(db, gateway: VenueGateway, mode: str, cfg: Strategy
             unrealized += position_unrealized_pnl(p, spot_now, perp_now)
             open_notional += p.quantity * p.spot_entry_price
             open_funding += p.funding_income_accrued
-        # Funding on already-closed positions is part of total_realized_pnl (added below);
-        # open positions' accrued funding is tracked separately so it can be treated as
-        # liquid cash for the free-balance calc — this is what makes "auto-reinvest" work.
-        closed_funding = db.scalar(select(func.coalesce(func.sum(Position.funding_income_accrued), 0.0)).where(Position.status == 'closed', Position.mode == mode, Position.exchange == gateway.venue_id)) or 0.0
-        capital_in = db.scalar(select(func.coalesce(func.sum(CapitalFlow.amount_usdt), 0.0)).where(CapitalFlow.mode == mode)) or 0.0
+        # Funding on already-closed positions is part of total_realized_pnl (added
+        # below); open positions' accrued funding is tracked separately so it can
+        # be treated as liquid cash for the free-balance calc — this is what
+        # makes "auto-reinvest" work.
+        closed_funding = total_funding_income(db, mode=mode, status='closed', exchange=gateway.venue_id)
+        # Manual capital flows are scoped per-venue (default 'binance' on legacy rows).
+        capital_in = db.scalar(select(func.coalesce(func.sum(CapitalFlow.amount_usdt), 0.0)).where(
+            CapitalFlow.mode == mode,
+            CapitalFlow.exchange == gateway.venue_id,
+        )) or 0.0
         total_equity = (cfg.paper_starting_equity + capital_in + realized + unrealized
                         + open_funding + closed_funding + earn.cumulative_yield_usdt)
         free = max(0.0, total_equity - earn.deployed_usdt - open_notional - unrealized)
         return total_equity, free
+    # Live mode — every value comes from the venue's own balances API.
     bals = gateway.safe_balances()
     if bals is None:
         return 0.0, 0.0
@@ -588,11 +608,10 @@ def _compute_equity_and_free(db, gateway: VenueGateway, mode: str, cfg: Strategy
     fut_total = float((bals['futures'].get('USDT') or {}).get('total') or 0)
     spot_free = float((bals['spot'].get('USDT') or {}).get('free') or 0)
     fut_free = float((bals['futures'].get('USDT') or {}).get('free') or 0)
-    # IMPORTANT: spot.USDT.total only counts USDT — the base assets the bot
-    # bought on the spot leg (SOL, ETH, etc.) live in their own balance
-    # entries. Without adding them back as USDT-equivalent, equity appears
-    # to drop by the full position notional every time we open a trade.
-    # Walk every non-USDT spot balance and price it via the spot ticker.
+    # IMPORTANT: spot.USDT.total only counts USDT — base assets the bot bought
+    # on the spot leg (SOL, ETH, etc.) live in their own balance entries.
+    # Without adding them back at USDT-equivalent, equity appears to drop by
+    # the full position notional every time we open a trade.
     spot_assets_value = 0.0
     spot_balances = bals.get('spot', {}) or {}
     META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
