@@ -173,17 +173,16 @@ def equity_breakdown(db, gateways, mode: str, earn_deployed: float) -> list[dict
                     continue
                 px = gw.safe_price(f'{asset}/USDT') or 0
                 spot_assets += qty * px
-            # Earn balance is venue-specific; KuCoin's gateway returns 0 for now
-            # (Pool-X deferred), Binance returns the real flexible-USDT figure.
+            # Earn balance is fetched live per venue every render — this is a
+            # trading dashboard and stale earn numbers are misleading. Each
+            # gateway hits its own earn endpoint (Binance simple-earn,
+            # KuCoin funding wallet). One extra SAPI call per venue per
+            # render is acceptable; the cost of a stale number is higher.
             try:
                 gw_earn, _ = gw.earn_balance_usdt()
                 gw_earn = gw_earn or 0.0
             except Exception:
                 gw_earn = 0.0
-            # Override Binance earn with the locally tracked figure when caller
-            # passed it (avoids a duplicate SAPI roundtrip on the hot path).
-            if gw.venue_id == 'binance' and earn_deployed:
-                gw_earn = earn_deployed
             items.append({'label': f'{gw.name} · Spot USDT', 'value': spot_usdt, 'color': PALETTE['spot_usdt'], 'venue': gw.venue_id})
             items.append({'label': f'{gw.name} · Futures USDT', 'value': fut_usdt, 'color': PALETTE['fut_usdt'], 'venue': gw.venue_id})
             items.append({'label': f'{gw.name} · Spot assets', 'value': spot_assets, 'color': PALETTE['spot_assets'], 'venue': gw.venue_id})

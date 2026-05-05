@@ -328,8 +328,21 @@ def _ensure_close_readiness(db, gateway: VenueGateway, p: Position, cfg: Strateg
 def _rebalance_spot_fut(db, gateway: VenueGateway, cfg: StrategyConfig, mode: str) -> None:
     """Move USDT between spot and futures wallets so both have roughly the same free
     balance — the right baseline for an arb that always opens equal legs. Runs once
-    at the end of each live cycle. Threshold avoids ping-ponging on tiny dust."""
+    at the end of each live cycle. Threshold avoids ping-ponging on tiny dust.
+
+    Earn-first guard: when the venue has no open positions, do NOT rebalance.
+    Cash sitting in the futures wallet earns nothing; with no active legs to
+    fund, it should drain back to spot (already done by the auto-drain step
+    upstream) and then sweep into earn. Calling rebalance in this state would
+    re-stuff half the capital back into futures and starve earn."""
     if mode != MODE_LIVE or not cfg.auto_transfer_enabled:
+        return
+    open_count = db.scalar(select(func.count(Position.id)).where(
+        Position.status == 'open',
+        Position.mode == mode,
+        Position.exchange == gateway.venue_id,
+    )) or 0
+    if open_count == 0:
         return
     bals = gateway.safe_balances() or {}
     spot_free = float((bals.get('spot', {}).get('USDT') or {}).get('free') or 0)
@@ -645,9 +658,10 @@ def _ingest_api_capital_flows(db, gateway: VenueGateway, mode: str) -> int:
     in the DB are skipped, so this is safe to run every cycle. Returns the
     number of new rows inserted.
 
-    LIVE mode only. Paper mode treats CapitalFlow as user-managed virtual
-    flows. Each auto-ingested row carries ``detected_by='auto'`` so the UI
-    can mark it as venue-derived (vs. ``'manual'`` for user-entered rows)."""
+    LIVE mode only. Paper mode treats CapitalFlow as virtual. We log the
+    by-kind row count every cycle (including zero) so the operator can see
+    on /logs whether each API is returning anything — silent zero would be
+    indistinguishable from "endpoint not wired" without this signal."""
     if mode != MODE_LIVE:
         return 0
     try:
@@ -655,8 +669,10 @@ def _ingest_api_capital_flows(db, gateway: VenueGateway, mode: str) -> int:
     except Exception as e:
         log_event(db, f'capital-flow ingest failed: {e}', mode=mode, level='WARN', exchange=gateway.venue_id)
         return 0
-    if not rows:
-        return 0
+    counts: dict[str, int] = {}
+    for r in rows:
+        kind = r.get('kind') or 'deposit'
+        counts[kind] = counts.get(kind, 0) + 1
     seen_ids = {x for (x,) in db.execute(select(CapitalFlow.external_id).where(
         CapitalFlow.exchange == gateway.venue_id,
         CapitalFlow.external_id != '',
@@ -680,7 +696,8 @@ def _ingest_api_capital_flows(db, gateway: VenueGateway, mode: str) -> int:
         inserted += 1
     if inserted:
         db.flush()
-        log_event(db, f'Ingested {inserted} capital-flow row(s) from venue API', mode=mode, exchange=gateway.venue_id)
+    summary = ', '.join(f'{k}={v}' for k, v in counts.items()) or 'no rows returned by any endpoint'
+    log_event(db, f'capital-flow ingest: {summary} · {inserted} new', mode=mode, exchange=gateway.venue_id)
     return inserted
 
 

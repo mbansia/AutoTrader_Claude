@@ -182,6 +182,10 @@ class VenueGateway:
         self.spot = None
         self.futures = None
         self.last_balance_error: str = ''
+        # Per-endpoint error map populated by ``list_capital_flow_records``
+        # so /monitoring can show which API endpoint refused (most common
+        # cause: missing permission on the API key).
+        self.last_history_errors: dict[str, str] = {}
 
     # ─── Market data + read-only helpers (ccxt-uniform) ───────────────────
 
@@ -851,9 +855,11 @@ class BinanceGateway(VenueGateway):
         }
 
     def list_capital_flow_records(self, lookback_days: int = 365) -> list[dict]:
-        """Binance: ingest external deposits, external withdrawals, master→sub
-        transfer-in, sub→master transfer-out. ``external_id`` falls back to
-        a synthesized hash when the venue row lacks a stable id."""
+        """Binance: external deposits, external withdrawals, master→sub
+        transfer-in, sub→master transfer-out. Errors per endpoint are
+        recorded on ``self.last_history_errors`` so /monitoring can surface
+        which endpoint refused (typically a missing API permission)."""
+        self.last_history_errors = {}
         rows: list[dict] = []
         try:
             for d in (self.deposit_history('USDT', lookback_days=lookback_days) or []):
@@ -861,32 +867,32 @@ class BinanceGateway(VenueGateway):
                 amt = float(d.get('amount') or 0)
                 ext = str(d.get('txId') or d.get('id') or '') or _row_hash('binance', 'deposit', ts, amt)
                 rows.append({'ts': ts, 'amount': amt, 'kind': 'deposit', 'external_id': ext, 'note': 'Binance external deposit'})
-        except Exception:
-            pass
+        except Exception as e:
+            self.last_history_errors['deposits'] = str(e)[:160]
         try:
             for w in (self.withdrawal_history('USDT', lookback_days=lookback_days) or []):
                 ts = _ms_to_dt(w.get('applyTime') or w.get('completeTime') or w.get('time'))
                 amt = -abs(float(w.get('amount') or 0))
                 ext = str(w.get('id') or w.get('txId') or '') or _row_hash('binance', 'withdrawal', ts, amt)
                 rows.append({'ts': ts, 'amount': amt, 'kind': 'withdrawal', 'external_id': ext, 'note': 'Binance external withdrawal'})
-        except Exception:
-            pass
+        except Exception as e:
+            self.last_history_errors['withdrawals'] = str(e)[:160]
         try:
-            for r in (self.sub_account_transfer_history('USDT', incoming=True, lookback_days=lookback_days) or []):
+            for r in (self.sub_account_transfer_history('USDT', incoming=True, lookback_days=lookback_days, ttl_seconds=0) or []):
                 ts = _ms_to_dt(r.get('time') or r.get('tranId'))
                 amt = float(r.get('qty') or r.get('amount') or 0)
                 ext = str(r.get('tranId') or r.get('id') or '') or _row_hash('binance', 'sub_in', ts, amt)
                 rows.append({'ts': ts, 'amount': amt, 'kind': 'sub_in', 'external_id': ext, 'note': 'Master → sub transfer'})
-        except Exception:
-            pass
+        except Exception as e:
+            self.last_history_errors['sub_in'] = str(e)[:160]
         try:
-            for r in (self.sub_account_transfer_history('USDT', incoming=False, lookback_days=lookback_days) or []):
+            for r in (self.sub_account_transfer_history('USDT', incoming=False, lookback_days=lookback_days, ttl_seconds=0) or []):
                 ts = _ms_to_dt(r.get('time') or r.get('tranId'))
                 amt = -abs(float(r.get('qty') or r.get('amount') or 0))
                 ext = str(r.get('tranId') or r.get('id') or '') or _row_hash('binance', 'sub_out', ts, amt)
                 rows.append({'ts': ts, 'amount': amt, 'kind': 'sub_out', 'external_id': ext, 'note': 'Sub → master transfer'})
-        except Exception:
-            pass
+        except Exception as e:
+            self.last_history_errors['sub_out'] = str(e)[:160]
         return [r for r in rows if r['ts'] is not None and abs(r['amount']) > 1e-9]
 
 
@@ -1140,6 +1146,7 @@ class KuCoinGateway(VenueGateway):
         }
 
     def list_capital_flow_records(self, lookback_days: int = 365) -> list[dict]:
+        self.last_history_errors = {}
         since_ms = int((datetime.utcnow() - timedelta(days=lookback_days)).timestamp() * 1000)
         rows: list[dict] = []
         try:
@@ -1148,29 +1155,40 @@ class KuCoinGateway(VenueGateway):
                 amt = float(d.get('amount') or 0)
                 ext = str(d.get('id') or d.get('txid') or '') or _row_hash('kucoin', 'deposit', ts, amt)
                 rows.append({'ts': ts, 'amount': amt, 'kind': 'deposit', 'external_id': ext, 'note': 'KuCoin external deposit'})
-        except Exception:
-            pass
+        except Exception as e:
+            self.last_history_errors['deposits'] = str(e)[:160]
         try:
             for w in (self.spot.fetch_withdrawals('USDT', since=since_ms) or []):
                 ts = _ms_to_dt(w.get('timestamp'))
                 amt = -abs(float(w.get('amount') or 0))
                 ext = str(w.get('id') or w.get('txid') or '') or _row_hash('kucoin', 'withdrawal', ts, amt)
                 rows.append({'ts': ts, 'amount': amt, 'kind': 'withdrawal', 'external_id': ext, 'note': 'KuCoin external withdrawal'})
-        except Exception:
-            pass
-        # Sub-account transfer audit (master ↔ sub). Only one ccxt entrypoint
-        # name is likely to exist, so probe and stop on first hit.
-        for name in ('privateGetSubTransferRecord', 'private_get_sub_transfer_record', 'privateGetAccountsSubTransfer'):
+        except Exception as e:
+            self.last_history_errors['withdrawals'] = str(e)[:160]
+        # Sub-account transfer audit (master ↔ sub). KuCoin's ccxt client
+        # exposes the underlying SAPI under multiple possible names depending
+        # on vintage; probe an ordered list and stop on the first one that
+        # actually responds (success OR a real API error). If none exist, we
+        # log a cause so /monitoring shows what to fix.
+        sub_endpoint_used = None
+        for name in (
+            'privateGetSubTransferRecord',         # newer ccxt
+            'private_get_sub_transfer_record',     # snake-case alias
+            'privateGetAccountsSubTransfer',       # older ccxt
+            'futuresPrivateGetSubTransferRecord',  # futures-side variant
+        ):
             fn = getattr(self.spot, name, None)
             if not callable(fn):
                 continue
+            sub_endpoint_used = name
             try:
                 resp = fn({'currency': 'USDT', 'startAt': since_ms})
                 items = ((resp or {}).get('data') or {}).get('items') or []
-            except Exception:
+            except Exception as e:
+                self.last_history_errors['sub_transfer'] = f'{name}: {str(e)[:140]}'
                 items = []
             for r in items:
-                direction = r.get('direction') or ''
+                direction = (r.get('direction') or '').lower()
                 ts = _ms_to_dt(r.get('createdAt') or r.get('time'))
                 amt_raw = float(r.get('amount') or 0)
                 if direction == 'in':
@@ -1178,6 +1196,8 @@ class KuCoinGateway(VenueGateway):
                 elif direction == 'out':
                     rows.append({'ts': ts, 'amount': -abs(amt_raw), 'kind': 'sub_out', 'external_id': str(r.get('id') or _row_hash('kucoin', 'sub_out', ts, -amt_raw)), 'note': 'KuCoin sub → master transfer'})
             break
+        if sub_endpoint_used is None:
+            self.last_history_errors['sub_transfer'] = 'no sub-transfer endpoint exposed by this ccxt build'
         return [r for r in rows if r['ts'] is not None and abs(r['amount']) > 1e-9]
 
 

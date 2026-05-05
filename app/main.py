@@ -696,42 +696,6 @@ def portfolio_page_redirect(_: None = Depends(auth)):
 
 
 
-@app.post('/capital-flow')
-def add_capital_flow(
-    ts: str = Form(...),
-    amount: float = Form(...),
-    venue: str = Form('binance'),
-    note: str = Form(''),
-    view_cookie: str | None = Cookie(default=None, alias='view'),
-    _: None = Depends(auth),
-):
-    v = _resolve_view(None, view_cookie)
-    try:
-        ts_dt = datetime.fromisoformat(ts)
-    except ValueError:
-        raise HTTPException(status_code=400, detail='invalid date')
-    venue = venue.lower().strip() or 'binance'
-    with SessionLocal() as db:
-        cf = CapitalFlow(
-            mode=v, exchange=venue, ts=ts_dt, amount_usdt=amount,
-            kind='deposit' if amount > 0 else 'withdrawal',
-            detected_by='manual', note=note,
-        )
-        db.add(cf)
-        db.commit()
-    return RedirectResponse(url='/dashboard', status_code=303)
-
-
-@app.post('/capital-flow/delete')
-def delete_capital_flow(id: int = Form(...), _: None = Depends(auth)):
-    with SessionLocal() as db:
-        f = db.get(CapitalFlow, id)
-        if f:
-            db.delete(f)
-            db.commit()
-    return RedirectResponse(url='/portfolio', status_code=303)
-
-
 @app.get('/transactions', response_class=HTMLResponse)
 def transactions_page(request: Request, view: str | None = None, limit: int = 100, view_cookie: str | None = Cookie(default=None, alias='view'), _: None = Depends(auth)):
     v = _resolve_view(view, view_cookie)
@@ -1019,6 +983,10 @@ def _gather_exchange_status() -> list[dict]:
         probes.append(_probe('Sub-account transfer in (USDT, 30d)', lambda: gw.sub_account_transfer_history('USDT', incoming=True, lookback_days=30, ttl_seconds=0)))
         probes.append(_probe('Sub-account transfer out (USDT, 30d)', lambda: gw.sub_account_transfer_history('USDT', incoming=False, lookback_days=30, ttl_seconds=0)))
         probes.append(_probe('Open perp positions', lambda: gw.open_perp_positions_raw()))
+        probes.append(_probe('Capital-flow ingest (deposits + withdrawals + sub-transfers, 365d)', lambda: {
+            'rows': gw.list_capital_flow_records(lookback_days=365),
+            'errors': gw.last_history_errors,
+        }))
         # Capital subtotal: cash + spot assets + futures + earn (all USDT-denominated).
         bals = gw.safe_balances() or {}
         spot_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
@@ -1070,8 +1038,12 @@ def _gather_exchange_status() -> list[dict]:
         kc_probes.append(_probe('Spot fetch_balance(trade)', lambda: kgw.spot.fetch_balance({'type': 'trade'})))
         kc_probes.append(_probe('Spot fetch_balance(main)', lambda: kgw.spot.fetch_balance({'type': 'main'})))
         kc_probes.append(_probe('Futures fetch_balance()', lambda: kgw.futures.fetch_balance()))
-        kc_probes.append(_probe('Funding rates', lambda: kgw.futures.fetch_funding_rates()))
+        kc_probes.append(_probe('Funding rates (markets-derived)', lambda: kgw.funding_rates_dict()))
         kc_probes.append(_probe('Open perp positions', lambda: kgw.open_perp_positions_raw()))
+        kc_probes.append(_probe('Capital-flow ingest (deposits + sub-transfers)', lambda: {
+            'rows': kgw.list_capital_flow_records(lookback_days=365),
+            'errors': kgw.last_history_errors,
+        }))
         kc_bals = kgw.safe_balances() or {}
         kc_balance_err = kgw.last_balance_error
         kc_spot_usdt = float((kc_bals.get('spot', {}).get('USDT') or {}).get('total') or 0)

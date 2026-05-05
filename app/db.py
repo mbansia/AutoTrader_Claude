@@ -98,3 +98,8 @@ def run_schema_migrations() -> None:
     if 'capital_flows' in insp.get_table_names():
         with engine.begin() as conn:
             conn.execute(text("DELETE FROM capital_flows WHERE detected_by = 'auto' AND (external_id IS NULL OR external_id = '')"))
+            # The manual capital-injection form was retired in favor of
+            # API-derived flows (the user wanted nothing to be assumed —
+            # only live data from the venue). Wipe any leftover manual rows
+            # so net-injected-capital and XIRR reflect API truth only.
+            conn.execute(text("DELETE FROM capital_flows WHERE detected_by = 'manual'"))
