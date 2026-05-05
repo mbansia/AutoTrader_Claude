@@ -545,7 +545,12 @@ class BinanceGateway(VenueGateway):
     # instances share the cooldown (the bot creates fresh gateways
     # frequently for HTTP routes).
     _earn_subscribe_cooldown_until: dict[str, float] = {}
-    EARN_SUBSCRIBE_DEFAULT_COOLDOWN_S = 3600.0       # 1h between subscribes per asset
+    # Time between earn subscribes per asset. 10 min keeps us well under
+    # Binance's 77505 rate-limit (subscriptions/day per product) while
+    # letting the earn-first sweep converge quickly when capital is freed
+    # by trades or transfers. The 24h punishment cooldown only kicks in if
+    # Binance actually returns 77505.
+    EARN_SUBSCRIBE_DEFAULT_COOLDOWN_S = 600.0         # 10 min between subscribes per asset
     EARN_SUBSCRIBE_RATE_LIMITED_COOLDOWN_S = 86400.0  # 24h after Binance signals 77505
 
     # Caches — instance-scoped so they survive across method calls but die

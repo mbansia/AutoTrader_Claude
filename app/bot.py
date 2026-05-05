@@ -1027,27 +1027,39 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                 note=scan_note,
             ))
 
-            # Earn-first model: idle USDT is parked in earn between trades.
-            # Pre-trade redemption (provision_margin + the open path) tops
-            # up spot/futures wallets when a leg is about to be opened or
-            # closed. After all positions on this venue are flat, two
-            # things happen: (1) the futures wallet is drained back to
-            # spot down to dust; (2) idle spot.free sweeps into earn.
+            # Earn-first model: idle USDT lives in earn between trades.
+            # Pre-trade provision_margin redeems from earn to top up
+            # whichever wallet the upcoming leg needs.
+            #
+            # Drain rules (live mode):
+            #   * No positions open on the venue → drain fut→spot down to
+            #     dust (0.10 USDT). Everything funnels into earn.
+            #   * Positions open → drain only the portion of fut.free that
+            #     exceeds 10% of total open notional. Below that threshold
+            #     we leave a free-margin buffer so a price move against
+            #     the perp short doesn't trigger maintenance liquidation
+            #     before the next provision_margin call.
             if mode == MODE_LIVE and cfg.auto_transfer_enabled:
-                still_open = db.scalar(select(func.count(Position.id)).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)) or 0
-                if still_open == 0:
-                    bals_after = gateway.safe_balances() or {}
-                    fut_free_now = float((bals_after.get('futures', {}).get('USDT') or {}).get('free') or 0)
-                    # Drain anything above the dust buffer (0.10 USDT). The
-                    # earlier 1.0 threshold left ~$1 of stranded capital on
-                    # KuCoin that the earn sweep then couldn't pick up.
-                    if fut_free_now > 0.20:
-                        amt = max(0.0, fut_free_now - 0.10)
-                        ok, err = gateway.transfer_futures_to_spot(amt, paper)
-                        if ok:
-                            log_event(db, f'Auto-transferred {amt:.2f} USDT futures→spot (no open positions)', mode=mode, exchange=gateway.venue_id)
-                        else:
-                            log_event(db, f'futures→spot transfer failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                open_ps = db.scalars(select(Position).where(
+                    Position.status == 'open',
+                    Position.mode == mode,
+                    Position.exchange == gateway.venue_id,
+                )).all()
+                bals_after = gateway.safe_balances() or {}
+                fut_free_now = float((bals_after.get('futures', {}).get('USDT') or {}).get('free') or 0)
+                if open_ps:
+                    # Keep 10% of open notional as free margin buffer.
+                    open_notional = sum((p.quantity or 0) * (p.perp_entry_price or 0) for p in open_ps)
+                    keep = max(0.20, open_notional * 0.10)
+                else:
+                    keep = 0.10
+                if fut_free_now > keep + 0.10:
+                    amt = fut_free_now - keep
+                    ok, err = gateway.transfer_futures_to_spot(amt, paper)
+                    if ok:
+                        log_event(db, f'Drained {amt:.2f} USDT futures→spot (kept {keep:.2f} as margin buffer; {len(open_ps)} pos open)', mode=mode, exchange=gateway.venue_id)
+                    else:
+                        log_event(db, f'futures→spot drain failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
             # Sweep idle USDT into earn. Use ``spot.free`` directly rather
             # than ``min(spot_free, fut_free)`` from _compute_equity_and_free
