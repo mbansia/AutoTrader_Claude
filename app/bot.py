@@ -1027,15 +1027,21 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                 note=scan_note,
             ))
 
-            # If everything is flat in live mode, drain leftover USDT out of the futures
-            # wallet back to spot so the Earn sweep below can pick it up. Only safe to
-            # drain when there are no open positions (otherwise we'd starve their margin).
+            # Earn-first model: idle USDT is parked in earn between trades.
+            # Pre-trade redemption (provision_margin + the open path) tops
+            # up spot/futures wallets when a leg is about to be opened or
+            # closed. After all positions on this venue are flat, two
+            # things happen: (1) the futures wallet is drained back to
+            # spot down to dust; (2) idle spot.free sweeps into earn.
             if mode == MODE_LIVE and cfg.auto_transfer_enabled:
                 still_open = db.scalar(select(func.count(Position.id)).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)) or 0
                 if still_open == 0:
                     bals_after = gateway.safe_balances() or {}
                     fut_free_now = float((bals_after.get('futures', {}).get('USDT') or {}).get('free') or 0)
-                    if fut_free_now > 1.0:
+                    # Drain anything above the dust buffer (0.10 USDT). The
+                    # earlier 1.0 threshold left ~$1 of stranded capital on
+                    # KuCoin that the earn sweep then couldn't pick up.
+                    if fut_free_now > 0.20:
                         amt = max(0.0, fut_free_now - 0.10)
                         ok, err = gateway.transfer_futures_to_spot(amt, paper)
                         if ok:
@@ -1043,26 +1049,25 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         else:
                             log_event(db, f'futures→spot transfer failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
-            # Earn-first model: idle USDT is parked in earn between trades.
-            # Pre-trade redemption (in :func:`provision_margin` and the open
-            # path) tops up spot/futures wallets when a leg is about to be
-            # opened or closed. The historical continuous spot↔futures
-            # rebalance was removed — it kept stuffing half the capital
-            # back into futures even when there was nothing to fund, which
-            # starved earn. Post-trade sweep below puts whatever's idle
-            # back into earn.
-
-            # Sweep any remaining idle USDT into Earn after entries are done.
+            # Sweep idle USDT into earn. Use ``spot.free`` directly rather
+            # than ``min(spot_free, fut_free)`` from _compute_equity_and_free
+            # — that minimum was the right shape for the old continuous-
+            # rebalance model where both legs needed equal margin, but in
+            # the earn-first model the spot wallet's free cash IS the idle
+            # amount (futures cash gets routed pre-trade by provision_margin
+            # rather than kept hot). The old min() left 7.90 in trade
+            # because fut had only 0.10 — fix is using spot.free directly.
             if cfg.earn_enabled:
-                _, free_after = _compute_equity_and_free(db, gateway, mode, cfg, earn)
-                if free_after > cfg.earn_idle_threshold_usdt:
-                    sweep = max(0.0, free_after - 0.10)  # leave a small buffer for rounding/fees
+                bals_for_sweep = gateway.safe_balances() or {}
+                spot_free_now = float((bals_for_sweep.get('spot', {}).get('USDT') or {}).get('free') or 0)
+                if spot_free_now > cfg.earn_idle_threshold_usdt:
+                    sweep = max(0.0, spot_free_now - 0.10)  # 0.10 USDT dust buffer
                     ok, err = gateway.earn_subscribe(sweep, paper)
                     if ok:
                         earn.deployed_usdt += sweep
                         log_event(db, f'Swept {sweep:.2f} USDT idle to earn', mode=mode, exchange=gateway.venue_id)
                     elif 'cooldown active' in err:
-                        # Per-asset cooldown — expected, don't spam logs. Surface on the dashboard via earn.last_error only.
+                        # Per-asset cooldown — expected, don't spam logs.
                         earn.last_error = err
                     else:
                         earn.last_error = err

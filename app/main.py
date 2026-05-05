@@ -1058,12 +1058,18 @@ def _gather_exchange_status() -> list[dict]:
                 continue
             px = kgw.safe_price(f'{asset}/USDT') or 0
             kc_spot_assets += qty * px
+        # KuCoin's "earn" surface is the funding (main) wallet — that's
+        # where auto-lend / Pool-X draws idle USDT from. Pull it via the
+        # gateway so the cached balance dict is reused (no extra round-trip).
+        kc_earn_usdt, _ = kgw.earn_balance_usdt()
+        kc_earn_usdt = kc_earn_usdt or 0.0
         kc_capital_breakdown = [
-            {'label': 'Spot · USDT', 'value': kc_spot_usdt},
+            {'label': 'Spot · USDT (trade wallet)', 'value': kc_spot_usdt},
             {'label': 'Spot · assets', 'value': kc_spot_assets},
-            {'label': 'Futures · USDT', 'value': kc_fut_usdt},
+            {'label': 'Futures · USDT (contract wallet)', 'value': kc_fut_usdt},
+            {'label': 'Earn · USDT (main / funding wallet)', 'value': kc_earn_usdt},
         ]
-        kc_capital_subtotal = kc_spot_usdt + kc_spot_assets + kc_fut_usdt
+        kc_capital_subtotal = kc_spot_usdt + kc_spot_assets + kc_fut_usdt + kc_earn_usdt
     sections.append({
         'name': 'KuCoin',
         'venue_id': 'kucoin',
