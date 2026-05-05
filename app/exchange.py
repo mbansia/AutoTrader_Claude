@@ -177,6 +177,15 @@ class VenueGateway:
     venue_id: str = ''   # 'binance' | 'kucoin' | 'ibkr'
     name: str = ''       # human-readable label rendered in UI
 
+    # Single dashboard render historically called ``safe_balances`` 5+ times
+    # per venue (one in ``_current_equity``, one in ``equity_breakdown``,
+    # one in ``_compute_equity_and_free``, etc.). On KuCoin's per-second
+    # rate limits this triggered ``code 429000 "Too many requests"``. We
+    # cache the latest result on the instance for ``BALANCE_CACHE_TTL``
+    # seconds; the worker loop bypasses it explicitly when it needs fresh
+    # numbers (e.g. after a transfer).
+    BALANCE_CACHE_TTL = 10.0
+
     def __init__(self) -> None:
         # Subclasses must set these in their own __init__ before super().
         self.spot = None
@@ -186,6 +195,7 @@ class VenueGateway:
         # so /monitoring can show which API endpoint refused (most common
         # cause: missing permission on the API key).
         self.last_history_errors: dict[str, str] = {}
+        self._balance_cache: tuple[float, dict | None] | None = None
 
     # ─── Market data + read-only helpers (ccxt-uniform) ───────────────────
 
@@ -233,16 +243,40 @@ class VenueGateway:
             total += p * q
         return total
 
-    def safe_balances(self) -> dict | None:
+    def safe_balances(self, *, force_refresh: bool = False) -> dict | None:
         """Return ``{'spot': {...}, 'futures': {...}}`` from ccxt, or ``None`` on
-        error (with the failure message pinned to ``self.last_balance_error``)."""
+        error (with the failure message pinned to ``self.last_balance_error``).
+
+        Cached for ``BALANCE_CACHE_TTL`` seconds (see class attribute) — the
+        dashboard renders multiple components that each ask for balances and
+        we don't want to hammer per-second rate limits. Pass
+        ``force_refresh=True`` after a transfer/order so the next read sees
+        the post-action state."""
+        if not force_refresh and self._balance_cache is not None:
+            ts, cached = self._balance_cache
+            if (time.time() - ts) < self.BALANCE_CACHE_TTL:
+                return cached
         try:
-            result = {'spot': self.spot.fetch_balance(), 'futures': self.futures.fetch_balance()}
+            result = self._fetch_balances_uncached()
             self.last_balance_error = ''
+            self._balance_cache = (time.time(), result)
             return result
         except Exception as e:
             self.last_balance_error = str(e)
+            self._balance_cache = (time.time(), None)
             return None
+
+    def _fetch_balances_uncached(self) -> dict:
+        """Override hook — subclasses with custom wallet topology (e.g.
+        KuCoin's ``trade`` vs ``main`` split) replace this. Default is the
+        plain ccxt fetch_balance() pair."""
+        return {'spot': self.spot.fetch_balance(), 'futures': self.futures.fetch_balance()}
+
+    def invalidate_balance_cache(self) -> None:
+        """Drop the in-memory balance cache so the next ``safe_balances``
+        call hits the API. Used right after orders, transfers, and earn
+        operations so downstream code sees the post-action state."""
+        self._balance_cache = None
 
     def price(self, symbol: str) -> float:
         return float(self.spot.fetch_ticker(symbol)['last'])
@@ -389,8 +423,13 @@ class VenueGateway:
                 'venue': leg, 'status': 'closed', 'price': fill_price, 'fee': {'cost': fee_cost},
             }
         if leg == 'spot':
-            return self.spot.create_order(symbol, 'market', side, amount)
-        return self.futures.create_order(symbol, 'market', side, amount)
+            fill = self.spot.create_order(symbol, 'market', side, amount)
+        else:
+            fill = self.futures.create_order(symbol, 'market', side, amount)
+        # Invalidate the balance cache so any caller that asks for
+        # balances after an order sees the post-fill state, not stale data.
+        self.invalidate_balance_cache()
+        return fill
 
     def create_spot_buy(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float) -> dict:
         return self._market_order('spot', symbol, 'buy', amount, paper_mode, slippage_bps, fee_bps)
@@ -660,6 +699,7 @@ class BinanceGateway(VenueGateway):
             return False, f'{asset}: sapi method not available in ccxt'
         # Success — install standard cooldown so we don't immediately retry next cycle.
         self._earn_subscribe_cooldown_until[asset] = now + self.EARN_SUBSCRIBE_DEFAULT_COOLDOWN_S
+        self.invalidate_balance_cache()
         return bool(resp.get('success', True)), ''
 
     def earn_redeem_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:
@@ -683,6 +723,7 @@ class BinanceGateway(VenueGateway):
             return False, f'{asset}: {e}'
         if resp is None:
             return False, f'{asset}: sapi method not available in ccxt'
+        self.invalidate_balance_cache()
         return bool(resp.get('success', True)), ''
 
     # ─── Binance universal transfer (spot ⇄ USDM-futures) ─────────────────
@@ -693,9 +734,10 @@ class BinanceGateway(VenueGateway):
             if callable(fn):
                 try:
                     fn({'type': transfer_type, 'asset': 'USDT', 'amount': f'{amount_usdt:.2f}'})
-                    return True, ''
                 except Exception as e:
                     return False, str(e)
+                self.invalidate_balance_cache()
+                return True, ''
         return False, 'sapiPostAssetTransfer not available in this ccxt build'
 
     def transfer_spot_to_futures(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
@@ -992,25 +1034,25 @@ class KuCoinGateway(VenueGateway):
     # ``bals['futures']``. The funding-wallet balance is surfaced via
     # :meth:`earn_balance_usdt` so the equity total = spot + earn + futures
     # without double-counting.
-    def safe_balances(self) -> dict | None:
-        try:
-            trade_bal = self.spot.fetch_balance({'type': 'trade'})
-            futures_bal = self.futures.fetch_balance()
-        except Exception as e:
-            self.last_balance_error = str(e)
-            return None
-        self.last_balance_error = ''
-        return {'spot': trade_bal, 'futures': futures_bal}
+    def _fetch_balances_uncached(self) -> dict:
+        # Fetch all three wallets in one shot so the cache covers
+        # spot + earn + futures with no extra round-trips. Stashes the main
+        # wallet under ``earn`` so :meth:`earn_balance_usdt` reads it
+        # without another API call.
+        return {
+            'spot': self.spot.fetch_balance({'type': 'trade'}),
+            'earn': self.spot.fetch_balance({'type': 'main'}),
+            'futures': self.futures.fetch_balance(),
+        }
 
     def _main_wallet_usdt(self) -> tuple[float | None, str]:
-        """Read the USDT balance of the ``main`` (Funding) wallet. Used by
-        :meth:`earn_balance_usdt` since KuCoin's auto-lend operates on
-        funding-wallet cash."""
-        try:
-            bal = self.spot.fetch_balance({'type': 'main'})
-        except Exception as e:
-            return None, str(e)
-        return float((bal.get('USDT') or {}).get('total') or 0), ''
+        """Read the USDT balance of the ``main`` (Funding) wallet from the
+        cached balance dict. Used by :meth:`earn_balance_usdt` since KuCoin's
+        auto-lend operates on funding-wallet cash."""
+        bals = self.safe_balances()
+        if bals is None:
+            return None, self.last_balance_error
+        return float((bals.get('earn', {}).get('USDT') or {}).get('total') or 0), ''
 
     # ─── Earn-equivalent on KuCoin: park idle cash in the funding wallet ──
     # KuCoin doesn't expose a single "Simple Earn Flexible" endpoint that
@@ -1035,40 +1077,31 @@ class KuCoinGateway(VenueGateway):
             return True, 'paper'
         if amount_usdt <= 0:
             return True, 'noop'
-        return self._inner_transfer('trade', 'main', amount_usdt)
+        return self._transfer('trade', 'main', amount_usdt)
 
     def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
         if paper_mode:
             return True, 'paper'
         if amount_usdt <= 0:
             return True, 'noop'
-        return self._inner_transfer('main', 'trade', amount_usdt)
+        return self._transfer('main', 'trade', amount_usdt)
 
-    # ─── Spot ↔ futures transfer (KuCoin innerTransfer) ───────────────────
-
-    def _inner_transfer(self, from_account: str, to_account: str, amount_usdt: float) -> tuple[bool, str]:
-        # ccxt's KuCoin client has historically exposed innerTransfer under
-        # different names. Probe a small ordered list and call the first that
-        # exists — same pattern used for Binance SAPI lookups.
-        for name in (
-            'privatePostAccountsInnerTransfer',
-            'private_post_accounts_inner_transfer',
-            'privatePostAccountsUniversalTransfer',
-        ):
-            fn = getattr(self.spot, name, None)
-            if callable(fn):
-                try:
-                    fn({
-                        'currency': 'USDT',
-                        'from': from_account,
-                        'to': to_account,
-                        'amount': f'{amount_usdt:.2f}',
-                        'clientOid': f'autotrader-{int(time.time() * 1000)}',
-                    })
-                    return True, ''
-                except Exception as e:
-                    return False, str(e)
-        return False, 'KuCoin innerTransfer not available in this ccxt build'
+    # ─── Spot ↔ futures transfer (KuCoin) ────────────────────────────────
+    # KuCoin splits transfers across two endpoints:
+    #   * /api/v1/accounts/inner-transfer — main ↔ trade ↔ margin (spot
+    #     wallets only). Rejects ``contract`` with code 400100
+    #     "from not in the given range".
+    #   * /api/v3/accounts/universal-transfer — handles everything,
+    #     including ``contract`` ↔ ``trade`` and master ↔ sub.
+    # ccxt's unified ``transfer()`` picks the right one based on whether
+    # the route involves a non-spot wallet, so we always go through it.
+    def _transfer(self, from_account: str, to_account: str, amount_usdt: float) -> tuple[bool, str]:
+        try:
+            self.spot.transfer('USDT', float(amount_usdt), from_account, to_account)
+        except Exception as e:
+            return False, str(e)
+        self.invalidate_balance_cache()
+        return True, ''
 
     # KuCoin's spot orders execute against the ``trade`` wallet (UI label
     # "Trading Account"); ``main`` is the funding wallet (deposits land here).
@@ -1081,14 +1114,14 @@ class KuCoinGateway(VenueGateway):
             return True, 'paper'
         if amount_usdt <= 0:
             return True, 'noop'
-        return self._inner_transfer('trade', 'contract', amount_usdt)
+        return self._transfer('trade', 'contract', amount_usdt)
 
     def transfer_futures_to_spot(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
         if paper_mode:
             return True, 'paper'
         if amount_usdt <= 0:
             return True, 'noop'
-        return self._inner_transfer('contract', 'trade', amount_usdt)
+        return self._transfer('contract', 'trade', amount_usdt)
 
     # ─── Capital-injection history (KuCoin) ───────────────────────────────
     # KuCoin sub-accounts: master→sub transfers come in via the

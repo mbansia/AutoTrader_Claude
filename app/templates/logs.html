@@ -40,13 +40,13 @@
 <div class="card">
   <h3>Bot events (last 100)</h3>
   {% if events %}
-  <div>
+  <div class="log-list">
     {% for e in events %}
       <div class="log-line">
-        <span class="muted mono">{{ e.ts }}</span>
-        <span class="tag" style="font-size:10px;">{{ e.venue }}</span>
-        <span class="lvl lvl-{{ e.level }}">{{ e.level }}</span>
-        <span>{{ e.message }}</span>
+        <span class="log-ts">{{ e.ts }}</span>
+        <span class="log-venue tag">{{ e.venue }}</span>
+        <span class="log-lvl lvl lvl-{{ e.level }}">{{ e.level }}</span>
+        <span class="log-msg" title="{{ e.message }}">{{ e.message }}</span>
       </div>
     {% endfor %}
   </div>

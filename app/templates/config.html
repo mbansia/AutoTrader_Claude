@@ -62,10 +62,7 @@
           <option value="1" {{ 'selected' if cfg.auto_transfer_enabled }}>yes</option>
           <option value="0" {{ 'selected' if not cfg.auto_transfer_enabled }}>no</option>
         </select>
-        <span class="hint">Live only. Continuously rebalances spot.free ≈ futures.free each cycle, redeems from earn for spot needs, drains futures back when positions close. Requires "Permits Universal Transfer" on the API key.</span></div>
-      <div class="form-row"><label>Rebalance threshold (USDT)</label>
-        <input type="number" step="0.1" name="auto_rebalance_threshold" value="{{ cfg.auto_rebalance_threshold }}">
-        <span class="hint">Only move if |spot.free − fut.free| exceeds this. Avoids ping-pong on dust.</span></div>
+        <span class="hint">Live only. Pre-trade redeems from earn and tops up the right wallet (spot or futures) for the leg about to open; post-trade drains futures back and sweeps idle into earn. Requires "Permits Universal Transfer" on each venue's API key.</span></div>
       <div class="form-row"><label>Perp leverage</label>
         <input type="number" step="1" name="perp_leverage" value="{{ cfg.perp_leverage }}">
         <span class="hint">Bot configures CROSS margin + this leverage on every perp before opening. <strong>1 is the only safe choice for an arb hedge</strong> — keeps perp margin == spot notional and avoids "Margin is insufficient" close errors.</span></div>

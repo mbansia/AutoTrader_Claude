@@ -1174,7 +1174,6 @@ def _render_export_md(v: str) -> str:
             ['earn_paper_apr', cfg.earn_paper_apr],
             ['earn_subscribe_spot_assets', cfg.earn_subscribe_spot_assets],
             ['auto_transfer_enabled', cfg.auto_transfer_enabled],
-            ['auto_rebalance_threshold', cfg.auto_rebalance_threshold],
             ['perp_leverage', cfg.perp_leverage],
         ]
         parts.append(_md_table(['key', 'value'], cfg_rows))

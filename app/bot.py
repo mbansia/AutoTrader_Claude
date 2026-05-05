@@ -18,7 +18,7 @@ Helper functions are grouped roughly by responsibility:
 * Closing: :func:`_force_close_both`, :func:`_close_naked_leg`,
   :func:`_ensure_close_readiness`, :func:`_actual_spot_qty`,
   :func:`_actual_perp_qty`, :func:`manual_close`.
-* Capital provisioning: :func:`_rebalance_spot_fut`,
+* Capital provisioning: pre-trade earn redemption + spot↔futures top-up,
   :func:`_take_balance_snapshot`.
 * Paper-mode simulation: :func:`_accrue_paper_yield`,
   :func:`_accrue_paper_funding`.
@@ -323,46 +323,6 @@ def _ensure_close_readiness(db, gateway: VenueGateway, p: Position, cfg: Strateg
                         log_event(db, f'Pre-close: transferred {transfer:.2f} USDT to futures (Earn → spot → futures)', mode=p.mode, exchange=p.exchange)
                     else:
                         log_event(db, f'Pre-close: post-redeem transfer for {p.perp_symbol} failed: {err2[:120]}', mode=p.mode, level='WARN', exchange=p.exchange)
-
-
-def _rebalance_spot_fut(db, gateway: VenueGateway, cfg: StrategyConfig, mode: str) -> None:
-    """Move USDT between spot and futures wallets so both have roughly the same free
-    balance — the right baseline for an arb that always opens equal legs. Runs once
-    at the end of each live cycle. Threshold avoids ping-ponging on tiny dust.
-
-    Earn-first guard: when the venue has no open positions, do NOT rebalance.
-    Cash sitting in the futures wallet earns nothing; with no active legs to
-    fund, it should drain back to spot (already done by the auto-drain step
-    upstream) and then sweep into earn. Calling rebalance in this state would
-    re-stuff half the capital back into futures and starve earn."""
-    if mode != MODE_LIVE or not cfg.auto_transfer_enabled:
-        return
-    open_count = db.scalar(select(func.count(Position.id)).where(
-        Position.status == 'open',
-        Position.mode == mode,
-        Position.exchange == gateway.venue_id,
-    )) or 0
-    if open_count == 0:
-        return
-    bals = gateway.safe_balances() or {}
-    spot_free = float((bals.get('spot', {}).get('USDT') or {}).get('free') or 0)
-    fut_free = float((bals.get('futures', {}).get('USDT') or {}).get('free') or 0)
-    diff = spot_free - fut_free
-    if abs(diff) < cfg.auto_rebalance_threshold:
-        return
-    transfer = abs(diff) / 2.0
-    if transfer < 0.20:
-        return
-    if diff > 0:
-        ok, err = gateway.transfer_spot_to_futures(transfer, False)
-        direction = 'spot→futures'
-    else:
-        ok, err = gateway.transfer_futures_to_spot(transfer, False)
-        direction = 'futures→spot'
-    if ok:
-        log_event(db, f'Rebalance: {transfer:.2f} USDT {direction} (spot {spot_free:.2f} ↔ fut {fut_free:.2f})', mode=mode, exchange=gateway.venue_id)
-    else:
-        log_event(db, f'Rebalance {direction} failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
 
 def _actual_spot_qty(gateway: VenueGateway, p: Position) -> float:
@@ -1083,9 +1043,14 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         else:
                             log_event(db, f'futures→spot transfer failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
-            # Continuous rebalance: keep spot.free ≈ futures.free so both legs of the
-            # next arb open are equally funded.
-            _rebalance_spot_fut(db, gateway, cfg, mode)
+            # Earn-first model: idle USDT is parked in earn between trades.
+            # Pre-trade redemption (in :func:`provision_margin` and the open
+            # path) tops up spot/futures wallets when a leg is about to be
+            # opened or closed. The historical continuous spot↔futures
+            # rebalance was removed — it kept stuffing half the capital
+            # back into futures even when there was nothing to fund, which
+            # starved earn. Post-trade sweep below puts whatever's idle
+            # back into earn.
 
             # Sweep any remaining idle USDT into Earn after entries are done.
             if cfg.earn_enabled:
