@@ -35,14 +35,6 @@
 </div>
 {% endif %}
 
-{% if view == 'live' and live_spot_free is not none %}
-<div class="alert alert-info" style="display:flex;gap:18px;">
-  <span><strong>Spot free:</strong> {{ '%.2f' % live_spot_free }} USDT</span>
-  <span><strong>Futures free:</strong> {{ '%.2f' % live_fut_free }} USDT</span>
-  <span class="muted">— this is the actual cash the bot can deploy. Auto-rebalance keeps them ≈ equal.</span>
-</div>
-{% endif %}
-
 {# ========== KPI ROW ========== #}
 <div class="kpi-grid">
   <div class="kpi">
