@@ -307,27 +307,32 @@
 
 {# ========== CLOSED POSITIONS ========== #}
 <div class="card">
-  <h3>Closed positions (last 20)</h3>
+  <h3>Closed positions (last 20) <span class="muted" style="font-size:13px;font-weight:400;">— click ▶ for per-leg trade detail</span></h3>
   {% if closed %}
+  <div class="table-wrapper">
   <table>
     <thead><tr>
+      <th style="width:32px;"></th>
       <th>Symbol</th>
       <th>Venue</th>
       <th class="num">Qty (base)</th>
       <th>Opened</th>
       <th>Closed</th>
+      <th class="num">Hold</th>
       <th class="num">Trade PnL (USD)</th>
       <th class="num">Funding earned (USD)</th>
       <th class="num">Realized total (USD)</th>
     </tr></thead>
     <tbody>
     {% for c in closed %}
-      <tr>
+      <tr class="position-row" data-pos-id="closed-{{ c.id }}">
+        <td><button type="button" class="row-toggle" aria-expanded="false" aria-controls="closed-detail-{{ c.id }}" onclick="togglePositionDetail('closed-{{ c.id }}', this)">▶</button></td>
         <td class="mono">{{ c.symbol }}</td>
         <td><span class="tag">{{ c.venue }}</span></td>
         <td class="num">{{ '%.6f' % c.quantity }}</td>
         <td class="muted">{{ c.opened_at }}</td>
         <td class="muted">{{ c.closed_at }}</td>
+        <td class="num muted">{{ c.hold_time }}</td>
         <td class="num {{ 'good' if c.trade_pnl >= 0 else 'bad' }}">{{ '%+.4f' % c.trade_pnl }}</td>
         <td class="num {{ 'good' if c.funding_income >= 0 else 'bad' }}">{{ '%+.4f' % c.funding_income }}</td>
         <td class="num {{ 'good' if c.realized >= 0 else 'bad' }}">{{ '%+.4f' % c.realized }}</td>
@@ -335,6 +340,62 @@
     {% endfor %}
     </tbody>
   </table>
+  </div>
+
+  {% for c in closed %}
+  <div class="position-detail-panel" id="detail-closed-{{ c.id }}" hidden>
+    <div class="leg-grid">
+      {# Spot leg (long, base asset bought + sold) #}
+      <div class="leg-card leg-spot">
+        <h4 class="leg-title">
+          <span class="tag good" style="font-size:10px;">SPOT · LONG</span>
+          <span class="mono">{{ c.spot_leg.symbol or c.spot_symbol }}</span>
+        </h4>
+        {% if c.spot_leg.present %}
+        <table class="leg-table">
+          <tr><th>Quantity</th><td class="num">{{ '%.6f' % c.spot_leg.qty }}</td></tr>
+          <tr><th>Entry price</th><td class="num">{{ '%.6f' % c.spot_leg.entry_price }} USDT</td></tr>
+          <tr><th>Exit price</th><td class="num">{{ '%.6f' % c.spot_leg.exit_price }} USDT</td></tr>
+          <tr><th>Entry notional</th><td class="num">{{ '%.4f' % c.spot_leg.entry_notional }} USDT</td></tr>
+          <tr><th>Exit notional</th><td class="num">{{ '%.4f' % c.spot_leg.exit_notional }} USDT</td></tr>
+          <tr><th>Entry fee</th><td class="num">{{ '%.4f' % c.spot_leg.entry_fee }} USDT</td></tr>
+          <tr><th>Exit fee</th><td class="num">{{ '%.4f' % c.spot_leg.exit_fee }} USDT</td></tr>
+          <tr><th>Total fees</th><td class="num">{{ '%.4f' % c.spot_leg.total_fee }} USDT</td></tr>
+          <tr><th>Leg PnL</th><td class="num {{ 'good' if c.spot_leg.leg_pnl >= 0 else 'bad' }}">{{ '%+.4f' % c.spot_leg.leg_pnl }} USDT</td></tr>
+          <tr><th>Filled at</th><td class="muted mono">{{ c.spot_leg.entry_ts or '—' }} → {{ c.spot_leg.exit_ts or '—' }}</td></tr>
+        </table>
+        {% else %}
+        <div class="muted" style="padding:6px 0;">No spot trades recorded for this position.</div>
+        {% endif %}
+      </div>
+
+      {# Perp leg (short, futures sell on entry + buy-back on close) #}
+      <div class="leg-card leg-perp">
+        <h4 class="leg-title">
+          <span class="tag bad" style="font-size:10px;">PERP · SHORT</span>
+          <span class="mono">{{ c.perp_leg.symbol or c.perp_symbol }}</span>
+        </h4>
+        {% if c.perp_leg.present %}
+        <table class="leg-table">
+          <tr><th>Quantity</th><td class="num">{{ '%.6f' % c.perp_leg.qty }}</td></tr>
+          <tr><th>Entry price</th><td class="num">{{ '%.6f' % c.perp_leg.entry_price }} USDT</td></tr>
+          <tr><th>Exit price</th><td class="num">{{ '%.6f' % c.perp_leg.exit_price }} USDT</td></tr>
+          <tr><th>Entry notional</th><td class="num">{{ '%.4f' % c.perp_leg.entry_notional }} USDT</td></tr>
+          <tr><th>Exit notional</th><td class="num">{{ '%.4f' % c.perp_leg.exit_notional }} USDT</td></tr>
+          <tr><th>Entry fee</th><td class="num">{{ '%.4f' % c.perp_leg.entry_fee }} USDT</td></tr>
+          <tr><th>Exit fee</th><td class="num">{{ '%.4f' % c.perp_leg.exit_fee }} USDT</td></tr>
+          <tr><th>Total fees</th><td class="num">{{ '%.4f' % c.perp_leg.total_fee }} USDT</td></tr>
+          <tr><th>Leg PnL</th><td class="num {{ 'good' if c.perp_leg.leg_pnl >= 0 else 'bad' }}">{{ '%+.4f' % c.perp_leg.leg_pnl }} USDT</td></tr>
+          <tr><th>Funding earned</th><td class="num {{ 'good' if c.funding_income >= 0 else 'bad' }}">{{ '%+.4f' % c.funding_income }} USDT</td></tr>
+          <tr><th>Filled at</th><td class="muted mono">{{ c.perp_leg.entry_ts or '—' }} → {{ c.perp_leg.exit_ts or '—' }}</td></tr>
+        </table>
+        {% else %}
+        <div class="muted" style="padding:6px 0;">No perp trades recorded for this position.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+  {% endfor %}
   {% else %}
   <div class="empty">No closed positions in {{ view|upper }} yet.</div>
   {% endif %}

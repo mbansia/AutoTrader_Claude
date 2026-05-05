@@ -676,19 +676,67 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
                 },
             })
 
-        # Closed positions table (formerly bottom of /positions).
+        # Closed positions table (formerly bottom of /positions). For each
+        # closed position we surface the full trade detail of all four legs
+        # — spot buy + perp sell on entry, spot sell + perp buy on close —
+        # so the operator can audit fees, slippage, and timing without
+        # cross-referencing the trades table.
         closed_rows = db.scalars(select(Position).where(Position.status == 'closed', Position.mode == v).order_by(desc(Position.id)).limit(20)).all()
-        closed = [{
-            'id': c.id,
-            'symbol': c.symbol,
-            'venue': c.exchange,
-            'quantity': c.quantity,
-            'opened_at': _fmt_ts(c.opened_at),
-            'closed_at': _fmt_ts(c.closed_at),
-            'trade_pnl': position_realized_pnl(db, c),
-            'funding_income': c.funding_income_accrued,
-            'realized': position_realized_pnl(db, c) + c.funding_income_accrued,
-        } for c in closed_rows]
+        closed = []
+        for c in closed_rows:
+            trades_for_c = db.scalars(select(Trade).where(Trade.position_id == c.id).order_by(Trade.ts)).all()
+            spot_entry = next((t for t in trades_for_c if t.venue == 'spot' and t.side == 'buy'), None)
+            spot_exit = next((t for t in trades_for_c if t.venue == 'spot' and t.side == 'sell'), None)
+            perp_entry = next((t for t in trades_for_c if t.venue == 'futures' and t.side == 'sell'), None)
+            perp_exit = next((t for t in trades_for_c if t.venue == 'futures' and t.side == 'buy'), None)
+
+            def _leg(entry, exit, side: str) -> dict:
+                """Pack a leg's entry+exit into a uniform dict the template
+                can render. ``side`` is 'long' for spot, 'short' for perp."""
+                if entry is None and exit is None:
+                    return {'present': False}
+                ep = float(entry.price) if entry else 0.0
+                xp = float(exit.price) if exit else 0.0
+                qty = float((entry or exit).quantity)
+                # Long PnL = (exit − entry) × qty; Short PnL = (entry − exit) × qty.
+                if side == 'long':
+                    leg_pnl = (xp - ep) * qty if (entry and exit) else 0.0
+                else:
+                    leg_pnl = (ep - xp) * qty if (entry and exit) else 0.0
+                return {
+                    'present': True,
+                    'symbol': (entry or exit).symbol,
+                    'side': side,
+                    'qty': qty,
+                    'entry_price': ep,
+                    'exit_price': xp,
+                    'entry_notional': ep * qty,
+                    'exit_notional': xp * qty,
+                    'entry_fee': float(entry.fee) if entry else 0.0,
+                    'exit_fee': float(exit.fee) if exit else 0.0,
+                    'total_fee': (float(entry.fee) if entry else 0.0) + (float(exit.fee) if exit else 0.0),
+                    'leg_pnl': leg_pnl,
+                    'entry_ts': _fmt_ts(entry.ts) if entry else None,
+                    'exit_ts': _fmt_ts(exit.ts) if exit else None,
+                }
+
+            closed.append({
+                'id': c.id,
+                'symbol': c.symbol,
+                'venue': c.exchange,
+                'spot_symbol': c.spot_symbol,
+                'perp_symbol': c.perp_symbol,
+                'quantity': c.quantity,
+                'opened_at': _fmt_ts(c.opened_at),
+                'closed_at': _fmt_ts(c.closed_at),
+                'hold_time': _fmt_age(c.closed_at - c.opened_at) if c.closed_at and c.opened_at else '—',
+                'trade_pnl': position_realized_pnl(db, c),
+                'funding_income': c.funding_income_accrued,
+                'realized': position_realized_pnl(db, c) + c.funding_income_accrued,
+                'spot_leg': _leg(spot_entry, spot_exit, 'long'),
+                'perp_leg': _leg(perp_entry, perp_exit, 'short'),
+                'last_close_error': c.last_close_error or '',
+            })
 
         # Capital flows (formerly on /portfolio).
         flows = db.scalars(select(CapitalFlow).where(CapitalFlow.mode == v).order_by(desc(CapitalFlow.id))).all()
