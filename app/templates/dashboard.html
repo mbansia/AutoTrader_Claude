@@ -51,20 +51,22 @@
     <div class="sub">{% for it in breakdown_items %}{% if it.value > 0 %}{{ it.label }} {{ '%.2f' % it.value }}{% if not loop.last %} · {% endif %}{% endif %}{% endfor %}</div>
   </div>
   <div class="kpi">
-    <div class="label">Net injected capital</div>
-    <div class="value">{{ '%.2f' % net_capital }} <span class="muted" style="font-size:14px">USDT</span></div>
+    <div class="label">Net injected capital (USDT)</div>
+    <div class="value">{{ '%.2f' % net_capital }}</div>
     <div class="sub">
-      {% if net_capital_meta and net_capital_meta.source == 'binance' %}
-        {% set in_n = net_capital_meta.sub_in_count or 0 %}{% set out_n = net_capital_meta.sub_out_count or 0 %}
-        {% if in_n or out_n %}
-          deposits {{ net_capital_meta.deposits_count }} · sub-in {{ in_n }} · sub-out {{ out_n }} · withdrawals {{ net_capital_meta.withdrawals_count }} · last {{ net_capital_meta.lookback_days }}d
-        {% else %}
-          {{ net_capital_meta.deposits_count }} deposits in / {{ net_capital_meta.withdrawals_count }} withdrawals out · last {{ net_capital_meta.lookback_days }}d · live from Binance
+      {% if net_capital_meta and net_capital_meta.source == 'venues' %}
+        {% for venue_id, vmeta in net_capital_meta.venue_breakdown.items() %}
+          {% if vmeta.value is not none %}
+            <span class="tag" style="font-size:10px;">{{ venue_id }} {{ '%+.2f' % vmeta.value }} USDT</span>
+          {% else %}
+            <span class="tag warn" style="font-size:10px;">{{ venue_id }} (history not wired)</span>
+          {% endif %}
+        {% endfor %}
+        {% if net_capital_meta.manual_count %}
+          + {{ net_capital_meta.manual_count }} manual flow(s) {{ '%+.2f' % net_capital_meta.manual_total }} USDT
         {% endif %}
-      {% elif net_capital_meta and net_capital_meta.error %}
-        no Binance history visible — falling back to {{ flow_count }} manual flow(s).
       {% else %}
-        {{ flow_count }} flow(s) recorded
+        {{ flow_count }} manual flow(s) — venue API history not yet visible
       {% endif %}
     </div>
   </div>
@@ -137,16 +139,30 @@
 </div>
 
 <div class="card">
-  <h3>Equity curve ({{ view|upper }}, last 60 snapshots)</h3>
+  <h3>Equity curve <span class="muted" style="font-size:13px;font-weight:400;">({{ view|upper }}, last 60 snapshots, USDT)</span></h3>
   <div class="body">
-    {% if equity_points %}
+    {% if equity_curves %}
     <svg class="equity-spark" viewBox="0 0 600 110" preserveAspectRatio="none">
-      <polyline fill="none" stroke="#38bdf8" stroke-width="2" points="{{ equity_polyline }}" />
+      {# Aggregated pool line first (dashed white so per-venue lines stand out) #}
+      <polyline fill="none" stroke="#e5e7eb" stroke-width="2" stroke-dasharray="4 3" points="{{ equity_agg_polyline }}" />
+      {# Per-venue lines (solid, venue-colored) #}
+      {% for c in equity_curves %}
+      <polyline fill="none" stroke="{{ c.color }}" stroke-width="2" points="{{ c.polyline }}" />
+      {% endfor %}
     </svg>
-    <div class="row-flex muted" style="font-size:12px;margin-top:6px;">
-      <span>{{ equity_points[0].ts }} · {{ '%.2f' % equity_points[0].equity_usdt }}</span>
-      <span class="spacer"></span>
-      <span>{{ equity_points[-1].ts }} · {{ '%.2f' % equity_points[-1].equity_usdt }}</span>
+    <div class="row-flex" style="font-size:12px;margin-top:6px;gap:18px;flex-wrap:wrap;">
+      <span class="muted" style="display:inline-flex;align-items:center;gap:6px;">
+        <span style="display:inline-block;width:24px;height:0;border-top:2px dashed #e5e7eb;"></span>
+        Pool total
+      </span>
+      {% for c in equity_curves %}
+      <span style="display:inline-flex;align-items:center;gap:6px;">
+        <span class="swatch" style="background:{{ c.color }};width:12px;height:12px;display:inline-block;border-radius:2px;"></span>
+        <strong>{{ c.venue_name }}</strong>
+        <span class="mono">{{ '%.2f' % c.latest }} USDT</span>
+        <span class="muted">({{ '%+.2f' % (c.latest - c.first) }} since {{ c.first_ts }})</span>
+      </span>
+      {% endfor %}
     </div>
     {% else %}
     <div class="empty">No equity snapshots yet — run the worker or hit "Run one cycle".</div>
@@ -296,53 +312,63 @@
   {% endif %}
 </div>
 
-{# ========== LATEST SCAN ========== #}
+{# ========== LATEST SCAN — one card per venue ========== #}
+{% if latest_scans %}
+{% for s in latest_scans %}
 <div class="card">
-  <h3>Latest scan</h3>
+  <h3>
+    <span class="swatch" style="background:{{ s.venue_color }};width:12px;height:12px;display:inline-block;border-radius:2px;vertical-align:middle;margin-right:6px;"></span>
+    Latest scan · {{ s.venue_name }}
+  </h3>
   <div class="body">
-    {% if latest_scan %}
-      <div class="row-flex muted" style="font-size:12px;margin-bottom:10px;">
-        <span>{{ latest_scan.ts }}</span>
-        <span class="tag">total {{ latest_scan.candidates_total }}</span>
-        <span class="tag good">passing {{ latest_scan.candidates_passing }}</span>
-        <span class="tag">action: {{ latest_scan.action }}</span>
-      </div>
-      {% if latest_scan_top %}
-      <table>
-        <thead><tr>
-          <th>Symbol</th>
-          <th class="num">Funding APY (%)</th>
-          <th class="num">+ Earn APR (%)</th>
-          <th class="num">Combined (%)</th>
-          <th class="num">Effective (%)</th>
-          <th class="num">Depth min (USD)</th>
-          <th class="num">Interval (h)</th>
-          <th class="num">24h Volume (USDT)</th>
-        </tr></thead>
-        <tbody>
-        {% for c in latest_scan_top %}
-          {% set depth_min = ((c.spot_depth or 0) if (c.spot_depth or 0) <= (c.perp_depth or 0) else (c.perp_depth or 0)) if c.spot_depth is defined and c.perp_depth is defined else 0 %}
-          <tr>
-            <td class="mono">{{ c.perp }}</td>
-            <td class="num good">{{ '%.2f' % (c.apr * 100) }}</td>
-            <td class="num">{{ '%.2f' % ((c.spot_earn_apr or 0) * 100) }}</td>
-            <td class="num good">{{ '%.2f' % ((c.combined_apy or c.apr) * 100) }}</td>
-            <td class="num good">{{ '%.2f' % ((c.effective_apy or c.apr/2) * 100) }}</td>
-            <td class="num">{{ '{:,.0f}'.format(depth_min) if depth_min else '—' }}</td>
-            <td class="num muted">{{ '%d' % (c.interval_h or 8) }}</td>
-            <td class="num">{{ '{:,.0f}'.format(c.qv) }}</td>
-          </tr>
-        {% endfor %}
-        </tbody>
-      </table>
-      {% else %}
-      <div class="empty">No passing candidates in latest scan.</div>
-      {% endif %}
+    <div class="row-flex muted" style="font-size:12px;margin-bottom:10px;">
+      <span>{{ s.ts }}</span>
+      <span class="tag">total {{ s.candidates_total }}</span>
+      <span class="tag good">passing {{ s.candidates_passing }}</span>
+      <span class="tag">action: {{ s.action }}</span>
+    </div>
+    {% if s.top %}
+    <table>
+      <thead><tr>
+        <th>Symbol</th>
+        <th class="num">Funding APY (%)</th>
+        <th class="num">+ Earn APR (%)</th>
+        <th class="num">Combined (%)</th>
+        <th class="num">Effective (%)</th>
+        <th class="num">Depth min (USD)</th>
+        <th class="num">Interval (h)</th>
+        <th class="num">24h Volume (USDT)</th>
+      </tr></thead>
+      <tbody>
+      {% for c in s.top %}
+        {% set depth_min = ((c.spot_depth or 0) if (c.spot_depth or 0) <= (c.perp_depth or 0) else (c.perp_depth or 0)) if c.spot_depth is defined and c.perp_depth is defined else 0 %}
+        <tr>
+          <td class="mono">{{ c.perp }}</td>
+          <td class="num good">{{ '%.2f' % (c.apr * 100) }}</td>
+          <td class="num">{{ '%.2f' % ((c.spot_earn_apr or 0) * 100) }}</td>
+          <td class="num good">{{ '%.2f' % ((c.combined_apy or c.apr) * 100) }}</td>
+          <td class="num good">{{ '%.2f' % ((c.effective_apy or c.apr/2) * 100) }}</td>
+          <td class="num">{{ '{:,.0f}'.format(depth_min) if depth_min else '—' }}</td>
+          <td class="num muted">{{ '%d' % (c.interval_h or 8) }}</td>
+          <td class="num">{{ '{:,.0f}'.format(c.qv) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
     {% else %}
-      <div class="empty">No scans recorded for {{ view|upper }} yet.</div>
+    <div class="empty">No passing candidates on {{ s.venue_name }} in latest scan.</div>
     {% endif %}
   </div>
 </div>
+{% endfor %}
+{% else %}
+<div class="card">
+  <h3>Latest scan</h3>
+  <div class="body">
+    <div class="empty">No scans recorded for {{ view|upper }} yet.</div>
+  </div>
+</div>
+{% endif %}
 
 {# ========== CAPITAL FLOWS ========== #}
 <div class="card">

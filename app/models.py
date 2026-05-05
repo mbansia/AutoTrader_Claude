@@ -94,6 +94,10 @@ class EquityCurve(Base):
     __tablename__ = 'equity_curve'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     mode: Mapped[str] = mapped_column(String(8), default=MODE_PAPER, index=True)
+    # Per-venue equity curve so dashboard can chart venues separately and
+    # aggregate them as needed. Defaults to ``binance`` for back-compat with
+    # rows written before Phase 1.
+    exchange: Mapped[str] = mapped_column(String(16), default=VENUE_BINANCE, index=True)
     ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     equity_usdt: Mapped[float] = mapped_column(Float)
 
@@ -102,6 +106,7 @@ class RejectedCandidate(Base):
     __tablename__ = 'rejected_candidates'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     mode: Mapped[str] = mapped_column(String(8), default=MODE_PAPER, index=True)
+    exchange: Mapped[str] = mapped_column(String(16), default=VENUE_BINANCE, index=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
     reason: Mapped[str] = mapped_column(Text)
     funding_rate: Mapped[float] = mapped_column(Float, default=0.0)
@@ -112,6 +117,9 @@ class BotEvent(Base):
     __tablename__ = 'bot_events'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     mode: Mapped[str] = mapped_column(String(8), default=MODE_PAPER, index=True)
+    # 'binance' | 'kucoin' | 'system' (cross-venue cycle events). Lets the
+    # logs page filter by venue and the export-md split events per venue.
+    exchange: Mapped[str] = mapped_column(String(16), default=VENUE_BINANCE, index=True)
     level: Mapped[str] = mapped_column(String(16), default='INFO')
     message: Mapped[str] = mapped_column(Text)
     ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
@@ -190,6 +198,10 @@ class StrategyConfig(Base):
 
 
 class BalanceSnapshot(Base):
+    """Per-cycle, per-(mode, venue) snapshot of the wallet balances. The
+    dashboard reads the latest row per venue and sums to get the live total.
+    Multi-venue aware: previously only carried ``source=mode`` so two venues
+    in the same mode would race each other on every cycle."""
     __tablename__ = 'balance_snapshots'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
@@ -198,12 +210,18 @@ class BalanceSnapshot(Base):
     total_usdt: Mapped[float] = mapped_column(Float, default=0.0)
     # 'paper' or 'live' — predates the formal `mode` convention; kept compatible.
     source: Mapped[str] = mapped_column(String(16), default=MODE_PAPER, index=True)
+    # Which venue this snapshot is for. Default 'binance' for back-compat.
+    exchange: Mapped[str] = mapped_column(String(16), default=VENUE_BINANCE, index=True)
 
 
 class CapitalFlow(Base):
     __tablename__ = 'capital_flows'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     mode: Mapped[str] = mapped_column(String(8), default=MODE_PAPER, index=True)
+    # Which venue the flow happened on. Manual flows can be attributed to a
+    # specific venue (e.g. user deposited $20 into the KuCoin sub-account)
+    # so net-injected-capital aggregates correctly across venues.
+    exchange: Mapped[str] = mapped_column(String(16), default=VENUE_BINANCE, index=True)
     ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     amount_usdt: Mapped[float] = mapped_column(Float)
     kind: Mapped[str] = mapped_column(String(16), default='deposit')
@@ -215,6 +233,9 @@ class ScanResult(Base):
     __tablename__ = 'scan_results'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     mode: Mapped[str] = mapped_column(String(8), default=MODE_PAPER, index=True)
+    # Which venue this scan covers. The Logs tab groups scans by venue so the
+    # user can see whether KuCoin's funding scan is actually running.
+    exchange: Mapped[str] = mapped_column(String(16), default=VENUE_BINANCE, index=True)
     ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
     candidates_total: Mapped[int] = mapped_column(Integer, default=0)
     candidates_passing: Mapped[int] = mapped_column(Integer, default=0)

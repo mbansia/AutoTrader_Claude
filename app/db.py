@@ -76,14 +76,13 @@ def run_schema_migrations() -> None:
     _add_column_if_missing('strategy_config', 'min_order_book_depth_usdt', 'FLOAT NOT NULL DEFAULT 500.0')
     _add_column_if_missing('strategy_config', 'depth_band_bps', 'FLOAT NOT NULL DEFAULT 10.0')
     _add_column_if_missing('positions', 'last_close_error', "TEXT NOT NULL DEFAULT ''")
-    # Cross-venue tag — every Position / Trade is attributable to a single
-    # exchange / broker. The whole portfolio is one pool distributed across
-    # venues; this column is what makes the dashboard break down equity and
-    # PnL by venue without ambiguity. Binance today, KuCoin / Interactive
-    # Brokers in the future. Named ``exchange`` because ``venue`` was already
-    # taken on ``trades`` (it's the spot/futures leg label).
-    _add_column_if_missing('positions', 'exchange', "VARCHAR(16) NOT NULL DEFAULT 'binance'")
-    _add_column_if_missing('trades', 'exchange', "VARCHAR(16) NOT NULL DEFAULT 'binance'")
+    # Cross-venue tag — every per-row table carries an ``exchange`` column so
+    # the dashboard, logs, scans, and exports can break down state by venue
+    # without ambiguity. Default 'binance' on every existing row guarantees
+    # the existing data renders correctly the first time the migration runs.
+    for table in ('positions', 'trades', 'balance_snapshots', 'equity_curve',
+                  'rejected_candidates', 'bot_events', 'capital_flows', 'scan_results'):
+        _add_column_if_missing(table, 'exchange', "VARCHAR(16) NOT NULL DEFAULT 'binance'")
 
     # One-shot cleanup: the old auto-detect heuristic created CapitalFlow rows
     # with detected_by='auto' whenever the live wallet drifted from the previous

@@ -48,7 +48,7 @@ from sqlalchemy import func, select
 
 from app.config import settings
 from app.db import SessionLocal
-from app.exchange import BINANCE_ERR_NO_EARN_POSITION, BinanceGateway, _interval_hours, annualize_rate, make_gateways
+from app.exchange import BINANCE_ERR_NO_EARN_POSITION, VenueGateway, _interval_hours, annualize_rate, make_gateways
 from app.finance import position_realized_pnl, position_unrealized_pnl, total_realized_pnl
 from app.models import (
     ALL_MODES,
@@ -76,8 +76,6 @@ from app.safety import (
 )
 
 
-CAPITAL_FLOW_THRESHOLD_USDT = 1.0  # was 50 — too coarse for the typical $20 starting equity
-
 # Module-level dedup so we only log "live API down" once per outage instead of every cycle.
 _LIVE_API_UNHEALTHY_LOGGED = False
 
@@ -86,8 +84,14 @@ _LIVE_API_UNHEALTHY_LOGGED = False
 _CLOSE_ERROR_CACHE: dict[tuple[int, str], str] = {}
 
 
-def log_event(db, message: str, mode: str = MODE_PAPER, level: str = 'INFO'):
-    db.add(BotEvent(mode=mode, level=level, message=message))
+def log_event(db, message: str, mode: str = MODE_PAPER, level: str = 'INFO', exchange: str = 'system'):
+    """Persist a BotEvent row.
+
+    ``exchange`` should be the venue this event pertains to (``binance``,
+    ``kucoin``, …) so the Logs tab can filter by venue. Use ``'system'`` for
+    cross-venue events (e.g. cycle-level errors, schema migrations) so they
+    don't get attributed to a single venue."""
+    db.add(BotEvent(mode=mode, exchange=exchange, level=level, message=message))
 
 
 def get_runtime_state(db) -> RuntimeState:
@@ -157,7 +161,7 @@ def _accrue_paper_funding(db, gateway, mode: str) -> None:
         p.last_funding_accrual_ts = now
 
 
-def _refresh_live_earn_balance(gateway: BinanceGateway, earn: EarnState) -> None:
+def _refresh_live_earn_balance(gateway: VenueGateway, earn: EarnState) -> None:
     bal, err = gateway.earn_balance_usdt()
     if bal is not None:
         # Compute realized yield since last refresh (deposits/redeems make this approximate
@@ -190,7 +194,7 @@ def get_strategy_config(db) -> StrategyConfig:
         cfg.exit_funding_threshold = round(cfg.exit_funding_threshold * 1095.0, 6)
         migrated = True
     if migrated:
-        log_event(db, f'Migrated funding thresholds to APR: entry={cfg.entry_funding_threshold:.4f}, exit={cfg.exit_funding_threshold:.4f}', mode=MODE_PAPER)
+        log_event(db, f'Migrated funding thresholds to APR: entry={cfg.entry_funding_threshold:.4f}, exit={cfg.exit_funding_threshold:.4f}', mode=MODE_PAPER, exchange='system')
         db.flush()
     return cfg
 
@@ -224,10 +228,10 @@ def _log_close_error(db, p: Position, leg: str, err: str) -> None:
     if _CLOSE_ERROR_CACHE.get(key) == snippet:
         return  # already logged this exact error for this leg
     _CLOSE_ERROR_CACHE[key] = snippet
-    log_event(db, f'Failed to close {leg} leg of {p.perp_symbol}: {snippet} (will retry next cycle)', mode=p.mode, level='ERROR')
+    log_event(db, f'Failed to close {leg} leg of {p.perp_symbol}: {snippet} (will retry next cycle)', mode=p.mode, level='ERROR', exchange=p.exchange)
 
 
-def _ensure_close_readiness(db, gateway: BinanceGateway, p: Position, cfg: StrategyConfig) -> None:
+def _ensure_close_readiness(db, gateway: VenueGateway, p: Position, cfg: StrategyConfig) -> None:
     """Walk all three wallets (spot, futures, earn) and reshuffle capital so the
     close has both legs funded. Live only — paper has no separate wallets.
 
@@ -258,11 +262,11 @@ def _ensure_close_readiness(db, gateway: BinanceGateway, p: Position, cfg: Strat
         if deficit > 0:
             ok, err = gateway.earn_redeem_asset(base, deficit, False)
             if ok:
-                log_event(db, f'Pre-close: redeemed {deficit:.6f} {base} from Earn', mode=p.mode)
+                log_event(db, f'Pre-close: redeemed {deficit:.6f} {base} from Earn', mode=p.mode, exchange=p.exchange)
             elif BINANCE_ERR_NO_EARN_POSITION in err or "doesn't exist" in err.lower() or 'no flexible product' in err.lower():
                 pass  # nothing was subscribed; close_spot will use whatever's already in spot
             else:
-                log_event(db, f'Pre-close: redeem {base} for {p.perp_symbol} failed: {err[:120]}', mode=p.mode, level='WARN')
+                log_event(db, f'Pre-close: redeem {base} for {p.perp_symbol} failed: {err[:120]}', mode=p.mode, level='WARN', exchange=p.exchange)
 
     # ---- Perp leg margin side ----
     fut_free = float((bals.get('futures', {}).get('USDT') or {}).get('free') or 0)
@@ -288,9 +292,9 @@ def _ensure_close_readiness(db, gateway: BinanceGateway, p: Position, cfg: Strat
                 spot_free -= transfer
                 fut_free += transfer
                 gap -= transfer
-                log_event(db, f'Pre-close: transferred {transfer:.2f} USDT spot→futures (margin top-up for {p.perp_symbol})', mode=p.mode)
+                log_event(db, f'Pre-close: transferred {transfer:.2f} USDT spot→futures (margin top-up for {p.perp_symbol})', mode=p.mode, exchange=p.exchange)
             else:
-                log_event(db, f'Pre-close: spot→futures transfer for {p.perp_symbol} failed: {err[:120]}', mode=p.mode, level='WARN')
+                log_event(db, f'Pre-close: spot→futures transfer for {p.perp_symbol} failed: {err[:120]}', mode=p.mode, level='WARN', exchange=p.exchange)
 
     # Step 2: redeem USDT from Earn → spot → futures
     if gap >= 0.20 and cfg.earn_enabled and cfg.auto_transfer_enabled:
@@ -300,17 +304,17 @@ def _ensure_close_readiness(db, gateway: BinanceGateway, p: Position, cfg: Strat
             redeem_amt = min(gap + 0.20, earn_bal)  # tiny extra so subsequent transfer has room
             ok, err = gateway.earn_redeem(redeem_amt, False)
             if ok:
-                log_event(db, f'Pre-close: redeemed {redeem_amt:.2f} USDT from Earn (margin top-up for {p.perp_symbol})', mode=p.mode)
+                log_event(db, f'Pre-close: redeemed {redeem_amt:.2f} USDT from Earn (margin top-up for {p.perp_symbol})', mode=p.mode, exchange=p.exchange)
                 transfer = min(gap, redeem_amt)
                 if transfer >= 0.20:
                     ok2, err2 = gateway.transfer_spot_to_futures(transfer, False)
                     if ok2:
-                        log_event(db, f'Pre-close: transferred {transfer:.2f} USDT to futures (Earn → spot → futures)', mode=p.mode)
+                        log_event(db, f'Pre-close: transferred {transfer:.2f} USDT to futures (Earn → spot → futures)', mode=p.mode, exchange=p.exchange)
                     else:
-                        log_event(db, f'Pre-close: post-redeem transfer for {p.perp_symbol} failed: {err2[:120]}', mode=p.mode, level='WARN')
+                        log_event(db, f'Pre-close: post-redeem transfer for {p.perp_symbol} failed: {err2[:120]}', mode=p.mode, level='WARN', exchange=p.exchange)
 
 
-def _rebalance_spot_fut(db, gateway: BinanceGateway, cfg: StrategyConfig, mode: str) -> None:
+def _rebalance_spot_fut(db, gateway: VenueGateway, cfg: StrategyConfig, mode: str) -> None:
     """Move USDT between spot and futures wallets so both have roughly the same free
     balance — the right baseline for an arb that always opens equal legs. Runs once
     at the end of each live cycle. Threshold avoids ping-ponging on tiny dust."""
@@ -332,12 +336,12 @@ def _rebalance_spot_fut(db, gateway: BinanceGateway, cfg: StrategyConfig, mode: 
         ok, err = gateway.transfer_futures_to_spot(transfer, False)
         direction = 'futures→spot'
     if ok:
-        log_event(db, f'Rebalance: {transfer:.2f} USDT {direction} (spot {spot_free:.2f} ↔ fut {fut_free:.2f})', mode=mode)
+        log_event(db, f'Rebalance: {transfer:.2f} USDT {direction} (spot {spot_free:.2f} ↔ fut {fut_free:.2f})', mode=mode, exchange=gateway.venue_id)
     else:
-        log_event(db, f'Rebalance {direction} failed: {err}', mode=mode, level='WARN')
+        log_event(db, f'Rebalance {direction} failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
 
-def _actual_spot_qty(gateway: BinanceGateway, p: Position) -> float:
+def _actual_spot_qty(gateway: VenueGateway, p: Position) -> float:
     """Actual base-asset balance on Binance spot, capped at p.quantity. Handles
     drift from fee deductions, lot-size rounding, or earlier partial fills."""
     bals = gateway.safe_balances() or {}
@@ -346,7 +350,7 @@ def _actual_spot_qty(gateway: BinanceGateway, p: Position) -> float:
     return min(p.quantity, max(0.0, actual))
 
 
-def _actual_perp_qty(gateway: BinanceGateway, p: Position) -> float:
+def _actual_perp_qty(gateway: VenueGateway, p: Position) -> float:
     """Actual perp position size on Binance, capped at p.quantity."""
     try:
         for r in gateway.open_perp_positions_raw():
@@ -365,7 +369,7 @@ def _is_dust(qty: float, min_amount: float) -> bool:
     return min_amount > 0 and 0 < qty < min_amount
 
 
-def _position_leg_states(gateway: BinanceGateway, p: Position, tolerance: float = 0.05) -> dict:
+def _position_leg_states(gateway: VenueGateway, p: Position, tolerance: float = 0.05) -> dict:
     """Returns per-leg state vs Binance for a position. Used for UI display
     and the cycle's reconciliation step.
 
@@ -391,7 +395,7 @@ def _position_leg_states(gateway: BinanceGateway, p: Position, tolerance: float 
     }
 
 
-def _reconcile_open_position_state(db, gateway: BinanceGateway, mode: str) -> None:
+def _reconcile_open_position_state(db, gateway: VenueGateway, mode: str) -> None:
     """For each open position on this gateway's venue, check actual leg state.
     If both legs are flat (e.g., the user closed manually, or a previous
     partial close fully completed externally), mark the row closed in DB so
@@ -406,10 +410,10 @@ def _reconcile_open_position_state(db, gateway: BinanceGateway, mode: str) -> No
             p.last_close_error = ''
             _CLOSE_ERROR_CACHE.pop((p.id, 'spot'), None)
             _CLOSE_ERROR_CACHE.pop((p.id, 'perp'), None)
-            log_event(db, f'Reconciled {p.perp_symbol} on {gateway.name}: both legs flat — marking closed', mode=mode)
+            log_event(db, f'Reconciled {p.perp_symbol} on {gateway.name}: both legs flat — marking closed', mode=mode, exchange=gateway.venue_id)
 
 
-def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyConfig, reason: str) -> None:
+def _force_close_both(db, gateway: VenueGateway, p: Position, cfg: StrategyConfig, reason: str) -> None:
     """Close both legs of a position. The whole point of an arb is being hedged,
     so we never WANT to leave one leg open — if either close fails we either
     abort (preserving the hedge for retry) or surface CRITICAL when there's no
@@ -442,11 +446,11 @@ def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyCon
 
     # Sub-LOT_SIZE dust is un-tradeable on Binance — treat the leg as flat.
     if _is_dust(spot_qty, spot_min):
-        log_event(db, f'Spot leg of {p.perp_symbol} is sub-min-lot dust ({spot_qty:.6f} < {spot_min:.6f}); treating as flat', mode=p.mode, level='WARN')
+        log_event(db, f'Spot leg of {p.perp_symbol} is sub-min-lot dust ({spot_qty:.6f} < {spot_min:.6f}); treating as flat', mode=p.mode, level='WARN', exchange=p.exchange)
         spot_qty = 0.0
         spot_ok = True
     if _is_dust(perp_qty, perp_min):
-        log_event(db, f'Perp leg of {p.perp_symbol} is sub-min-lot dust ({perp_qty:.6f} < {perp_min:.6f}); treating as flat', mode=p.mode, level='WARN')
+        log_event(db, f'Perp leg of {p.perp_symbol} is sub-min-lot dust ({perp_qty:.6f} < {perp_min:.6f}); treating as flat', mode=p.mode, level='WARN', exchange=p.exchange)
         perp_qty = 0.0
         perp_ok = True
 
@@ -454,7 +458,7 @@ def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyCon
     if spot_qty > 0:
         try:
             s = gateway.close_spot(p.spot_symbol, spot_qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-            record_trade(db, p.id, p.mode, p.spot_symbol, 'spot', 'sell', spot_qty, s)
+            record_trade(db, p.id, p.mode, p.spot_symbol, 'spot', 'sell', spot_qty, s, exchange=p.exchange)
             spot_ok = True
         except Exception as e:
             _log_close_error(db, p, 'spot', str(e))
@@ -465,7 +469,7 @@ def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyCon
     if perp_qty > 0:
         try:
             f = gateway.close_perp(p.perp_symbol, perp_qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-            record_trade(db, p.id, p.mode, p.perp_symbol, 'futures', 'buy', perp_qty, f)
+            record_trade(db, p.id, p.mode, p.perp_symbol, 'futures', 'buy', perp_qty, f, exchange=p.exchange)
             perp_ok = True
         except Exception as e:
             _log_close_error(db, p, 'perp', str(e))
@@ -485,10 +489,10 @@ def _force_close_both(db, gateway: BinanceGateway, p: Position, cfg: StrategyCon
         p.last_close_error = ''
         _CLOSE_ERROR_CACHE.pop((p.id, 'spot'), None)
         _CLOSE_ERROR_CACHE.pop((p.id, 'perp'), None)
-        log_event(db, f'Closed {p.perp_symbol} ({reason}); realized={position_realized_pnl(db, p):+.4f}', mode=p.mode)
+        log_event(db, f'Closed {p.perp_symbol} ({reason}); realized={position_realized_pnl(db, p):+.4f}', mode=p.mode, exchange=p.exchange)
 
 
-def _close_naked_leg(db, gateway: BinanceGateway, p: Position, cfg: StrategyConfig, surviving_leg: str | None, reason: str) -> None:
+def _close_naked_leg(db, gateway: VenueGateway, p: Position, cfg: StrategyConfig, surviving_leg: str | None, reason: str) -> None:
     paper = (p.mode == MODE_PAPER)
     closed_ok = False
     try:
@@ -498,45 +502,45 @@ def _close_naked_leg(db, gateway: BinanceGateway, p: Position, cfg: StrategyConf
             qty = _actual_spot_qty(gateway, p) if not paper else p.quantity
             min_amt = gateway.market_min_amount(p.spot_symbol, perp=False) if not paper else 0.0
             if _is_dust(qty, min_amt):
-                log_event(db, f'Naked spot leg of {p.perp_symbol} is sub-min-lot dust ({qty:.6f} < {min_amt:.6f}); treating as flat', mode=p.mode, level='WARN')
+                log_event(db, f'Naked spot leg of {p.perp_symbol} is sub-min-lot dust ({qty:.6f} < {min_amt:.6f}); treating as flat', mode=p.mode, level='WARN', exchange=p.exchange)
                 closed_ok = True
             elif qty <= 0:
                 closed_ok = True
             else:
                 s = gateway.close_spot(p.spot_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-                record_trade(db, p.id, p.mode, p.spot_symbol, 'spot', 'sell', qty, s)
+                record_trade(db, p.id, p.mode, p.spot_symbol, 'spot', 'sell', qty, s, exchange=p.exchange)
                 closed_ok = True
         elif surviving_leg == 'perp':
             qty = _actual_perp_qty(gateway, p) if not paper else p.quantity
             min_amt = gateway.market_min_amount(p.perp_symbol, perp=True) if not paper else 0.0
             if _is_dust(qty, min_amt):
-                log_event(db, f'Naked perp leg of {p.perp_symbol} is sub-min-lot dust ({qty:.6f} < {min_amt:.6f}); treating as flat', mode=p.mode, level='WARN')
+                log_event(db, f'Naked perp leg of {p.perp_symbol} is sub-min-lot dust ({qty:.6f} < {min_amt:.6f}); treating as flat', mode=p.mode, level='WARN', exchange=p.exchange)
                 closed_ok = True
             elif qty <= 0:
                 closed_ok = True
             else:
                 f = gateway.close_perp(p.perp_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-                record_trade(db, p.id, p.mode, p.perp_symbol, 'futures', 'buy', qty, f)
+                record_trade(db, p.id, p.mode, p.perp_symbol, 'futures', 'buy', qty, f, exchange=p.exchange)
                 closed_ok = True
         else:
             closed_ok = True  # no surviving leg to close
     except Exception as e:
         snippet = str(e)[:140]
         p.last_close_error = f'{surviving_leg or "?"}: {snippet}'
-        log_event(db, f'Failed to flatten naked {surviving_leg} leg of {p.perp_symbol}: {snippet} (will retry)', mode=p.mode, level='ERROR')
+        log_event(db, f'Failed to flatten naked {surviving_leg} leg of {p.perp_symbol}: {snippet} (will retry)', mode=p.mode, level='ERROR', exchange=p.exchange)
         return
     if closed_ok:
         p.status = 'closed'
         p.closed_at = datetime.utcnow()
         p.last_close_error = ''
-        log_event(db, f'Closed naked leg on {p.perp_symbol}: {reason}; flattened {surviving_leg or "no surviving leg"}', mode=p.mode, level='ERROR')
+        log_event(db, f'Closed naked leg on {p.perp_symbol}: {reason}; flattened {surviving_leg or "no surviving leg"}', mode=p.mode, level='ERROR', exchange=p.exchange)
 
 
-def manual_close(db, gateway: BinanceGateway, p: Position, cfg: StrategyConfig) -> None:
+def manual_close(db, gateway: VenueGateway, p: Position, cfg: StrategyConfig) -> None:
     _force_close_both(db, gateway, p, cfg, 'manual_close')
 
 
-def reconcile_positions(gateway: BinanceGateway) -> None:
+def reconcile_positions(gateway: VenueGateway) -> None:
     """Rehydrate any perp positions on this gateway's venue that aren't tracked locally."""
     with SessionLocal() as db:
         for p in gateway.open_perp_positions_raw():
@@ -547,17 +551,17 @@ def reconcile_positions(gateway: BinanceGateway) -> None:
                 continue
             base = symbol.split('/')[0]
             db.add(Position(mode=MODE_LIVE, exchange=gateway.venue_id, symbol=base, spot_symbol=f'{base}/USDT', perp_symbol=symbol, quantity=abs(pos_amt), entry_funding_rate=0.0))
-            log_event(db, f'Rehydrated orphan position {symbol} on {gateway.name} qty={pos_amt}', mode=MODE_LIVE)
+            log_event(db, f'Rehydrated orphan position {symbol} on {gateway.name} qty={pos_amt}', mode=MODE_LIVE, exchange=gateway.venue_id)
         db.commit()
 
 
-def _compute_equity_and_free(db, gateway: BinanceGateway, mode: str, cfg: StrategyConfig, earn: EarnState) -> tuple[float, float]:
+def _compute_equity_and_free(db, gateway: VenueGateway, mode: str, cfg: StrategyConfig, earn: EarnState) -> tuple[float, float]:
     """Total portfolio equity in USDT and the amount currently free for opening a position.
     For paper, free = total − earn_deployed − sum(open spot notionals). For live, free is the
     smaller of spot.free and futures.free since both legs of an arb need margin; earn money
     sits in a separate Binance wallet so it's already excluded from spot.free."""
     if mode == MODE_PAPER:
-        realized = total_realized_pnl(db, mode=mode)
+        realized = total_realized_pnl(db, mode=mode, exchange=gateway.venue_id)
         open_ps = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)).all()
         unrealized = 0.0
         open_notional = 0.0
@@ -604,7 +608,7 @@ def _compute_equity_and_free(db, gateway: BinanceGateway, mode: str, cfg: Strate
     return total_equity, min(spot_free, fut_free)
 
 
-def _take_balance_snapshot(db, gateway: BinanceGateway, mode: str, cfg: StrategyConfig, earn: EarnState) -> BalanceSnapshot:
+def _take_balance_snapshot(db, gateway: VenueGateway, mode: str, cfg: StrategyConfig, earn: EarnState) -> BalanceSnapshot:
     # Both modes share the live/paper-aware equity calc which already includes
     # spot asset values for tracked positions in live mode.
     total_equity, _ = _compute_equity_and_free(db, gateway, mode, cfg, earn)
@@ -612,37 +616,15 @@ def _take_balance_snapshot(db, gateway: BinanceGateway, mode: str, cfg: Strategy
         bals = gateway.safe_balances()
         spot = float((bals['spot'].get('USDT') or {}).get('total') or 0) if bals else 0.0
         fut = float((bals['futures'].get('USDT') or {}).get('total') or 0) if bals else 0.0
-        snap = BalanceSnapshot(spot_usdt=spot, futures_usdt=fut, total_usdt=total_equity, source=MODE_LIVE)
+        snap = BalanceSnapshot(spot_usdt=spot, futures_usdt=fut, total_usdt=total_equity, source=MODE_LIVE, exchange=gateway.venue_id)
     else:
-        snap = BalanceSnapshot(spot_usdt=total_equity, futures_usdt=0.0, total_usdt=total_equity, source=mode)
+        snap = BalanceSnapshot(spot_usdt=total_equity, futures_usdt=0.0, total_usdt=total_equity, source=mode, exchange=gateway.venue_id)
     db.add(snap)
     db.flush()
     return snap
 
 
-def _detect_capital_flow(db, prev: BalanceSnapshot | None, curr: BalanceSnapshot, mode: str) -> None:
-    if mode != MODE_LIVE:
-        return  # auto-detection is only meaningful against real exchange balances
-    if prev is None or prev.source != curr.source:
-        return
-    delta = curr.total_usdt - prev.total_usdt
-    if abs(delta) < CAPITAL_FLOW_THRESHOLD_USDT:
-        return
-    trade_count = db.scalar(select(func.count(Trade.id)).where(Trade.ts > prev.ts, Trade.ts <= curr.ts, Trade.mode == mode)) or 0
-    if trade_count > 0:
-        return
-    cf = CapitalFlow(
-        mode=mode,
-        amount_usdt=delta,
-        kind='deposit' if delta > 0 else 'withdrawal',
-        detected_by='auto',
-        note=f'Auto-detected balance jump of {delta:+.2f} USDT with no trade activity',
-    )
-    db.add(cf)
-    log_event(db, f'Detected capital flow {delta:+.2f} USDT', mode=mode)
-
-
-def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
+def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
     paper = (mode == MODE_PAPER)
     try:
         with SessionLocal() as db:
@@ -675,7 +657,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                     db.commit()
                     return
                 elif _LIVE_API_UNHEALTHY_LOGGED:
-                    log_event(db, 'Live API recovered.', mode=MODE_LIVE, level='INFO')
+                    log_event(db, f'{gateway.name} API recovered.', mode=MODE_LIVE, level='INFO', exchange=gateway.venue_id)
                     _LIVE_API_UNHEALTHY_LOGGED = False
 
             # Earn upkeep: accrue paper-mode interest or fetch the live deployed balance.
@@ -705,9 +687,9 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                             quantity=pos_amt, entry_funding_rate=0.0,
                             last_funding_accrual_ts=datetime.utcnow(),
                         ))
-                        log_event(db, f'Rehydrated orphan position {sym} on {gateway.name} qty={pos_amt}', mode=MODE_LIVE, level='WARN')
+                        log_event(db, f'Rehydrated orphan position {sym} on {gateway.name} qty={pos_amt}', mode=MODE_LIVE, level='WARN', exchange=gateway.venue_id)
                 except Exception as e:
-                    log_event(db, f'Reconcile failed on {gateway.name}: {str(e)[:120]}', mode=MODE_LIVE, level='WARN')
+                    log_event(db, f'Reconcile failed on {gateway.name}: {str(e)[:120]}', mode=MODE_LIVE, level='WARN', exchange=gateway.venue_id)
                 # And the inverse direction: if a position is open in our DB but
                 # both legs are actually flat on Binance (user closed manually,
                 # or a partial close fully completed outside the bot), mark it
@@ -715,7 +697,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                 try:
                     _reconcile_open_position_state(db, gateway, mode)
                 except Exception as e:
-                    log_event(db, f'State reconcile failed: {str(e)[:120]}', mode=MODE_LIVE, level='WARN')
+                    log_event(db, f'State reconcile failed on {gateway.name}: {str(e)[:120]}', mode=MODE_LIVE, level='WARN', exchange=gateway.venue_id)
 
             # Live short-circuit: if entries are off, no positions, and no earn or
             # auto-transfer to do, skip the API hits entirely.
@@ -731,7 +713,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                     _force_close_both(db, gateway, p, cfg, 'maintenance')
                 if mstate.entry_enabled:
                     mstate.entry_enabled = False
-                    log_event(db, 'Maintenance mode active — entries disabled', mode=mode)
+                    log_event(db, 'Maintenance mode active — entries disabled', mode=mode, exchange=gateway.venue_id)
                 # leave maintenance_mode set; user clears it via the dashboard
                 db.commit()
                 return
@@ -783,7 +765,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                     if exit_reason and not mandatory and spot_now and perp_now:
                         favorable, bps = is_basis_exit_favorable(spot_now, perp_now, cfg.max_exit_basis_bps)
                         if not favorable:
-                            log_event(db, f'Exit deferred for {p.perp_symbol} ({exit_reason}): basis={bps:+.1f}bps > max_exit={cfg.max_exit_basis_bps:.1f}bps', mode=mode)
+                            log_event(db, f'Exit deferred for {p.perp_symbol} ({exit_reason}): basis={bps:+.1f}bps > max_exit={cfg.max_exit_basis_bps:.1f}bps', mode=mode, exchange=gateway.venue_id)
                             continue
                     if exit_reason:
                         _force_close_both(db, gateway, p, cfg, exit_reason)
@@ -809,7 +791,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                     )
                 except Exception as e:
                     passing, candidates_total, rejected_scan = [], 0, []
-                    log_event(db, f'scan_funding failed: {e}', mode=mode, level='ERROR')
+                    log_event(db, f'scan_funding failed: {e}', mode=mode, level='ERROR', exchange=gateway.venue_id)
                 candidates_passing = len(passing)
                 top_candidates_payload = [{
                     'perp': c.perp_symbol,
@@ -823,7 +805,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                     'combined_apy': c.combined_apy,
                 } for c in passing[:5]]
                 for sym, reason, apr in rejected_scan[:20]:
-                    db.add(RejectedCandidate(mode=mode, symbol=sym, reason=reason, funding_rate=apr))
+                    db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=sym, reason=reason, funding_rate=apr))
 
                 total_equity, free = _compute_equity_and_free(db, gateway, mode, cfg, earn)
                 # Pull per-wallet free balances so we can act on each leg's constraint
@@ -851,10 +833,10 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                             if ok:
                                 earn.deployed_usdt -= need
                                 spot_free += need
-                                log_event(db, f'Redeemed {need:.4f} USDT from earn before opening', mode=mode)
+                                log_event(db, f'Redeemed {need:.4f} USDT from earn before opening', mode=mode, exchange=gateway.venue_id)
                             else:
                                 earn.last_error = err
-                                log_event(db, f'Earn redeem USDT (need={need:.4f}) failed: {err}', mode=mode, level='WARN')
+                                log_event(db, f'Earn redeem USDT (need={need:.4f}) failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
                     # Transfer spot→futures so the perp leg has margin (once per cycle).
                     if mode == MODE_LIVE and cfg.auto_transfer_enabled and fut_free < desired_notional and spot_free > desired_notional:
@@ -864,9 +846,9 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                             if ok:
                                 spot_free -= transfer
                                 fut_free += transfer
-                                log_event(db, f'Auto-transferred {transfer:.2f} USDT spot→futures for perp margin', mode=mode)
+                                log_event(db, f'Auto-transferred {transfer:.2f} USDT spot→futures for perp margin', mode=mode, exchange=gateway.venue_id)
                             else:
-                                log_event(db, f'spot→futures transfer failed: {err}', mode=mode, level='WARN')
+                                log_event(db, f'spot→futures transfer failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
                     # Diversity: skip any candidate whose base asset we already hold open
                     # in this mode. Avoids piling more capital into the same name even
@@ -884,7 +866,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                         sized_notional = min(free_for_arb * 0.97, desired_notional)
                         if sized_notional < min_notional:
                             reason = f'below min position pct ({sized_notional:.2f} < {min_notional:.2f} USDT; spot_free={spot_free:.2f} fut_free={fut_free:.2f})'
-                            db.add(RejectedCandidate(mode=mode, symbol=c.perp_symbol, reason=reason, funding_rate=c.funding_apr))
+                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=reason, funding_rate=c.funding_apr))
                             scan_action = 'below_min_pct'
                             continue
                         spot_px = gateway.safe_price(c.spot_symbol) or 0
@@ -893,7 +875,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                             continue
                         ok, entry_bps = is_basis_entry_acceptable(spot_px, perp_px, cfg.max_entry_basis_bps)
                         if not ok:
-                            db.add(RejectedCandidate(mode=mode, symbol=c.perp_symbol, reason=f'basis_too_wide ({entry_bps:+.1f}bps > ±{cfg.max_entry_basis_bps:.1f})', funding_rate=c.funding_apr))
+                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=f'basis_too_wide ({entry_bps:+.1f}bps > ±{cfg.max_entry_basis_bps:.1f})', funding_rate=c.funding_apr))
                             scan_action = 'basis_too_wide'
                             continue
                         qty = sized_notional / max(0.0001, spot_px)
@@ -903,8 +885,8 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                             s = gateway.create_spot_buy(c.spot_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
                         except Exception as e:
                             err = str(e)[:140]
-                            log_event(db, f'Spot buy failed for {c.spot_symbol}: {err}', mode=mode, level='ERROR')
-                            db.add(RejectedCandidate(mode=mode, symbol=c.perp_symbol, reason=f'spot_buy_error: {err[:80]}', funding_rate=c.funding_apr))
+                            log_event(db, f'Spot buy failed for {c.spot_symbol}: {err}', mode=mode, level='ERROR', exchange=gateway.venue_id)
+                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=f'spot_buy_error: {err[:80]}', funding_rate=c.funding_apr))
                             scan_action = 'spot_buy_error'
                             continue
 
@@ -926,7 +908,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                         )
                         db.add(pos)
                         db.flush()
-                        record_trade(db, pos.id, mode, c.spot_symbol, 'spot', 'buy', qty, s)
+                        record_trade(db, pos.id, mode, c.spot_symbol, 'spot', 'buy', qty, s, exchange=gateway.venue_id)
 
                         # Now the perp short. Configure CROSS margin + 1x leverage on the
                         # symbol first — keeps the perp's used margin == its notional and
@@ -934,24 +916,24 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                         if not paper:
                             cfg_ok, cfg_err = gateway.configure_perp_for_arb(c.perp_symbol)
                             if not cfg_ok:
-                                log_event(db, f'configure_perp_for_arb({c.perp_symbol}) warned: {cfg_err[:120]}', mode=mode, level='WARN')
+                                log_event(db, f'configure_perp_for_arb({c.perp_symbol}) warned: {cfg_err[:120]}', mode=mode, level='WARN', exchange=gateway.venue_id)
                         try:
                             f = gateway.create_perp_short(c.perp_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
                         except Exception as e:
                             err = str(e)[:140]
-                            log_event(db, f'Perp short failed for {c.perp_symbol} after spot bought: {err} — rolling back spot leg', mode=mode, level='ERROR')
+                            log_event(db, f'Perp short failed for {c.perp_symbol} after spot bought: {err} — rolling back spot leg', mode=mode, level='ERROR', exchange=gateway.venue_id)
                             try:
                                 if not paper and cfg.earn_subscribe_spot_assets:
                                     base = c.spot_symbol.split('/')[0]
                                     gateway.earn_redeem_asset(base, qty, False)
                                 rev = gateway.close_spot(c.spot_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-                                record_trade(db, pos.id, mode, c.spot_symbol, 'spot', 'sell', qty, rev)
+                                record_trade(db, pos.id, mode, c.spot_symbol, 'spot', 'sell', qty, rev, exchange=gateway.venue_id)
                                 pos.status = 'closed'
                                 pos.closed_at = datetime.utcnow()
-                                log_event(db, f'Rolled back spot leg of {c.perp_symbol}; loss ≈ entry+exit fees + slippage', mode=mode)
+                                log_event(db, f'Rolled back spot leg of {c.perp_symbol}; loss ≈ entry+exit fees + slippage', mode=mode, exchange=gateway.venue_id)
                             except Exception as e2:
-                                log_event(db, f'CRITICAL: spot rollback failed: {str(e2)[:140]}. {c.spot_symbol} is naked-long; hedge check will retry next cycle.', mode=mode, level='ERROR')
-                            db.add(RejectedCandidate(mode=mode, symbol=c.perp_symbol, reason=f'perp_short_error: {err[:80]}', funding_rate=c.funding_apr))
+                                log_event(db, f'CRITICAL: spot rollback failed: {str(e2)[:140]}. {c.spot_symbol} is naked-long; hedge check will retry next cycle.', mode=mode, level='ERROR', exchange=gateway.venue_id)
+                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=f'perp_short_error: {err[:80]}', funding_rate=c.funding_apr))
                             scan_action = 'perp_short_error'
                             continue
 
@@ -961,18 +943,18 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                             base = c.spot_symbol.split('/')[0]
                             ok_e, err_e = gateway.earn_subscribe_asset(base, qty, False)
                             if ok_e:
-                                log_event(db, f'Subscribed {qty:.6f} {base} to flexible Earn ({c.perp_symbol})', mode=mode)
+                                log_event(db, f'Subscribed {qty:.6f} {base} to flexible Earn ({c.perp_symbol})', mode=mode, exchange=gateway.venue_id)
                             elif 'cooldown active' in err_e:
-                                log_event(db, f'Earn subscribe for {base} skipped (cooldown — {c.perp_symbol})', mode=mode)
+                                log_event(db, f'Earn subscribe for {base} skipped (cooldown — {c.perp_symbol})', mode=mode, exchange=gateway.venue_id)
                             else:
-                                log_event(db, f'Earn subscribe for {base} on {c.perp_symbol} skipped: {err_e[:120]}', mode=mode, level='WARN')
+                                log_event(db, f'Earn subscribe for {base} on {c.perp_symbol} skipped: {err_e[:120]}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
                         # Both legs filled — finalize.
                         pos.perp_entry_price = float(f.get('price') or 0)
-                        record_trade(db, pos.id, mode, c.perp_symbol, 'futures', 'sell', qty, f)
+                        record_trade(db, pos.id, mode, c.perp_symbol, 'futures', 'sell', qty, f, exchange=gateway.venue_id)
                         held_bases.add(base)
                         scan_action = f'opened {c.perp_symbol}'
-                        log_event(db, f'Opened {c.perp_symbol} qty={qty:.6f} funding_apy={c.funding_apr:.2%} earn_apr={c.spot_earn_apr:.2%} combined={c.combined_apy:.2%} depth=${c.min_depth_usdt:.0f}', mode=mode)
+                        log_event(db, f'Opened {c.perp_symbol} qty={qty:.6f} funding_apy={c.funding_apr:.2%} earn_apr={c.spot_earn_apr:.2%} combined={c.combined_apy:.2%} depth=${c.min_depth_usdt:.0f}', mode=mode, exchange=gateway.venue_id)
                         break
             else:
                 if not mstate.entry_enabled:
@@ -984,6 +966,7 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
 
             db.add(ScanResult(
                 mode=mode,
+                exchange=gateway.venue_id,
                 candidates_total=candidates_total,
                 candidates_passing=candidates_passing,
                 top_candidates=json.dumps(top_candidates_payload),
@@ -1003,9 +986,9 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                         amt = max(0.0, fut_free_now - 0.10)
                         ok, err = gateway.transfer_futures_to_spot(amt, paper)
                         if ok:
-                            log_event(db, f'Auto-transferred {amt:.2f} USDT futures→spot (no open positions)', mode=mode)
+                            log_event(db, f'Auto-transferred {amt:.2f} USDT futures→spot (no open positions)', mode=mode, exchange=gateway.venue_id)
                         else:
-                            log_event(db, f'futures→spot transfer failed: {err}', mode=mode, level='WARN')
+                            log_event(db, f'futures→spot transfer failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
             # Continuous rebalance: keep spot.free ≈ futures.free so both legs of the
             # next arb open are equally funded.
@@ -1019,28 +1002,25 @@ def run_one_cycle_for_mode(gateway: BinanceGateway, mode: str) -> None:
                     ok, err = gateway.earn_subscribe(sweep, paper)
                     if ok:
                         earn.deployed_usdt += sweep
-                        log_event(db, f'Swept {sweep:.2f} USDT idle to earn', mode=mode)
+                        log_event(db, f'Swept {sweep:.2f} USDT idle to earn', mode=mode, exchange=gateway.venue_id)
                     elif 'cooldown active' in err:
                         # Per-asset cooldown — expected, don't spam logs. Surface on the dashboard via earn.last_error only.
                         earn.last_error = err
                     else:
                         earn.last_error = err
-                        log_event(db, f'Earn subscribe USDT failed (sweep={sweep:.4f}): {err}', mode=mode, level='WARN')
+                        log_event(db, f'Earn subscribe USDT failed (sweep={sweep:.4f}): {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
-            prev_snap = db.scalar(select(BalanceSnapshot).where(BalanceSnapshot.source == mode).order_by(BalanceSnapshot.id.desc()).limit(1))
+            # End-of-cycle bookkeeping: snapshot the per-(mode, venue) balance
+            # and append an equity-curve point. Live capital flows come from
+            # gateway.net_injected_capital_usdt(); the CapitalFlow table is
+            # manual-only (we removed the buggy auto-detect heuristic that
+            # mistook funding payments for withdrawals).
             snap = _take_balance_snapshot(db, gateway, mode, cfg, earn)
-            # Note: live capital flows come from Binance deposit/withdraw +
-            # sub-account-transfer history via gateway.net_injected_capital_usdt().
-            # We previously also auto-detected balance jumps here, but that
-            # heuristic mistook funding payments and mark-price drift for
-            # withdrawals, polluting the Capital Flows table with phantom
-            # entries. The CapitalFlow table is now manual-only (or paper).
-            _ = prev_snap  # kept for the next-cycle baseline; no longer compared.
-            db.add(EquityCurve(mode=mode, equity_usdt=snap.total_usdt))
+            db.add(EquityCurve(mode=mode, exchange=gateway.venue_id, equity_usdt=snap.total_usdt))
             db.commit()
     except Exception as e:
         with SessionLocal() as db:
-            log_event(db, f'Loop iteration error ({mode}): {e}', mode=mode, level='ERROR')
+            log_event(db, f'Loop iteration error ({mode}): {e}', mode=mode, level='ERROR', exchange=gateway.venue_id)
             db.commit()
 
 
@@ -1056,7 +1036,7 @@ def run_one_cycle(gateways: list | None = None, mode: str | None = None) -> int:
                 gw.load_markets()
             except Exception as e:
                 with SessionLocal() as db:
-                    log_event(db, f'{gw.name} load_markets failed: {e}', mode=MODE_PAPER, level='ERROR')
+                    log_event(db, f'{gw.name} load_markets failed: {e}', mode=MODE_PAPER, level='ERROR', exchange=gw.venue_id)
                     db.commit()
     sleep_seconds = 30
     with SessionLocal() as db:
@@ -1076,7 +1056,7 @@ def run_loop() -> None:
             gw.load_markets()
         except Exception as e:
             with SessionLocal() as db:
-                log_event(db, f'{gw.name} load_markets failed: {e}', mode=MODE_PAPER, level='ERROR')
+                log_event(db, f'{gw.name} load_markets failed: {e}', mode=MODE_PAPER, level='ERROR', exchange=gw.venue_id)
                 db.commit()
     for gw in gateways:
         reconcile_positions(gw)

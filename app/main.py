@@ -366,39 +366,123 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         # when computing leg states.
         gw = gateways[0]
 
-        equity_points = list(reversed(db.scalars(select(EquityCurve).where(EquityCurve.mode == v).order_by(desc(EquityCurve.id)).limit(60)).all()))
-        equity_polyline = ''
-        if equity_points:
-            xs = list(range(len(equity_points)))
-            ys = [pt.equity_usdt for pt in equity_points]
-            ymin, ymax = min(ys), max(ys)
-            yrange = (ymax - ymin) or 1.0
-            xmax = max(1, len(xs) - 1)
-            equity_polyline = ' '.join(f'{(x / xmax) * 600:.1f},{110 - (y - ymin) / yrange * 100:.1f}' for x, y in zip(xs, ys))
+        # Per-venue equity curve: read up to 60 points per venue from
+        # EquityCurve, build a polyline per venue + an aggregated curve
+        # (summed at matching cycle indexes). Aggregated is the single-pool
+        # truth; per-venue lines let the user see how each venue performed.
+        equity_curves_by_venue: dict[str, list] = {}
+        for gw in gateways:
+            pts = list(reversed(db.scalars(
+                select(EquityCurve)
+                .where(EquityCurve.mode == v, EquityCurve.exchange == gw.venue_id)
+                .order_by(desc(EquityCurve.id))
+                .limit(60)
+            ).all()))
+            if pts:
+                equity_curves_by_venue[gw.venue_id] = pts
 
-        latest_scan = db.scalar(select(ScanResult).where(ScanResult.mode == v).order_by(desc(ScanResult.id)).limit(1))
-        latest_scan_top = []
-        if latest_scan:
+        equity_curves: list[dict] = []
+        agg_xs: list[float] = []
+        agg_ys: list[float] = []
+
+        # Stable per-venue colours that match the equity-composition donut.
+        VENUE_COLOR = {'binance': '#fbbf24', 'kucoin': '#38bdf8', 'ibkr': '#a78bfa', 'paper': '#4ade80'}
+
+        if equity_curves_by_venue:
+            # Common Y range so all polylines share the same scale.
+            all_ys = [pt.equity_usdt for pts in equity_curves_by_venue.values() for pt in pts]
+            # Aggregated curve: sum equity across venues at each cycle index
+            # (most-recent index = 0 from the right). Length = max len across venues.
+            max_len = max(len(pts) for pts in equity_curves_by_venue.values())
+            for i in range(max_len):
+                total = 0.0
+                for pts in equity_curves_by_venue.values():
+                    if i < len(pts):
+                        total += pts[i].equity_usdt
+                agg_xs.append(i)
+                agg_ys.append(total)
+            all_ys.extend(agg_ys)
+            ymin, ymax = min(all_ys), max(all_ys)
+            yrange = (ymax - ymin) or 1.0
+            xmax = max(1, max_len - 1)
+            for venue_id, pts in equity_curves_by_venue.items():
+                ys = [pt.equity_usdt for pt in pts]
+                xs = list(range(len(pts)))
+                polyline = ' '.join(
+                    f'{(x / xmax) * 600:.1f},{110 - (y - ymin) / yrange * 100:.1f}'
+                    for x, y in zip(xs, ys)
+                )
+                equity_curves.append({
+                    'venue_id': venue_id,
+                    'venue_name': next((g.name for g in gateways if g.venue_id == venue_id), venue_id),
+                    'color': VENUE_COLOR.get(venue_id, '#888'),
+                    'polyline': polyline,
+                    'latest': ys[-1],
+                    'first': ys[0],
+                    'first_ts': _fmt_ts(pts[0].ts),
+                    'latest_ts': _fmt_ts(pts[-1].ts),
+                })
+            agg_polyline = ' '.join(
+                f'{(x / xmax) * 600:.1f},{110 - (y - ymin) / yrange * 100:.1f}'
+                for x, y in zip(agg_xs, agg_ys)
+            )
+        else:
+            agg_polyline = ''
+
+        # One latest scan per venue — dashboard shows them side-by-side so
+        # the user can see at a glance whether each venue's scan is firing.
+        latest_scans = []
+        for gw in gateways:
+            sc = db.scalar(
+                select(ScanResult)
+                .where(ScanResult.mode == v, ScanResult.exchange == gw.venue_id)
+                .order_by(desc(ScanResult.id))
+                .limit(1)
+            )
+            if sc is None:
+                continue
             try:
-                latest_scan_top = json.loads(latest_scan.top_candidates) or []
+                top = json.loads(sc.top_candidates) or []
             except Exception:
-                latest_scan_top = []
-        for c in latest_scan_top:
-            if 'apr' not in c:
-                c['apr'] = annualize_rate(c.get('fr', 0.0), c.get('interval_h', 8.0))
-            c['effective_apy'] = effective_position_apy(c['apr'], cfg.perp_leverage or 1)
+                top = []
+            for c in top:
+                if 'apr' not in c:
+                    c['apr'] = annualize_rate(c.get('fr', 0.0), c.get('interval_h', 8.0))
+                c['effective_apy'] = effective_position_apy(c['apr'], cfg.perp_leverage or 1)
+            latest_scans.append({
+                'venue_id': gw.venue_id,
+                'venue_name': gw.name,
+                'venue_color': VENUE_COLOR.get(gw.venue_id, '#888'),
+                'ts': _fmt_ts(sc.ts),
+                'candidates_total': sc.candidates_total,
+                'candidates_passing': sc.candidates_passing,
+                'action': sc.action,
+                'top': top,
+            })
+        # Last cycle age uses whichever gateway scanned most recently.
+        latest_scan = max(
+            (db.scalar(select(ScanResult).where(ScanResult.mode == v, ScanResult.exchange == gw.venue_id).order_by(desc(ScanResult.id)).limit(1)) for gw in gateways),
+            key=lambda x: (x.ts if x else datetime.min),
+            default=None,
+        )
 
         current_equity, equity_source, equity_stale = _current_equity(db, v, gateways)
+        # Aggregate balance-fetch errors across every configured venue so the
+        # banner names the venue that's down rather than blanket-saying
+        # "Binance" (which would be misleading when KuCoin is the one failing).
         balances_error = None
         if v == MODE_LIVE:
-            bals = gw.safe_balances()
-            if bals is None:
-                balances_error = 'unable to fetch from Binance'
+            errors: list[str] = []
+            for g in gateways:
+                if g.safe_balances() is None and g.last_balance_error:
+                    errors.append(f'{g.name}: {g.last_balance_error[:140]}')
+            if errors:
+                balances_error = ' · '.join(errors)
 
         trade_realized = total_realized_pnl(db, mode=v)
         funding_income_tracked = total_funding_income(db, mode=v)
         unrealized = _unrealized_for_open(db, gateways, v)
-        net_capital, net_capital_meta = net_capital_in(db, mode=v, gateway=gw)
+        net_capital, net_capital_meta = net_capital_in(db, mode=v, gateways=gateways)
         flow_count_n = db.scalar(select(func.count(CapitalFlow.id)).where(CapitalFlow.mode == v)) or 0
         xirr_value = portfolio_xirr(db, current_equity, mode=v)
         open_count = db.scalar(select(func.count(Position.id)).where(Position.status == 'open', Position.mode == v)) or 0
@@ -427,7 +511,10 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             funding_income = funding_income_tracked
         realized = trade_realized + funding_income
 
-        last_cycle_ts = latest_scan.ts if latest_scan else (equity_points[-1].ts if equity_points else None)
+        # Last cycle age = the most recent scan timestamp across all venues.
+        all_pts = [pt for pts in equity_curves_by_venue.values() for pt in pts]
+        last_cycle_ts = (latest_scan.ts if latest_scan else
+                         (max(p.ts for p in all_pts) if all_pts else None))
         last_cycle_age = _fmt_age(datetime.utcnow() - last_cycle_ts) if last_cycle_ts else None
 
         stuck_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == v, Position.last_close_error != '')).all()
@@ -577,10 +664,9 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             'xirr_value': xirr_value,
             'open_count': open_count,
             'trades_today': trades_today_n,
-            'equity_points': [{'ts': _fmt_ts(p.ts), 'equity_usdt': p.equity_usdt} for p in equity_points],
-            'equity_polyline': equity_polyline,
-            'latest_scan': {'ts': _fmt_ts(latest_scan.ts), 'candidates_total': latest_scan.candidates_total, 'candidates_passing': latest_scan.candidates_passing, 'action': latest_scan.action} if latest_scan else None,
-            'latest_scan_top': latest_scan_top,
+            'equity_curves': equity_curves,         # per-venue lines (color-coded)
+            'equity_agg_polyline': agg_polyline,    # aggregated single-pool line
+            'latest_scans': latest_scans,           # one card per venue
             'last_cycle_age': last_cycle_age,
             'rows': rows,
             'closed': closed,
@@ -635,18 +721,21 @@ def transactions_page(request: Request, view: str | None = None, limit: int = 10
         ctx['active'] = 'transactions'
         ctx['cfg'] = get_strategy_config(db)
 
-        # Position history — open + closed, newest first.
-        gw_for_legs = BinanceGateway() if v == MODE_LIVE else None
+        # Position history — open + closed, newest first. For live positions
+        # we route the leg-state probe through the *position's own venue*
+        # gateway so KuCoin positions get their leg state from KuCoin and
+        # Binance from Binance.
+        gateways_by_venue = {g.venue_id: g for g in make_gateways()} if v == MODE_LIVE else {}
         position_rows = db.scalars(select(Position).where(Position.mode == v).order_by(desc(Position.id)).limit(limit)).all()
         positions_v = []
         for p in position_rows:
             trade_pnl = position_realized_pnl(db, p)
             ended = p.closed_at if p.closed_at else datetime.utcnow()
             hold = ended - p.opened_at
-            # Per-leg state from Binance (live only). Closed positions show
-            # both legs as "flat" since there's nothing to verify.
-            if v == MODE_LIVE and p.status == 'open' and gw_for_legs is not None:
-                st = _position_leg_states(gw_for_legs, p)
+            # Per-leg state from the position's venue (live only). Closed
+            # positions show both legs as flat since there's nothing to verify.
+            if v == MODE_LIVE and p.status == 'open' and p.exchange in gateways_by_venue:
+                st = _position_leg_states(gateways_by_venue[p.exchange], p)
                 spot_alive = st['spot_alive']
                 perp_alive = st['perp_alive']
             elif p.status == 'open':
@@ -741,13 +830,17 @@ def logs_page(request: Request, view: str | None = None, view_cookie: str | None
                     top_label = f"{top[0]['perp']} @ {apy*100:.2f}% funding APY ({eff*100:.2f}% effective)"
             except Exception:
                 pass
-            scans.append({'ts': _fmt_ts(s.ts), 'candidates_total': s.candidates_total, 'candidates_passing': s.candidates_passing, 'action': s.action, 'top_candidate_label': top_label, 'note': s.note})
+            scans.append({
+                'ts': _fmt_ts(s.ts), 'venue': s.exchange,
+                'candidates_total': s.candidates_total, 'candidates_passing': s.candidates_passing,
+                'action': s.action, 'top_candidate_label': top_label, 'note': s.note,
+            })
 
         events = db.scalars(select(BotEvent).where(BotEvent.mode == v).order_by(desc(BotEvent.id)).limit(100)).all()
-        events_v = [{'ts': _fmt_ts(e.ts), 'level': e.level, 'message': e.message} for e in events]
+        events_v = [{'ts': _fmt_ts(e.ts), 'venue': e.exchange, 'level': e.level, 'message': e.message} for e in events]
 
         rejected = db.scalars(select(RejectedCandidate).where(RejectedCandidate.mode == v).order_by(desc(RejectedCandidate.id)).limit(50)).all()
-        rejected_v = [{'ts': _fmt_ts(r.ts), 'symbol': r.symbol, 'reason': r.reason, 'funding_rate': r.funding_rate} for r in rejected]
+        rejected_v = [{'ts': _fmt_ts(r.ts), 'venue': r.exchange, 'symbol': r.symbol, 'reason': r.reason, 'funding_rate': r.funding_rate} for r in rejected]
 
         trades = db.scalars(select(Trade).where(Trade.mode == v).order_by(desc(Trade.id)).limit(30)).all()
         trades_v = [{'ts': _fmt_ts(t.ts), 'symbol': t.symbol, 'exchange': t.exchange, 'leg': t.venue, 'side': t.side, 'quantity': t.quantity, 'price': t.price, 'fee': t.fee} for t in trades]
@@ -1107,14 +1200,15 @@ def _render_export_md(v: str) -> str:
              for e in (paper_earn, live_earn)],
         ))
 
-        # ---- Live wallet snapshot ----
-        gw = BinanceGateway()
+        # ---- Live wallet snapshot, per venue ----
+        gateways = make_gateways() or [BinanceGateway()]
         if v == MODE_LIVE:
-            parts.append('\n## Binance balances (live)\n')
-            bals = gw.safe_balances()
-            if bals is None:
-                parts.append(f'_failed: {gw.last_balance_error or "unknown"}_\n')
-            else:
+            for gw_v in gateways:
+                parts.append(f'\n## {gw_v.name} balances (live)\n')
+                bals = gw_v.safe_balances()
+                if bals is None:
+                    parts.append(f'_failed: {gw_v.last_balance_error or "unknown"}_\n')
+                    continue
                 bal_rows = []
                 for wallet in ('spot', 'futures'):
                     w = bals.get(wallet, {}) or {}
@@ -1133,7 +1227,7 @@ def _render_export_md(v: str) -> str:
         # ---- Equity composition for current view ----
         earn_for_view = live_earn if v == MODE_LIVE else paper_earn
         try:
-            breakdown = equity_breakdown(db, gw, v, earn_for_view.deployed_usdt)
+            breakdown = equity_breakdown(db, gateways, v, earn_for_view.deployed_usdt)
         except Exception as e:
             breakdown = []
             parts.append(f'\n_equity breakdown failed: {e}_\n')
@@ -1144,11 +1238,15 @@ def _render_export_md(v: str) -> str:
         # ---- Open positions with leg states ----
         open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == v)).all()
         parts.append(f'\n## Open positions ({v}) — {len(open_positions)} row(s)\n')
+        gateways_by_venue = {g.venue_id: g for g in gateways}
         op_rows = []
         for p in open_positions:
-            if v == MODE_LIVE:
+            # Route the leg-state probe through the position's own venue
+            # gateway so KuCoin positions get state from KuCoin etc.
+            pgw = gateways_by_venue.get(p.exchange)
+            if v == MODE_LIVE and pgw is not None:
                 try:
-                    st = _position_leg_states(gw, p)
+                    st = _position_leg_states(pgw, p)
                 except Exception:
                     st = {'spot_actual': 0.0, 'perp_actual': 0.0, 'spot_alive': None, 'perp_alive': None, 'spot_min': 0.0, 'perp_min': 0.0}
             else:

@@ -9,11 +9,20 @@
   <h3>Scan history (last 50)</h3>
   {% if scans %}
   <table>
-    <thead><tr><th>Time</th><th class="num">Total (#)</th><th class="num">Passing (#)</th><th>Action</th><th>Top candidate</th><th>Note</th></tr></thead>
+    <thead><tr>
+      <th>Time</th>
+      <th>Venue</th>
+      <th class="num">Total (#)</th>
+      <th class="num">Passing (#)</th>
+      <th>Action</th>
+      <th>Top candidate</th>
+      <th>Note</th>
+    </tr></thead>
     <tbody>
       {% for s in scans %}
       <tr>
         <td class="muted mono">{{ s.ts }}</td>
+        <td><span class="tag">{{ s.venue }}</span></td>
         <td class="num">{{ s.candidates_total }}</td>
         <td class="num">{{ s.candidates_passing }}</td>
         <td><span class="tag {{ 'good' if 'opened' in s.action else '' }}">{{ s.action }}</span></td>
@@ -35,6 +44,7 @@
     {% for e in events %}
       <div class="log-line">
         <span class="muted mono">{{ e.ts }}</span>
+        <span class="tag" style="font-size:10px;">{{ e.venue }}</span>
         <span class="lvl lvl-{{ e.level }}">{{ e.level }}</span>
         <span>{{ e.message }}</span>
       </div>
@@ -49,10 +59,22 @@
   <h3>Rejected candidates (last 50)</h3>
   {% if rejected %}
   <table>
-    <thead><tr><th>Time</th><th>Symbol</th><th>Reason</th><th class="num">Funding APY (%)</th></tr></thead>
+    <thead><tr>
+      <th>Time</th>
+      <th>Venue</th>
+      <th>Symbol</th>
+      <th>Reason</th>
+      <th class="num">Funding APY (%)</th>
+    </tr></thead>
     <tbody>
     {% for r in rejected %}
-      <tr><td class="muted mono">{{ r.ts }}</td><td class="mono">{{ r.symbol }}</td><td>{{ r.reason }}</td><td class="num">{{ '%.2f' % (r.funding_rate * 100) }}</td></tr>
+      <tr>
+        <td class="muted mono">{{ r.ts }}</td>
+        <td><span class="tag">{{ r.venue }}</span></td>
+        <td class="mono">{{ r.symbol }}</td>
+        <td>{{ r.reason }}</td>
+        <td class="num">{{ '%.2f' % (r.funding_rate * 100) }}</td>
+      </tr>
     {% endfor %}
     </tbody>
   </table>

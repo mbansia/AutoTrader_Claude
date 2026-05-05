@@ -229,39 +229,78 @@ def equity_donut_svg(items: list[dict], cx: int = 100, cy: int = 100, r: int = 8
     return ''.join(paths)
 
 
-def net_capital_in(db, mode: str | None = None, gateway=None) -> tuple[float, dict]:
-    """Net capital injected (deposits − withdrawals).
+def net_capital_in(db, mode: str | None = None, gateways=None) -> tuple[float, dict]:
+    """Net capital injected (deposits − withdrawals) across every configured
+    venue.
 
-    For live mode with a gateway present, queries Binance's deposit/withdraw
-    history directly — that's the authoritative number regardless of any
-    auto-detect threshold or whether manual flows were entered.
+    LIVE mode: walks every gateway's ``net_injected_capital_usdt()``,
+    summing the deposit / withdrawal / sub-transfer totals. Each venue's
+    history is independent — a deposit into the KuCoin sub-account adds to
+    the pool's net injected capital in the same row as a Binance deposit.
+    Falls back to manual ``CapitalFlow`` rows for any venue whose history
+    isn't yet wired (KuCoin today).
 
-    For paper mode (no gateway, or live without a gateway), falls back to the
-    CapitalFlow table which is filled by user-entered flows + the cycle-time
-    auto-detect heuristic.
+    PAPER mode (or no gateways): just sums the manual ``CapitalFlow`` table.
 
-    Returns (value, meta). meta carries 'source' = 'binance' or 'capital_flows'
-    plus any breakdown counts for the UI.
+    Returns ``(value, meta)``. ``meta`` carries 'source' = 'venues' or
+    'capital_flows' plus per-venue breakdown counts for the UI.
     """
     from app.models import MODE_LIVE
-    binance_meta: dict = {}
-    if mode == MODE_LIVE and gateway is not None and hasattr(gateway, 'net_injected_capital_usdt'):
-        try:
-            value, binance_meta = gateway.net_injected_capital_usdt()
+    # Tolerate the legacy single-gateway signature: a list, a single
+    # gateway, or None.
+    if gateways is None:
+        gw_list: list = []
+    elif isinstance(gateways, list):
+        gw_list = gateways
+    else:
+        gw_list = [gateways]
+
+    if mode == MODE_LIVE and gw_list:
+        # Sum across venues — any venue that returns None is excluded from
+        # the venue total but its manual capital flows still count below.
+        venue_total = 0.0
+        venue_breakdown: dict[str, dict] = {}
+        any_venue_data = False
+        for gw in gw_list:
+            try:
+                value, meta = gw.net_injected_capital_usdt()
+            except Exception as e:
+                meta = {'error': str(e)[:120]}
+                value = None
             if value is not None:
-                meta = {**(binance_meta or {}), 'source': 'binance'}
-                return value, meta
-        except Exception as e:
-            binance_meta = {'error': str(e)[:120]}
+                venue_total += value
+                any_venue_data = True
+            venue_breakdown[gw.venue_id] = {**(meta or {}), 'value': value}
+
+        # Add manual CapitalFlow rows whose venue didn't return live data.
+        # Avoids double-counting a Binance deposit if Binance's API also
+        # reported it.
+        manual_total = 0.0
+        manual_count = 0
+        if any_venue_data or True:  # always include manual rows for venues without API history
+            stmt = select(CapitalFlow).where(CapitalFlow.mode == mode)
+            covered_venues = {vid for vid, m in venue_breakdown.items() if m.get('value') is not None}
+            for f in db.scalars(stmt).all():
+                if f.exchange in covered_venues:
+                    continue  # venue's own API already accounted for it
+                manual_total += f.amount_usdt
+                manual_count += 1
+        meta = {
+            'source': 'venues',
+            'venue_breakdown': venue_breakdown,
+            'manual_count': manual_count,
+            'manual_total': manual_total,
+        }
+        if any_venue_data:
+            return venue_total + manual_total, meta
+        # No venue had any data — fall through to pure manual.
+
     stmt = select(CapitalFlow)
     if mode is not None:
         stmt = stmt.where(CapitalFlow.mode == mode)
     flows = db.scalars(stmt).all()
     total = sum(f.amount_usdt for f in flows)
-    meta = {'source': 'capital_flows', 'count': len(flows)}
-    if binance_meta.get('error'):
-        meta['error'] = binance_meta['error']
-    return total, meta
+    return total, {'source': 'capital_flows', 'count': len(flows)}
 
 
 def xirr(flows: Iterable[tuple[datetime, float]], guess: float = 0.1, max_iter: int = 200, tol: float = 1e-7) -> float | None:

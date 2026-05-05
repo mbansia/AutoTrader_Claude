@@ -1,39 +1,47 @@
-"""Venue gateways — single point of contact for all exchange operations.
+"""Venue gateways — the bot's single point of contact for every exchange / broker.
 
-The bot manages a single pool of capital distributed across venues. Each
-venue (Binance today, KuCoin from Phase 1, Interactive Brokers later)
-exposes the same surface so the bot loop can iterate uniformly:
+The portfolio is a single pool of capital distributed across venues. Each
+venue (Binance live today; KuCoin live from Phase 1; Interactive Brokers in
+Phase 3) presents the same surface to the bot through :class:`VenueGateway`,
+so the cycle loop in :mod:`app.bot` iterates over a list of gateways without
+any per-venue conditionals.
 
-* :class:`BinanceGateway` wraps ``ccxt.binance`` (spot) + ``ccxt.binanceusdm``
-  (USDM-perp). Earn / transfer / deposit-history / sub-transfer are
-  Binance-specific and live here.
-* :class:`KuCoinGateway` wraps ``ccxt.kucoin`` (spot) + ``ccxt.kucoinfutures``
-  (USDT-margined perps). Transfers use KuCoin's ``innerTransfer`` SAPI;
-  Earn (Pool-X) is deferred to a later phase.
-* :func:`make_gateways` is the factory the bot uses — it returns the
-  ordered list of currently-configured venues based on env credentials.
+Class hierarchy
+---------------
+* :class:`VenueGateway` — abstract base. Holds every method whose
+  implementation is identical across venues thanks to ccxt's uniform
+  facade (order-book depth, balances, prices, scanning, market orders,
+  hedge configuration). Subclasses must populate ``self.spot`` and
+  ``self.futures`` ccxt clients and override venue-specific methods.
+* :class:`BinanceGateway` — Binance spot + USDM-perp + Simple Earn +
+  universal-transfer SAPI + deposit/withdrawal/sub-transfer history.
+* :class:`KuCoinGateway` — KuCoin spot + futures + ``innerTransfer``
+  SAPI. Earn (Pool-X) and capital-flow history are deferred — earn
+  methods return safe no-ops; ``net_injected_capital_usdt`` returns
+  ``None`` so the dashboard falls back to manual capital flows.
 
-Design notes
-------------
-* Every method that hits the network is wrapped to fail-soft (return
-  ``None`` / empty / a ``(False, err)`` tuple) so a transient API issue
-  doesn't crash the bot's main loop.
-* SAPI methods are looked up across a couple of ccxt name conventions
-  (``sapiV1Get…`` / ``sapi_v1_get_…``) so the gateway works across the
-  ccxt-version drift the user might encounter on their deployment.
-* Several caches (``_earn_product_id_cache``, ``_*_history_cache``) live
-  on the instance with explicit TTLs to keep API calls cheap on routes
-  that re-render frequently. They're invalidated by recreating the
-  gateway (e.g. on restart) — that's intentional.
-* Historical Binance error codes are tracked as named constants below
-  so the bot's error-handling paths use semantically meaningful names
-  rather than magic numbers.
+Design invariants
+-----------------
+* Every method that touches the network is wrapped to fail-soft: it
+  returns ``None`` / ``[]`` / ``(False, err)`` rather than letting an
+  exception escape into the cycle loop. A transient outage on one
+  venue must not break the cycle for the others.
+* SAPI methods are looked up through a small list of ccxt naming
+  conventions (``sapiV1Get…`` / ``sapi_v1_get_…``) so the gateway
+  works across the ccxt-version drift between dev and production.
+* Caches (``_earn_product_id_cache``, ``_*_history_cache``,
+  ``_earn_subscribe_cooldown_until``) live on the instance with
+  explicit TTLs. They get cleared by recreating the gateway, e.g. on
+  process restart — that's intentional.
+* Binance error codes the bot reacts to are named constants; the
+  string-match-on-exception-text approach is what ccxt's stable
+  surface gives us.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import ccxt
 
@@ -41,9 +49,11 @@ from app.config import settings
 
 
 # ─── Binance error codes we react to ────────────────────────────────────────
-# These are returned in the ccxt exception message text when Binance rejects
-# a request. We string-search rather than parse JSON because ccxt's message
-# format isn't fully stable across versions.
+# Returned in the ccxt exception message text when Binance rejects a request.
+# We string-search rather than parse JSON because ccxt's message format
+# isn't fully stable across versions. KuCoin error codes are not surfaced
+# explicitly today — we treat any ccxt exception as "the call failed,
+# fall back gracefully" and log the message verbatim.
 
 BINANCE_ERR_INVALID_API = '-2015'           # bad key / IP not whitelisted / missing permission
 BINANCE_ERR_INSUFFICIENT_MARGIN = '-2019'   # futures order can't be placed for lack of free margin
@@ -51,6 +61,11 @@ BINANCE_ERR_MALFORMED_AMOUNT = '-1102'      # amount param missing/empty/zero on
 BINANCE_ERR_NO_EARN_POSITION = '-6053'      # trying to redeem from a flexible product with no balance
 BINANCE_ERR_EARN_TOO_MANY_SUBS = '77505'    # subscribed too many times for this token (rate-limit)
 
+
+# ─── Candidate dataclass ────────────────────────────────────────────────────
+# A scan result row: one funding-rate opportunity that passed every filter
+# (entry threshold, volume, liquidity, etc.). The bot ranks candidates by
+# ``combined_apy`` to decide which to open next.
 
 @dataclass
 class Candidate:
@@ -62,6 +77,7 @@ class Candidate:
     spot_depth_usdt: float = 0.0
     perp_depth_usdt: float = 0.0
     spot_earn_apr: float = 0.0  # latest annualized rate on the asset's flexible earn product, if any
+    venue_id: str = 'binance'   # which venue this candidate came from — set by scan_funding
 
     @property
     def funding_apr(self) -> float:
@@ -100,6 +116,9 @@ def annualize_rate(period_rate: float, interval_hours: float) -> float:
 
 
 def _interval_hours(row: dict) -> float:
+    """Extract funding interval (in hours) from a ccxt ``fetch_funding_rates`` row.
+    Falls back to 8h — Binance's default — when the response doesn't carry the
+    interval explicitly. KuCoin pays funding every 8h so the same default works."""
     interval = row.get('interval')
     if isinstance(interval, str) and interval.endswith('h'):
         try:
@@ -115,14 +134,26 @@ def _interval_hours(row: dict) -> float:
     return 8.0
 
 
-class BinanceGateway:
-    venue_id = 'binance'
-    name = 'Binance'
+# ─── VenueGateway base class ────────────────────────────────────────────────
+# Shared implementation for every method that's identical across ccxt-supported
+# venues. Subclasses must:
+#   * set the class attributes ``venue_id`` and ``name``
+#   * populate ``self.spot`` and ``self.futures`` in ``__init__``
+#   * implement the venue-specific methods at the bottom (transfers, earn,
+#     history). Default implementations are safe no-ops so a venue without
+#     Earn (e.g. KuCoin Phase 1) still has a complete surface.
+
+class VenueGateway:
+    venue_id: str = ''   # 'binance' | 'kucoin' | 'ibkr'
+    name: str = ''       # human-readable label rendered in UI
 
     def __init__(self) -> None:
-        self.spot = ccxt.binance({'apiKey': settings.binance_api_key, 'secret': settings.binance_api_secret, 'enableRateLimit': True})
-        self.futures = ccxt.binanceusdm({'apiKey': settings.binance_api_key, 'secret': settings.binance_api_secret, 'enableRateLimit': True})
+        # Subclasses must set these in their own __init__ before super().
+        self.spot = None
+        self.futures = None
         self.last_balance_error: str = ''
+
+    # ─── Market data + read-only helpers (ccxt-uniform) ───────────────────
 
     def load_markets(self) -> None:
         self.spot.load_markets()
@@ -152,11 +183,11 @@ class BinanceGateway:
         if side == 'ask':
             cutoff = mid * (1 + threshold)
             levels = asks
-            within = lambda p: p <= cutoff
+            within = lambda p: p <= cutoff  # noqa: E731
         else:
             cutoff = mid * (1 - threshold)
             levels = bids
-            within = lambda p: p >= cutoff
+            within = lambda p: p >= cutoff  # noqa: E731
         total = 0.0
         for lvl in levels:
             try:
@@ -168,42 +199,78 @@ class BinanceGateway:
             total += p * q
         return total
 
-    _flexible_earn_apr_cache: dict[str, tuple[float, float]] = {}
-
-    def flexible_earn_apr(self, asset: str, ttl_seconds: float = 3600.0) -> float:
-        """Latest annualized rate (decimal) for the flexible Earn product on `asset`,
-        cached for an hour. Returns 0.0 if no product or the API isn't reachable —
-        caller can treat that as "no extra spot yield to count toward score."""
-        cached = self._flexible_earn_apr_cache.get(asset)
-        if cached:
-            rate, ts = cached
-            if time.time() - ts < ttl_seconds:
-                return rate
+    def safe_balances(self) -> dict | None:
+        """Return ``{'spot': {...}, 'futures': {...}}`` from ccxt, or ``None`` on
+        error (with the failure message pinned to ``self.last_balance_error``)."""
         try:
-            resp = self._call_sapi((
-                'sapiV1GetSimpleEarnFlexibleList',
-                'sapi_v1_get_simple_earn_flexible_list',
-                'sapiGetSimpleEarnFlexibleList',
-            ), {'asset': asset})
-        except Exception:
-            self._flexible_earn_apr_cache[asset] = (0.0, time.time())
-            return 0.0
-        if not resp:
-            self._flexible_earn_apr_cache[asset] = (0.0, time.time())
-            return 0.0
-        for r in resp.get('rows', []) or resp.get('data', []) or []:
-            if r.get('asset') == asset:
-                try:
-                    rate = float(r.get('latestAnnualPercentageRate') or r.get('annualPercentageRate') or 0)
-                except Exception:
-                    rate = 0.0
-                self._flexible_earn_apr_cache[asset] = (rate, time.time())
-                return rate
-        self._flexible_earn_apr_cache[asset] = (0.0, time.time())
-        return 0.0
+            result = {'spot': self.spot.fetch_balance(), 'futures': self.futures.fetch_balance()}
+            self.last_balance_error = ''
+            return result
+        except Exception as e:
+            self.last_balance_error = str(e)
+            return None
 
-    def scan_funding(self, entry_apr_threshold: float, min_quote_volume: float, min_depth_usdt: float = 0.0, depth_band_bps: float = 10.0, include_earn_apr: bool = False) -> tuple[list[Candidate], int, list[tuple[str, str, float]]]:
-        rates = self.futures.fetch_funding_rates()
+    def price(self, symbol: str) -> float:
+        return float(self.spot.fetch_ticker(symbol)['last'])
+
+    def perp_price(self, symbol: str) -> float:
+        return float(self.futures.fetch_ticker(symbol)['last'])
+
+    def safe_price(self, symbol: str, perp: bool = False) -> float | None:
+        try:
+            return self.perp_price(symbol) if perp else self.price(symbol)
+        except Exception:
+            return None
+
+    def market_min_amount(self, symbol: str, perp: bool = False) -> float:
+        """Minimum order quantity (LOT_SIZE.minQty on Binance, baseMinSize on
+        KuCoin) for a symbol. Both are surfaced as ``market.limits.amount.min``
+        in ccxt. The bot uses this to detect dust on a closing leg and treat it
+        as already-flat rather than spinning on rejected orders. Returns 0.0
+        when the market isn't loaded — caller proceeds with the order."""
+        ex = self.futures if perp else self.spot
+        try:
+            market = ex.market(symbol)
+        except Exception:
+            return 0.0
+        try:
+            return float((market.get('limits') or {}).get('amount', {}).get('min') or 0.0)
+        except Exception:
+            return 0.0
+
+    def open_perp_positions_raw(self) -> list[dict]:
+        """Open perp positions on this venue. Filters out zero-contract rows that
+        ccxt sometimes returns for symbols that were once held."""
+        try:
+            positions = self.futures.fetch_positions()
+        except Exception:
+            return []
+        return [p for p in positions if abs(float(p.get('contracts') or p.get('info', {}).get('positionAmt') or 0)) > 0]
+
+    # ─── Funding scan (ccxt-uniform) ───────────────────────────────────────
+
+    def scan_funding(
+        self,
+        entry_apr_threshold: float,
+        min_quote_volume: float,
+        min_depth_usdt: float = 0.0,
+        depth_band_bps: float = 10.0,
+        include_earn_apr: bool = False,
+    ) -> tuple[list[Candidate], int, list[tuple[str, str, float]]]:
+        """Scan this venue's USDT-perp funding rates. Returns
+        ``(passing, total_examined, rejected)`` where:
+        * ``passing`` is the ranked list of :class:`Candidate` rows that survived
+          every filter (APR threshold, quote volume, liquidity).
+        * ``total_examined`` is the number of perps whose funding rate ccxt
+          returned — useful to confirm the API is actually live.
+        * ``rejected`` is a list of ``(symbol, reason, apr)`` for the Logs tab.
+
+        Each :class:`Candidate` carries ``venue_id`` so when multiple venues'
+        results get pooled in the bot loop, the destination is unambiguous."""
+        try:
+            rates = self.futures.fetch_funding_rates()
+        except Exception:
+            return [], 0, []
         passing: list[Candidate] = []
         rejected: list[tuple[str, str, float]] = []
         total = 0
@@ -248,126 +315,217 @@ class BinanceGateway:
                 spot_depth_usdt=spot_depth,
                 perp_depth_usdt=perp_depth,
                 spot_earn_apr=earn_apr,
+                venue_id=self.venue_id,
             ))
-        # Rank by total expected yield (funding APY + spot earn APR). Within
-        # ties this naturally prefers the side with deeper books because deeper
-        # markets tend to be the high-volume / low-friction names.
+        # Rank by total expected yield (funding APY + spot earn APR). Ties
+        # break by deeper book — deeper markets tend to be high-volume names
+        # with lower friction.
         passing.sort(key=lambda c: (c.combined_apy, c.min_depth_usdt), reverse=True)
         return passing, total, rejected
 
-    def safe_balances(self) -> dict | None:
-        try:
-            result = {'spot': self.spot.fetch_balance(), 'futures': self.futures.fetch_balance()}
-            self.last_balance_error = ''
-            return result
-        except Exception as e:
-            self.last_balance_error = str(e)
-            return None
+    # ─── Order placement (ccxt-uniform) ───────────────────────────────────
 
-    def price(self, symbol: str) -> float:
-        return float(self.spot.fetch_ticker(symbol)['last'])
+    def _market_order(self, leg: str, symbol: str, side: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float) -> dict:
+        """Place a market order on the spot or futures client. In ``paper_mode``
+        synthesise a fill at the current ticker price, shifted adversely by
+        ``slippage_bps`` and charged ``fee_bps`` — these numbers are
+        configurable on the Configuration tab so paper trading tracks reality.
 
-    def perp_price(self, symbol: str) -> float:
-        return float(self.futures.fetch_ticker(symbol)['last'])
-
-    def safe_price(self, symbol: str, perp: bool = False) -> float | None:
-        try:
-            return self.perp_price(symbol) if perp else self.price(symbol)
-        except Exception:
-            return None
-
-    def market_min_amount(self, symbol: str, perp: bool = False) -> float:
-        """Minimum order quantity (LOT_SIZE.minQty) for a symbol. Binance refuses
-        orders below this, so when our actual balance falls below it (e.g.,
-        funding / fee deductions ate into the spot leg) the leg is effectively
-        un-tradeable and the bot should treat it as flat rather than spinning
-        on rejected close attempts. Returns 0.0 if the market isn't loaded — the
-        caller should still attempt the order in that case."""
-        ex = self.futures if perp else self.spot
-        try:
-            market = ex.market(symbol)
-        except Exception:
-            return 0.0
-        try:
-            return float((market.get('limits') or {}).get('amount', {}).get('min') or 0.0)
-        except Exception:
-            return 0.0
-
-    def _market_order(self, venue: str, symbol: str, side: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float):
+        ``leg`` is 'spot' | 'futures'; this is the trade-row leg label that
+        ends up in :data:`app.models.Trade.venue` (which long predates the
+        cross-venue ``exchange`` column)."""
         if paper_mode:
-            mid = self.perp_price(symbol) if venue == 'futures' else self.price(symbol)
+            mid = self.perp_price(symbol) if leg == 'futures' else self.price(symbol)
             slip = slippage_bps / 10000.0
             fill_price = mid * (1 + slip) if side == 'buy' else mid * (1 - slip)
             fee_cost = fill_price * amount * (fee_bps / 10000.0)
-            return {'id': 'paper', 'symbol': symbol, 'side': side, 'amount': amount, 'venue': venue, 'status': 'closed', 'price': fill_price, 'fee': {'cost': fee_cost}}
-        if venue == 'spot':
+            return {
+                'id': 'paper', 'symbol': symbol, 'side': side, 'amount': amount,
+                'venue': leg, 'status': 'closed', 'price': fill_price, 'fee': {'cost': fee_cost},
+            }
+        if leg == 'spot':
             return self.spot.create_order(symbol, 'market', side, amount)
         return self.futures.create_order(symbol, 'market', side, amount)
 
-    def create_spot_buy(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float):
+    def create_spot_buy(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float) -> dict:
         return self._market_order('spot', symbol, 'buy', amount, paper_mode, slippage_bps, fee_bps)
 
-    def create_perp_short(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float):
+    def create_perp_short(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float) -> dict:
         return self._market_order('futures', symbol, 'sell', amount, paper_mode, slippage_bps, fee_bps)
 
-    def close_spot(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float):
+    def close_spot(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float) -> dict:
         return self._market_order('spot', symbol, 'sell', amount, paper_mode, slippage_bps, fee_bps)
 
-    def close_perp(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float):
+    def close_perp(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float) -> dict:
         return self._market_order('futures', symbol, 'buy', amount, paper_mode, slippage_bps, fee_bps)
 
-    def open_perp_positions_raw(self) -> list[dict]:
-        try:
-            positions = self.futures.fetch_positions()
-        except Exception:
-            return []
-        return [p for p in positions if abs(float(p.get('contracts') or p.get('info', {}).get('positionAmt') or 0)) > 0]
-
-    # ─── Margin mode + leverage configuration ───────────────────────────────
-    # For a delta-neutral arb, CROSS margin at 1x is the right setup:
-    #  - CROSS shares margin across positions, avoiding single-leg liquidation
-    #    risk on tiny price moves while the spot leg backs the perp short.
-    #  - 1x leverage means the perp uses its full notional as margin, matching
-    #    what we hold on the spot leg — keeps both legs symmetrically capitalized
-    #    and prevents "Margin is insufficient" close failures from leverage drift.
-    # Both calls are idempotent on Binance — repeating them when already-set is
-    # cheap and safe.
+    # ─── Margin mode + leverage (ccxt-uniform — both Binance & KuCoin) ────
 
     def configure_perp_for_arb(self, symbol: str) -> tuple[bool, str]:
+        """Set the perp to CROSS margin at 1x leverage — the right setup for a
+        delta-neutral arb hedge:
+          * CROSS shares margin across positions, avoiding single-leg
+            liquidation risk on tiny price moves.
+          * 1x leverage means perp margin == perp notional == spot notional,
+            keeping both legs symmetrically capitalised.
+        Both calls are idempotent on Binance and KuCoin — repeating them when
+        already-set is cheap and returns a benign "no need to change"."""
         margin_ok = leverage_ok = True
         margin_err = leverage_err = ''
         try:
             self.futures.set_margin_mode('cross', symbol)
         except Exception as e:
             msg = str(e)
-            # Binance returns "No need to change margin type" if it's already CROSS — that's fine.
-            if 'No need to change' not in msg and 'no need to change' not in msg:
+            if 'no need to change' not in msg.lower() and 'already' not in msg.lower():
                 margin_ok, margin_err = False, msg
         try:
             self.futures.set_leverage(1, symbol)
         except Exception as e:
             msg = str(e)
-            if 'No need to change' not in msg and 'no need to change' not in msg:
+            if 'no need to change' not in msg.lower() and 'already' not in msg.lower():
                 leverage_ok, leverage_err = False, msg
         if margin_ok and leverage_ok:
             return True, ''
         return False, '; '.join(filter(None, [margin_err, leverage_err]))
 
-    # ─── Binance Simple Earn (Flexible USDT) ─────────────────────────────────
-    # ccxt method names vary across versions; we probe a small set and call
-    # the first that exists. All methods degrade gracefully — if the API key
-    # lacks the Earn permission, the network is down, or the SAPI shape
-    # changes, we return None / an error string and the caller leaves money
-    # in the spot wallet.
+    # ─── Default no-op implementations for venue-specific surfaces ────────
+    # Subclasses override the methods their venue actually supports.
 
-    _earn_product_id_cache: dict[str, str] = {}
+    def flexible_earn_apr(self, asset: str, ttl_seconds: float = 3600.0) -> float:
+        """Latest annualized rate (decimal) for the venue's flexible Earn product
+        on `asset`. Default: 0.0 (venue has no Earn or it's not yet wired)."""
+        return 0.0
+
+    def earn_balance_usdt(self) -> tuple[float | None, str]:
+        return 0.0, ''
+
+    def earn_balance(self, asset: str = 'USDT') -> tuple[float | None, str]:
+        return 0.0, ''
+
+    def earn_subscribe(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        return self.earn_subscribe_asset('USDT', amount_usdt, paper_mode)
+
+    def earn_subscribe_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:
+        if paper_mode:
+            return True, 'paper'
+        return False, f'{asset}: Earn not wired on {self.name}'
+
+    def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        return self.earn_redeem_asset('USDT', amount_usdt, paper_mode)
+
+    def earn_redeem_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:
+        if paper_mode:
+            return True, 'paper'
+        return False, f'{asset}: Earn not wired on {self.name}'
+
+    def transfer_spot_to_futures(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        if paper_mode:
+            return True, 'paper'
+        return False, f'spot→futures transfer not wired on {self.name}'
+
+    def transfer_futures_to_spot(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        if paper_mode:
+            return True, 'paper'
+        return False, f'futures→spot transfer not wired on {self.name}'
+
+    def net_injected_capital_usdt(self, lookback_days: int = 365) -> tuple[float | None, dict]:
+        """Returns ``(net, meta)`` where ``net`` is in USDT and ``meta`` carries
+        a per-component breakdown for the UI. ``None`` signals the caller to
+        fall back to manual CapitalFlow rows."""
+        return None, {'error': f'history not wired on {self.name}'}
+
+
+# ─── Binance gateway ────────────────────────────────────────────────────────
+# Implements the full surface — Earn, universal-transfer, deposit /
+# withdrawal / sub-account-transfer history. Uses Binance's USDM-futures
+# client (``ccxt.binanceusdm``) to keep symbol shape identical to the spot
+# client (``BTC/USDT:USDT`` for the perp, ``BTC/USDT`` for the spot).
+
+class BinanceGateway(VenueGateway):
+    venue_id = 'binance'
+    name = 'Binance'
+
+    # Earn-subscribe rate-limit machinery — kept as class state so all
+    # instances share the cooldown (the bot creates fresh gateways
+    # frequently for HTTP routes).
+    _earn_subscribe_cooldown_until: dict[str, float] = {}
+    EARN_SUBSCRIBE_DEFAULT_COOLDOWN_S = 3600.0       # 1h between subscribes per asset
+    EARN_SUBSCRIBE_RATE_LIMITED_COOLDOWN_S = 86400.0  # 24h after Binance signals 77505
+
+    # Caches — instance-scoped so they survive across method calls but die
+    # with the gateway. Each carries an explicit TTL because Earn-product
+    # ids and capital-flow history are stable for many minutes.
+    _flexible_earn_apr_cache: dict[str, tuple[float, float]]
+    _earn_product_id_cache: dict[str, str]
+    _deposit_history_cache: dict[str, tuple[list[dict], float]]
+    _withdrawal_history_cache: dict[str, tuple[list[dict], float]]
+    _sub_transfer_history_cache: dict[str, tuple[list[dict], float]]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.spot = ccxt.binance({
+            'apiKey': settings.binance_api_key,
+            'secret': settings.binance_api_secret,
+            'enableRateLimit': True,
+        })
+        self.futures = ccxt.binanceusdm({
+            'apiKey': settings.binance_api_key,
+            'secret': settings.binance_api_secret,
+            'enableRateLimit': True,
+        })
+        # Per-instance caches so cleared state doesn't leak across processes.
+        self._flexible_earn_apr_cache = {}
+        self._earn_product_id_cache = {}
+        self._deposit_history_cache = {}
+        self._withdrawal_history_cache = {}
+        self._sub_transfer_history_cache = {}
+
+    # ─── SAPI helper (handles ccxt-version naming drift) ───────────────────
 
     def _call_sapi(self, candidates: tuple[str, ...], params: dict | None = None):
+        """Try each candidate ccxt method name in order; return the first hit.
+        Returns ``None`` when none of the candidates are bound on the spot
+        client (older ccxt builds expose different names than newer ones)."""
         for name in candidates:
             fn = getattr(self.spot, name, None)
             if callable(fn):
                 return fn(params or {})
         return None
+
+    # ─── Binance Simple Earn (Flexible) ────────────────────────────────────
+
+    def flexible_earn_apr(self, asset: str, ttl_seconds: float = 3600.0) -> float:
+        """Latest annualized rate (decimal) for the flexible Earn product on
+        `asset`, cached for an hour. Returns 0.0 if no product is offered or
+        the API isn't reachable — caller treats that as "no extra spot yield
+        to count toward the candidate's combined APY"."""
+        cached = self._flexible_earn_apr_cache.get(asset)
+        if cached:
+            rate, ts = cached
+            if time.time() - ts < ttl_seconds:
+                return rate
+        try:
+            resp = self._call_sapi((
+                'sapiV1GetSimpleEarnFlexibleList',
+                'sapi_v1_get_simple_earn_flexible_list',
+                'sapiGetSimpleEarnFlexibleList',
+            ), {'asset': asset})
+        except Exception:
+            self._flexible_earn_apr_cache[asset] = (0.0, time.time())
+            return 0.0
+        if not resp:
+            self._flexible_earn_apr_cache[asset] = (0.0, time.time())
+            return 0.0
+        for r in resp.get('rows', []) or resp.get('data', []) or []:
+            if r.get('asset') == asset:
+                try:
+                    rate = float(r.get('latestAnnualPercentageRate') or r.get('annualPercentageRate') or 0)
+                except Exception:
+                    rate = 0.0
+                self._flexible_earn_apr_cache[asset] = (rate, time.time())
+                return rate
+        self._flexible_earn_apr_cache[asset] = (0.0, time.time())
+        return 0.0
 
     def earn_product_id(self, asset: str) -> str | None:
         cached = self._earn_product_id_cache.get(asset)
@@ -392,10 +550,6 @@ class BinanceGateway:
                     return str(pid)
         return None
 
-    # Backwards-compat alias used by callers that only deal with USDT.
-    def earn_product_id_usdt(self) -> str | None:
-        return self.earn_product_id('USDT')
-
     def earn_balance(self, asset: str = 'USDT') -> tuple[float | None, str]:
         try:
             resp = self._call_sapi((
@@ -415,23 +569,12 @@ class BinanceGateway:
     def earn_balance_usdt(self) -> tuple[float | None, str]:
         return self.earn_balance('USDT')
 
-    # Earn subscribe is rate-limited per (asset, day) on Binance — too many
-    # subscribes returns 77505. We track the last attempt per asset and apply
-    # a cooldown locally so we never spam Binance, and bump the cooldown if
-    # Binance ever does return 77505.
-    _earn_subscribe_cooldown_until: dict[str, float] = {}
-    EARN_SUBSCRIBE_DEFAULT_COOLDOWN_S = 3600.0      # 1h between subscribes per asset
-    EARN_SUBSCRIBE_RATE_LIMITED_COOLDOWN_S = 86400.0  # 24h after Binance signals 77505
-
     def earn_subscribe_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:
-        """Subscribe `amount` of `asset` to Binance Simple Earn Flexible. Asset can be
-        USDT or any base coin that has a flexible product (Binance offers flexible
-        for most major listings). Caller must pre-format `amount` to the asset's
-        precision; here we use 6 decimals as a conservative cap.
-
+        """Subscribe ``amount`` of ``asset`` to Binance Simple Earn Flexible.
         Cooldown: each successful subscribe pins a per-asset cooldown so the
-        bot doesn't spam the SAPI every 30s loop. 77505 from Binance bumps
-        the cooldown to 24h for that asset."""
+        bot doesn't spam the SAPI on every loop. 77505 from Binance bumps
+        the cooldown to 24h for that asset to keep us safely under the daily
+        rate-limit window."""
         if paper_mode:
             return True, 'paper'
         if amount <= 0:
@@ -466,7 +609,7 @@ class BinanceGateway:
         if paper_mode:
             return True, 'paper'
         if amount <= 0:
-            return False, 'zero amount'
+            return False, f'{asset}: zero amount'
         # Binance returns -1102 when amount string is "0.00" — skip clearly-tiny calls.
         if asset == 'USDT' and amount < 0.10:
             return False, f'amount {amount:.4f} below USDT redeem minimum'
@@ -480,21 +623,12 @@ class BinanceGateway:
                 'sapiPostSimpleEarnFlexibleRedeem',
             ), {'productId': pid, 'amount': f'{amount:.6f}', 'destAccount': 'SPOT'})
         except Exception as e:
-            return False, str(e)
+            return False, f'{asset}: {e}'
         if resp is None:
-            return False, 'sapi method not available in ccxt'
+            return False, f'{asset}: sapi method not available in ccxt'
         return bool(resp.get('success', True)), ''
 
-    # Convenience wrappers for the existing USDT-only callers.
-    def earn_subscribe(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
-        return self.earn_subscribe_asset('USDT', amount_usdt, paper_mode)
-
-    def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
-        return self.earn_redeem_asset('USDT', amount_usdt, paper_mode)
-
-    # ─── Universal transfer (spot ⇄ USDM-futures) ────────────────────────
-    # Binance keeps spot and futures wallets separate; an arb bot needs USDT in
-    # both. The universal transfer SAPI moves USDT between them instantly.
+    # ─── Binance universal transfer (spot ⇄ USDM-futures) ─────────────────
 
     def _universal_transfer(self, transfer_type: str, amount_usdt: float) -> tuple[bool, str]:
         for name in ('sapiPostAssetTransfer', 'sapi_post_asset_transfer'):
@@ -521,13 +655,11 @@ class BinanceGateway:
             return True, 'noop'
         return self._universal_transfer('UMFUTURE_MAIN', amount_usdt)
 
-    # ─── Deposit / withdrawal history (for net-injected-capital headline) ───
-    # Binance only returns up to 90 days of history per call, so we walk
-    # backwards in 90-day chunks for `lookback_days` total. Cached for 5min.
-
-    _deposit_history_cache: dict[str, tuple[list[dict], float]] = {}
-    _withdrawal_history_cache: dict[str, tuple[list[dict], float]] = {}
-    _sub_transfer_history_cache: dict[str, tuple[list[dict], float]] = {}
+    # ─── Deposit / withdrawal / sub-transfer history ──────────────────────
+    # Binance returns up to 90 days per call on deposit/withdrawal endpoints
+    # and 30 days per call on sub-account-transfer. We walk backwards in
+    # chunks to reach ``lookback_days`` total. Cached for 5 minutes so the
+    # dashboard's repeated renders don't burn rate-limit.
 
     def _walk_history(self, sapi_candidates: tuple[str, ...], asset: str, status_value: int, lookback_days: int) -> list[dict]:
         rows: list[dict] = []
@@ -581,15 +713,14 @@ class BinanceGateway:
     def sub_account_transfer_history(self, asset: str = 'USDT', incoming: bool = True, lookback_days: int = 365, ttl_seconds: float = 300.0) -> list[dict]:
         """Sub-account-side view of master ↔ sub transfers.
         Endpoint: GET /sapi/v1/sub-account/sub/transfer/history
-        type: 1 = transfer in (master → this sub), 2 = transfer out (this sub → master).
+        type: 1 = transfer in (master → this sub), 2 = transfer out (sub → master).
         Returns [] if the API key isn't on a sub-account or the endpoint isn't
-        accessible (e.g., master keys hit a different endpoint)."""
+        accessible (master keys hit a different endpoint)."""
         key = f'{asset}:{1 if incoming else 2}:{lookback_days}'
         cached = self._sub_transfer_history_cache.get(key)
         if cached and (time.time() - cached[1]) < ttl_seconds:
             return cached[0]
         rows: list[dict] = []
-        # 30-day window per call on this endpoint historically.
         chunk_ms = 30 * 86400 * 1000
         end = int(time.time() * 1000)
         oldest = end - lookback_days * 86400 * 1000
@@ -619,13 +750,12 @@ class BinanceGateway:
         return rows
 
     def net_injected_capital_usdt(self, lookback_days: int = 365) -> tuple[float | None, dict]:
-        """Sum of all completed USDT inflows − outflows over the lookback window:
-            inflows = external deposits + master→sub transfers (if sub-account)
+        """Sum of completed USDT inflows − outflows over the lookback window:
+            inflows  = external deposits + master→sub transfers (if sub-account)
             outflows = external withdrawals + sub→master transfers
-        Returns (net_value, meta) where meta carries each component's count and
-        total so the UI can show the breakdown. Each fetch is best-effort; if
-        a particular endpoint isn't accessible (master key hitting sub endpoint
-        and vice-versa) it just returns 0/empty for that component."""
+        Returns ``(net, meta)`` where meta carries per-component count and total
+        for the UI. Returns ``(None, {'error': ...})`` if every history endpoint
+        came back empty so the caller falls back to manual CapitalFlow rows."""
         deps: list[dict] = []
         wdrs: list[dict] = []
         sub_in: list[dict] = []
@@ -652,8 +782,6 @@ class BinanceGateway:
         sub_in_total = sum(float(r.get('qty') or r.get('amount') or 0) for r in sub_in)
         sub_out_total = sum(float(r.get('qty') or r.get('amount') or 0) for r in sub_out)
         net = (deps_total + sub_in_total) - (wdrs_total + sub_out_total)
-        # If literally everything came back empty, signal failure so the caller
-        # falls back to CapitalFlow / manual tracking instead of showing $0.
         if not deps and not wdrs and not sub_in and not sub_out:
             return None, {'error': 'no SAPI history available (missing permission, sub-account keys, or no activity)'}
         return net, {
@@ -671,25 +799,25 @@ class BinanceGateway:
 
 
 # ─── KuCoin gateway ─────────────────────────────────────────────────────────
-# Same surface as :class:`BinanceGateway` so the bot loop can iterate over a
-# list of gateways without conditional logic. Significant differences vs
-# Binance:
+# Implements the venue-specific overrides; everything else inherits from
+# :class:`VenueGateway`. Notable differences vs Binance:
 #   * Spot ↔ futures transfers go through KuCoin's ``innerTransfer`` SAPI on
 #     the spot client (Binance uses ``sapiPostAssetTransfer``).
-#   * Earn / Pool-X is deferred — KuCoin's flexible-lend product pays in the
-#     deposited asset rather than USDT, breaking the "compounded APY in USDT"
-#     accounting the bot uses today. earn_* methods all return safely-no-op.
-#   * Net-injected-capital history is venue-specific and not yet implemented;
-#     callers fall back to the manual CapitalFlow table.
-#   * Symbol shape: ccxt normalises both KuCoin's perp suffix (e.g. ``XBTUSDTM``
-#     → ``BTC/USDT:USDT``) and Binance's, so the bot's symbol handling is
-#     unchanged.
+#   * Earn / Pool-X is deferred — KuCoin's lend product pays in the deposited
+#     asset rather than USDT, which doesn't fit the bot's compounded-USDT
+#     APY accounting. Inherit the no-op earn_* methods.
+#   * Net-injected-capital history is venue-specific and not yet wired —
+#     dashboard falls back to manual CapitalFlow rows on KuCoin until then.
+#   * Symbol shape: ccxt normalises both KuCoin's perp suffix
+#     (``XBTUSDTM`` → ``BTC/USDT:USDT``) and Binance's, so the bot's symbol
+#     handling is unchanged.
 
-class KuCoinGateway:
+class KuCoinGateway(VenueGateway):
     venue_id = 'kucoin'
     name = 'KuCoin'
 
     def __init__(self) -> None:
+        super().__init__()
         common = {
             'apiKey': settings.kucoin_api_key,
             'secret': settings.kucoin_api_secret,
@@ -698,208 +826,18 @@ class KuCoinGateway:
         }
         self.spot = ccxt.kucoin(common)
         self.futures = ccxt.kucoinfutures(common)
-        self.last_balance_error: str = ''
 
-    def load_markets(self) -> None:
-        self.spot.load_markets()
-        self.futures.load_markets()
-
-    # ─── Read-only helpers ───────────────────────────────────────────────
-    # These are ccxt-uniform across venues, so the implementations mirror
-    # :class:`BinanceGateway` byte-for-byte. They exist on the gateway
-    # rather than as free functions so the bot can pass a single object
-    # into per-venue code paths.
-
-    def order_book_depth_usdt(self, symbol: str, side: str = 'ask', band_bps: float = 10.0, perp: bool = False) -> float:
-        try:
-            ex = self.futures if perp else self.spot
-            ob = ex.fetch_order_book(symbol, limit=50)
-        except Exception:
-            return 0.0
-        bids = ob.get('bids') or []
-        asks = ob.get('asks') or []
-        if not bids or not asks:
-            return 0.0
-        try:
-            mid = (float(bids[0][0]) + float(asks[0][0])) / 2.0
-        except Exception:
-            return 0.0
-        if mid <= 0:
-            return 0.0
-        threshold = band_bps / 10000.0
-        if side == 'ask':
-            cutoff = mid * (1 + threshold)
-            levels = asks
-            within = lambda p: p <= cutoff
-        else:
-            cutoff = mid * (1 - threshold)
-            levels = bids
-            within = lambda p: p >= cutoff
-        total = 0.0
-        for lvl in levels:
-            try:
-                p, q = float(lvl[0]), float(lvl[1])
-            except Exception:
-                continue
-            if not within(p):
-                break
-            total += p * q
-        return total
-
-    def safe_balances(self) -> dict | None:
-        try:
-            result = {'spot': self.spot.fetch_balance(), 'futures': self.futures.fetch_balance()}
-            self.last_balance_error = ''
-            return result
-        except Exception as e:
-            self.last_balance_error = str(e)
-            return None
-
-    def price(self, symbol: str) -> float:
-        return float(self.spot.fetch_ticker(symbol)['last'])
-
-    def perp_price(self, symbol: str) -> float:
-        return float(self.futures.fetch_ticker(symbol)['last'])
-
-    def safe_price(self, symbol: str, perp: bool = False) -> float | None:
-        try:
-            return self.perp_price(symbol) if perp else self.price(symbol)
-        except Exception:
-            return None
-
-    def market_min_amount(self, symbol: str, perp: bool = False) -> float:
-        ex = self.futures if perp else self.spot
-        try:
-            market = ex.market(symbol)
-        except Exception:
-            return 0.0
-        try:
-            return float((market.get('limits') or {}).get('amount', {}).get('min') or 0.0)
-        except Exception:
-            return 0.0
-
-    def open_perp_positions_raw(self) -> list[dict]:
-        try:
-            positions = self.futures.fetch_positions()
-        except Exception:
-            return []
-        return [p for p in positions if abs(float(p.get('contracts') or p.get('info', {}).get('positionAmt') or 0)) > 0]
-
-    # ─── Funding scan ───────────────────────────────────────────────────
-    # KuCoin's fetch_funding_rates exposes the same shape as Binance's.
-    # ccxt fills in interval, fundingRate, etc. We re-use _interval_hours
-    # + annualize_rate from the module level so the math is consistent.
-
-    def scan_funding(self, entry_apr_threshold: float, min_quote_volume: float, min_depth_usdt: float = 0.0, depth_band_bps: float = 10.0, include_earn_apr: bool = False) -> tuple[list[Candidate], int, list[tuple[str, str, float]]]:
-        try:
-            rates = self.futures.fetch_funding_rates()
-        except Exception:
-            return [], 0, []
-        passing: list[Candidate] = []
-        rejected: list[tuple[str, str, float]] = []
-        total = 0
-        for symbol, row in rates.items():
-            fr = row.get('fundingRate')
-            if fr is None or not symbol.endswith(':USDT'):
-                continue
-            total += 1
-            interval_h = _interval_hours(row)
-            apr = annualize_rate(float(fr), interval_h)
-            if apr < entry_apr_threshold:
-                continue
-            base = symbol.split('/')[0]
-            spot_symbol = f'{base}/USDT'
-            if spot_symbol not in self.spot.markets:
-                rejected.append((symbol, 'no_spot_market', apr))
-                continue
-            try:
-                t = self.spot.fetch_ticker(spot_symbol)
-            except Exception:
-                rejected.append((symbol, 'ticker_error', apr))
-                continue
-            qv = float(t.get('quoteVolume') or 0)
-            if qv < min_quote_volume:
-                rejected.append((symbol, f'volume<{min_quote_volume:.0f}', apr))
-                continue
-            spot_depth = perp_depth = 0.0
-            if min_depth_usdt > 0:
-                spot_depth = self.order_book_depth_usdt(spot_symbol, side='ask', band_bps=depth_band_bps, perp=False)
-                perp_depth = self.order_book_depth_usdt(symbol, side='bid', band_bps=depth_band_bps, perp=True)
-                tight = min(spot_depth, perp_depth)
-                if tight < min_depth_usdt:
-                    rejected.append((symbol, f'depth<{min_depth_usdt:.0f} (spot {spot_depth:.0f} / perp {perp_depth:.0f} @ ±{depth_band_bps:.0f}bps)', apr))
-                    continue
-            # KuCoin Earn / Pool-X deferred — pass 0.0 so the candidate's
-            # combined_apy is just the funding APY for now.
-            passing.append(Candidate(
-                spot_symbol=spot_symbol,
-                perp_symbol=symbol,
-                funding_rate=float(fr),
-                funding_interval_hours=interval_h,
-                quote_volume=qv,
-                spot_depth_usdt=spot_depth,
-                perp_depth_usdt=perp_depth,
-                spot_earn_apr=0.0,
-            ))
-        passing.sort(key=lambda c: (c.combined_apy, c.min_depth_usdt), reverse=True)
-        return passing, total, rejected
-
-    # ─── Order placement ────────────────────────────────────────────────
-
-    def _market_order(self, venue: str, symbol: str, side: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float):
-        if paper_mode:
-            mid = self.perp_price(symbol) if venue == 'futures' else self.price(symbol)
-            slip = slippage_bps / 10000.0
-            fill_price = mid * (1 + slip) if side == 'buy' else mid * (1 - slip)
-            fee_cost = fill_price * amount * (fee_bps / 10000.0)
-            return {'id': 'paper', 'symbol': symbol, 'side': side, 'amount': amount, 'venue': venue, 'status': 'closed', 'price': fill_price, 'fee': {'cost': fee_cost}}
-        if venue == 'spot':
-            return self.spot.create_order(symbol, 'market', side, amount)
-        return self.futures.create_order(symbol, 'market', side, amount)
-
-    def create_spot_buy(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float):
-        return self._market_order('spot', symbol, 'buy', amount, paper_mode, slippage_bps, fee_bps)
-
-    def create_perp_short(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float):
-        return self._market_order('futures', symbol, 'sell', amount, paper_mode, slippage_bps, fee_bps)
-
-    def close_spot(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float):
-        return self._market_order('spot', symbol, 'sell', amount, paper_mode, slippage_bps, fee_bps)
-
-    def close_perp(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float):
-        return self._market_order('futures', symbol, 'buy', amount, paper_mode, slippage_bps, fee_bps)
-
-    # ─── Margin mode + leverage configuration ───────────────────────────
-    # CROSS + 1x leverage matches Binance's setup. Both calls are
-    # idempotent; KuCoin returns a benign error string when the symbol
-    # is already on the requested setting.
-
-    def configure_perp_for_arb(self, symbol: str) -> tuple[bool, str]:
-        margin_ok = leverage_ok = True
-        margin_err = leverage_err = ''
-        try:
-            self.futures.set_margin_mode('cross', symbol)
-        except Exception as e:
-            msg = str(e)
-            if 'no need' not in msg.lower() and 'already' not in msg.lower():
-                margin_ok, margin_err = False, msg
-        try:
-            self.futures.set_leverage(1, symbol)
-        except Exception as e:
-            msg = str(e)
-            if 'no need' not in msg.lower() and 'already' not in msg.lower():
-                leverage_ok, leverage_err = False, msg
-        if margin_ok and leverage_ok:
-            return True, ''
-        return False, '; '.join(filter(None, [margin_err, leverage_err]))
-
-    # ─── Spot ↔ futures transfer (KuCoin innerTransfer) ─────────────────
+    # ─── Spot ↔ futures transfer (KuCoin innerTransfer) ───────────────────
 
     def _inner_transfer(self, from_account: str, to_account: str, amount_usdt: float) -> tuple[bool, str]:
-        # ccxt method names for KuCoin's transfer. We probe several
-        # naming variants for ccxt-version drift, same pattern as the
-        # SAPI lookup on Binance.
-        for name in ('privatePostAccountsInnerTransfer', 'private_post_accounts_inner_transfer', 'privatePostAccountsUniversalTransfer'):
+        # ccxt's KuCoin client has historically exposed innerTransfer under
+        # different names. Probe a small ordered list and call the first that
+        # exists — same pattern used for Binance SAPI lookups.
+        for name in (
+            'privatePostAccountsInnerTransfer',
+            'private_post_accounts_inner_transfer',
+            'privatePostAccountsUniversalTransfer',
+        ):
             fn = getattr(self.spot, name, None)
             if callable(fn):
                 try:
@@ -929,56 +867,19 @@ class KuCoinGateway:
             return True, 'noop'
         return self._inner_transfer('contract', 'main', amount_usdt)
 
-    # ─── Earn / Pool-X (deferred — Phase 1 doesn't subscribe on KuCoin) ─
 
-    def earn_balance_usdt(self) -> tuple[float | None, str]:
-        return 0.0, ''
-
-    def earn_balance(self, asset: str = 'USDT') -> tuple[float | None, str]:
-        return 0.0, ''
-
-    def earn_subscribe(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
-        if paper_mode:
-            return True, 'paper'
-        return False, 'KuCoin Earn (Pool-X) not yet wired — see docs/kucoin-integration-plan.md'
-
-    def earn_subscribe_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:
-        if paper_mode:
-            return True, 'paper'
-        return False, f'{asset}: KuCoin Earn (Pool-X) not yet wired'
-
-    def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
-        if paper_mode:
-            return True, 'paper'
-        return False, 'KuCoin Earn not subscribed'
-
-    def earn_redeem_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:
-        if paper_mode:
-            return True, 'paper'
-        return False, f'{asset}: KuCoin Earn not subscribed'
-
-    def flexible_earn_apr(self, asset: str, ttl_seconds: float = 3600.0) -> float:
-        return 0.0
-
-    # ─── Capital-flow history (deferred — manual CapitalFlow only) ──────
-
-    def net_injected_capital_usdt(self, lookback_days: int = 365) -> tuple[float | None, dict]:
-        return None, {'error': 'KuCoin deposit/withdrawal history not yet wired'}
-
-
-# ─── Multi-venue factory ────────────────────────────────────────────────
+# ─── Multi-venue factory ────────────────────────────────────────────────────
 # The bot calls :func:`make_gateways` to discover which venues are live.
 # A venue is "live" iff its credentials are present in the environment.
-# Order matters: gateways earlier in the list are scanned first each
-# cycle, so they get first pick of capital and candidates. Binance leads
-# by default since it has the most mature integration and the most
-# liquidity.
+# Order matters: gateways earlier in the list scan first each cycle, so they
+# get first pick of capital and candidates. Binance leads by default — most
+# mature integration, deepest liquidity.
 
-def make_gateways() -> list:
-    """Return the ordered list of gateways the bot should drive this run.
-    Empty list means no venue is configured — the bot loop becomes a
-    no-op until credentials are set."""
-    gws: list = []
+def make_gateways() -> list[VenueGateway]:
+    """Return the ordered list of currently-configured venue gateways. Empty
+    list means no venue is configured — the bot loop becomes a no-op until
+    credentials are set on the Configuration tab / env."""
+    gws: list[VenueGateway] = []
     if settings.binance_api_key and settings.binance_api_secret:
         gws.append(BinanceGateway())
     if settings.kucoin_api_key and settings.kucoin_api_secret and settings.kucoin_api_passphrase:
