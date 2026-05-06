@@ -1153,13 +1153,46 @@ class BinanceGateway(VenueGateway):
         return {'spot': spot, 'earn': earn, 'futures': futures}
 
     def earn_balance_usdt(self) -> tuple[float | None, str]:
-        """Under PM, the 'earn' surface is BFUSD — yield-bearing margin
-        collateral. The cached balance dict already contains it, so we
-        just read; no extra API call."""
+        """Aggregate Binance's 'yield-bearing' surfaces.
+        Under PM the canonical earn asset is BFUSD (cross-collateral margin
+        that earns yield). But many users — including ours after the migration
+        — still hold legacy Simple Earn Flexible USDT positions that the bot
+        was managing pre-PM. Both should count toward equity until the user
+        migrates everything via the dashboard's 'Migrate Simple Earn → PM'
+        button (see _migrate_simple_earn_to_pm in main.py).
+
+        Returns the sum: BFUSD (from cached PM balance) + Simple Earn
+        flexible USDT position. Either component may be 0 — that's fine."""
         bals = self.safe_balances()
-        if bals is None:
-            return None, self.last_balance_error
-        return float((bals.get('earn', {}).get('USDT') or {}).get('total') or 0), ''
+        bfusd_total = 0.0
+        if bals is not None:
+            bfusd_total = float((bals.get('earn', {}).get('USDT') or {}).get('total') or 0)
+        # Simple Earn flexible USDT — works on both Classic AND PM accounts
+        # (it's a separate Simple Earn product, not linked to the trading
+        # account type).
+        simple_earn_total = 0.0
+        try:
+            resp = self._call_sapi((
+                'sapiV1GetSimpleEarnFlexiblePosition',
+                'sapi_v1_get_simple_earn_flexible_position',
+                'sapiGetSimpleEarnFlexiblePosition',
+            ), {'asset': 'USDT'})
+            if resp:
+                rows = resp.get('rows') or resp.get('data') or []
+                for r in rows:
+                    if r.get('asset') == 'USDT':
+                        try:
+                            simple_earn_total += float(r.get('totalAmount') or r.get('amount') or 0)
+                        except (TypeError, ValueError):
+                            pass
+        except Exception:
+            pass  # Simple Earn endpoint may be 4xx on some PM accounts;
+                  # that's fine, balance falls back to BFUSD-only.
+        total = bfusd_total + simple_earn_total
+        # Surface the breakdown via last_earn_breakdown so the dashboard
+        # can show "BFUSD X.XX + Simple Earn Y.YY" without a second call.
+        self.last_earn_breakdown = {'bfusd': bfusd_total, 'simple_earn_flexible_usdt': simple_earn_total}
+        return total, ''
 
     def earn_balance(self, asset: str = 'USDT') -> tuple[float | None, str]:
         if asset != 'USDT':
@@ -1347,6 +1380,41 @@ class KuCoinGateway(VenueGateway):
         }
         self.spot = ccxt.kucoin(common)
         self.futures = ccxt.kucoinfutures(common)
+        # UTA detection — cached at init so per-method overrides don't
+        # round-trip the network on every call. The probe is cheap (single
+        # /api/v3/uta/check call); failures fall back to Classic to stay
+        # safe. The bot loop and dashboard refresh the gateway frequently
+        # enough that a UTA flip in the KuCoin UI is picked up quickly.
+        self._is_uta = False
+        try:
+            self._is_uta = bool(self.spot.is_uta_enabled())
+        except Exception:
+            self._is_uta = False
+
+    # ─── UTA helpers ────────────────────────────────────────────────────
+    # ccxt names the UTA private routes ``utaPrivate{Get,Post}…``. We
+    # probe both the camel- and snake-case variants because ccxt has
+    # historically renamed these in minor releases.
+
+    @staticmethod
+    def _uta(client, candidates: tuple[str, ...]):
+        for name in candidates:
+            fn = getattr(client, name, None)
+            if callable(fn):
+                return fn
+        return None
+
+    def _ex_symbol_uta(self, ccxt_symbol: str) -> str:
+        """KuCoin UTA expects raw exchange symbols (e.g. ``ETHUSDTM`` for
+        the perp), not ccxt-normalised ``ETH/USDT:USDT``. Use ccxt's
+        ``market`` lookup which carries the venue's id field."""
+        try:
+            m = self.futures.markets.get(ccxt_symbol) or self.spot.markets.get(ccxt_symbol)
+            if m and m.get('id'):
+                return str(m['id'])
+        except Exception:
+            pass
+        return ccxt_symbol.split(':')[0].replace('/', '')
 
     # ccxt's kucoinfutures.fetch_funding_rates() raises NotSupported, so the
     # base-class scan would silently return zero candidates. KuCoin does
@@ -1416,10 +1484,57 @@ class KuCoinGateway(VenueGateway):
     # :meth:`earn_balance_usdt` so the equity total = spot + earn + futures
     # without double-counting.
     def _fetch_balances_uncached(self) -> dict:
-        # Fetch all three wallets in one shot so the cache covers
-        # spot + earn + futures with no extra round-trips. Stashes the main
-        # wallet under ``earn`` so :meth:`earn_balance_usdt` reads it
-        # without another API call.
+        # Two paths depending on account mode:
+        #   UTA — single ``/api/v3/uta/account/balance`` call returns a
+        #         unified pool of every collateral asset. We synthesise
+        #         spot/earn/futures buckets so downstream code (which
+        #         was written against Classic shape) keeps working: the
+        #         unified-pool USDT lands in 'spot', 0 in 'futures' (UTA
+        #         doesn't separate), auto-lent USDT in 'earn'.
+        #   Classic — three separate fetch_balance calls (trade / main /
+        #         contract); same as before.
+        if self._is_uta:
+            fn = self._uta(self.spot, ('utaPrivateGetAccountBalance', 'utaprivateGetAccountBalance'))
+            if fn is not None:
+                try:
+                    resp = fn({})
+                    rows = (resp or {}).get('data')
+                    if isinstance(rows, dict):
+                        rows = rows.get('list') or rows.get('balances') or []
+                    elif not isinstance(rows, list):
+                        rows = []
+                    usdt_total = usdt_free = lent_total = 0.0
+                    per_asset: dict[str, dict] = {}
+                    for r in rows or []:
+                        asset = r.get('coin') or r.get('asset') or r.get('currency') or ''
+                        try:
+                            free = float(r.get('availableBalance') or r.get('free') or 0)
+                            total = float(r.get('walletBalance') or r.get('total') or free)
+                            lent = float(r.get('autoLendQuantity') or r.get('lentBalance') or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if asset == 'USDT':
+                            usdt_total += total
+                            usdt_free += free
+                            lent_total += lent
+                        elif total > 0:
+                            per_asset[asset] = {'free': free, 'used': max(0.0, total - free), 'total': total}
+                    spot = {'USDT': {'free': usdt_free, 'used': max(0.0, usdt_total - usdt_free), 'total': usdt_total},
+                            **per_asset,
+                            'free': {'USDT': usdt_free, **{k: v['free'] for k, v in per_asset.items()}},
+                            'used': {'USDT': max(0.0, usdt_total - usdt_free), **{k: v['used'] for k, v in per_asset.items()}},
+                            'total': {'USDT': usdt_total, **{k: v['total'] for k, v in per_asset.items()}}}
+                    futures = {'USDT': {'free': usdt_free, 'used': max(0.0, usdt_total - usdt_free), 'total': usdt_total},
+                               'free': {'USDT': usdt_free}, 'used': {'USDT': max(0.0, usdt_total - usdt_free)},
+                               'total': {'USDT': usdt_total}}
+                    earn = {'USDT': {'free': lent_total, 'used': 0.0, 'total': lent_total},
+                            'free': {'USDT': lent_total}, 'used': {'USDT': 0.0}, 'total': {'USDT': lent_total}}
+                    return {'spot': spot, 'earn': earn, 'futures': futures}
+                except Exception:
+                    # UTA balance probe failed — fall through to classic
+                    # path. last_balance_error gets populated by the parent.
+                    pass
+        # Classic fall-through.
         return {
             'spot': self.spot.fetch_balance({'type': 'trade'}),
             'earn': self.spot.fetch_balance({'type': 'main'}),
@@ -1484,6 +1599,11 @@ class KuCoinGateway(VenueGateway):
             return True, 'paper'
         if amount_usdt <= 0:
             return True, 'noop'
+        if self._is_uta:
+            # Under UTA, idle USDT auto-lends if the user enables auto-lend
+            # in the KuCoin UI. The bot doesn't issue explicit subscribe
+            # calls — that races with KuCoin's auto-routing.
+            return True, 'UTA mode: auto-lend handles USDT yield (toggle in KuCoin UI per asset)'
         return self._transfer('trade', 'main', amount_usdt)
 
     def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
@@ -1491,6 +1611,8 @@ class KuCoinGateway(VenueGateway):
             return True, 'paper'
         if amount_usdt <= 0:
             return True, 'noop'
+        if self._is_uta:
+            return True, 'UTA mode: auto-lend redeems automatically when margin is needed'
         return self._transfer('main', 'trade', amount_usdt)
 
     # ─── Spot ↔ futures transfer (KuCoin) ────────────────────────────────
@@ -1503,6 +1625,10 @@ class KuCoinGateway(VenueGateway):
     # ccxt's unified ``transfer()`` picks the right one based on whether
     # the route involves a non-spot wallet, so we always go through it.
     def _transfer(self, from_account: str, to_account: str, amount_usdt: float) -> tuple[bool, str]:
+        # Under UTA the unified pool handles everything — no transfers
+        # between trade / contract / main needed.
+        if self._is_uta:
+            return True, 'UTA mode: unified pool, no transfer needed'
         try:
             self.spot.transfer('USDT', float(amount_usdt), from_account, to_account)
         except Exception as e:

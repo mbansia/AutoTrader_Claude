@@ -354,6 +354,66 @@ def run_once(view: str | None = Cookie(default=None), _: None = Depends(auth)):
     return RedirectResponse(url='/dashboard', status_code=303)
 
 
+@app.post('/admin/migrate-earn-to-pm')
+def migrate_earn_to_pm(_: None = Depends(auth)):
+    """One-time migration helper. Redeems the user's legacy Simple Earn
+    Flexible USDT position back to the spot wallet. Under Portfolio
+    Margin, the redeemed USDT lands in the unified margin pool where
+    Binance's auto-collection (toggled per-asset in the Binance UI)
+    will auto-convert it to BFUSD if enabled. We don't directly call
+    BFUSD subscribe — that's owned by the user's auto-collection
+    settings; calling it from the bot would race with Binance's own
+    routing logic.
+
+    Idempotent: if no Simple Earn position exists, the call is a no-op
+    and logs 'nothing to migrate'. Run it multiple times safely.
+
+    KuCoin equivalent: under UTA the funding-wallet auto-lend surface
+    is the destination; until UTA lands the bot just leaves USDT in
+    the main wallet (which is already the earn surface)."""
+    from app.exchange import make_gateways, BinanceGateway
+    from app.bot import log_event
+    gateways = make_gateways()
+    bn = next((g for g in gateways if isinstance(g, BinanceGateway)), None)
+    with SessionLocal() as db:
+        if bn is None:
+            log_event(db, 'Migrate-to-PM: Binance gateway not configured', mode=MODE_LIVE, level='WARN', exchange='binance')
+            db.commit()
+            return RedirectResponse(url='/dashboard', status_code=303)
+        # Read current Simple Earn flexible USDT.
+        try:
+            resp = bn._call_sapi((
+                'sapiV1GetSimpleEarnFlexiblePosition',
+                'sapi_v1_get_simple_earn_flexible_position',
+                'sapiGetSimpleEarnFlexiblePosition',
+            ), {'asset': 'USDT'})
+        except Exception as e:
+            log_event(db, f'Migrate-to-PM: failed to read Simple Earn position — {e}', mode=MODE_LIVE, level='WARN', exchange='binance')
+            db.commit()
+            return RedirectResponse(url='/dashboard', status_code=303)
+        rows = (resp or {}).get('rows') or (resp or {}).get('data') or []
+        usdt_position = next((r for r in rows if r.get('asset') == 'USDT'), None)
+        if not usdt_position:
+            log_event(db, 'Migrate-to-PM: nothing to migrate (no Simple Earn USDT position)', mode=MODE_LIVE, exchange='binance')
+            db.commit()
+            return RedirectResponse(url='/dashboard', status_code=303)
+        try:
+            amount = float(usdt_position.get('totalAmount') or usdt_position.get('amount') or 0)
+        except (TypeError, ValueError):
+            amount = 0.0
+        if amount <= 0.10:
+            log_event(db, f'Migrate-to-PM: Simple Earn USDT position too small to redeem ({amount:.4f})', mode=MODE_LIVE, exchange='binance')
+            db.commit()
+            return RedirectResponse(url='/dashboard', status_code=303)
+        ok, err = bn.earn_redeem_asset('USDT', amount, paper_mode=False)
+        if ok:
+            log_event(db, f'Migrate-to-PM: redeemed {amount:.2f} USDT from Simple Earn → spot (PM auto-collection will convert to BFUSD if enabled)', mode=MODE_LIVE, exchange='binance')
+        else:
+            log_event(db, f'Migrate-to-PM failed: {err}', mode=MODE_LIVE, level='WARN', exchange='binance')
+        db.commit()
+    return RedirectResponse(url='/dashboard', status_code=303)
+
+
 @app.post('/admin/force-earn-sweep')
 def force_earn_sweep(_: None = Depends(auth)):
     """Force-bypass the per-asset earn-subscribe cooldown and try to sweep
@@ -1156,11 +1216,24 @@ def _probe(label: str, fn) -> dict:
     """Run a probe callable and capture (ok, raw, err, latency_ms).
     The ``raw`` payload is sanitised through :func:`_json_safe` so the
     monitoring template can render it via Jinja's ``tojson`` filter
-    without choking on datetime / set / Decimal values."""
+    without choking on datetime / set / Decimal values.
+
+    For probes that return collections (lists, dicts with ``rows`` /
+    ``data``), we annotate the label with the row count so the operator
+    can see at a glance whether the endpoint had anything — the most
+    common diagnostic question (e.g. "did the deposit-history call
+    return rows?") is now answered without expanding the probe."""
     started = time.time()
     try:
         raw = fn()
-        return {'label': label, 'ok': True, 'raw': _json_safe(raw), 'err': '', 'latency_ms': int((time.time() - started) * 1000)}
+        annotated = label
+        # Try to surface the row count cheaply.
+        rows_for_count = raw
+        if isinstance(raw, dict):
+            rows_for_count = raw.get('rows') or raw.get('data') or raw.get('items')
+        if isinstance(rows_for_count, list):
+            annotated = f'{label} · {len(rows_for_count)} row(s)'
+        return {'label': annotated, 'ok': True, 'raw': _json_safe(raw), 'err': '', 'latency_ms': int((time.time() - started) * 1000)}
     except Exception as e:
         return {'label': label, 'ok': False, 'raw': None, 'err': str(e)[:400], 'latency_ms': int((time.time() - started) * 1000)}
 
@@ -1188,10 +1261,25 @@ def _gather_exchange_status() -> list[dict]:
             'sapi_v1_get_simple_earn_flexible_position',
             'sapiGetSimpleEarnFlexiblePosition',
         ), {'asset': 'USDT'})))
-        probes.append(_probe('Deposit history (USDT, 30d)', lambda: gw.deposit_history('USDT', lookback_days=30, ttl_seconds=0)))
-        probes.append(_probe('Withdrawal history (USDT, 30d)', lambda: gw.withdrawal_history('USDT', lookback_days=30, ttl_seconds=0)))
-        probes.append(_probe('Sub-account transfer in (USDT, 30d)', lambda: gw.sub_account_transfer_history('USDT', incoming=True, lookback_days=30, ttl_seconds=0)))
-        probes.append(_probe('Sub-account transfer out (USDT, 30d)', lambda: gw.sub_account_transfer_history('USDT', incoming=False, lookback_days=30, ttl_seconds=0)))
+        probes.append(_probe('Deposit history (USDT, 365d)', lambda: gw.deposit_history('USDT', lookback_days=365, ttl_seconds=0)))
+        probes.append(_probe('Withdrawal history (USDT, 365d)', lambda: gw.withdrawal_history('USDT', lookback_days=365, ttl_seconds=0)))
+        probes.append(_probe('Sub-account transfer in (USDT, 365d)', lambda: gw.sub_account_transfer_history('USDT', incoming=True, lookback_days=365, ttl_seconds=0)))
+        probes.append(_probe('Sub-account transfer out (USDT, 365d)', lambda: gw.sub_account_transfer_history('USDT', incoming=False, lookback_days=365, ttl_seconds=0)))
+        # Alternate sub-transfer endpoint name. Some Binance vintages
+        # expose subUserHistory but not subTransferHistory; probe both
+        # so we don't miss rows behind a naming difference.
+        probes.append(_probe('Sub-account subUserHistory (alt endpoint)', lambda: gw._call_sapi((
+            'sapiV1GetSubAccountTransferSubUserHistory',
+            'sapi_v1_get_sub_account_transfer_sub_user_history',
+            'sapiGetSubAccountTransferSubUserHistory',
+        ), {'asset': 'USDT', 'startTime': int((datetime.utcnow() - timedelta(days=365)).timestamp() * 1000)})))
+        # Universal-transfer history (raw, no intra-account filter) so the
+        # operator can see EVERY row Binance returns and spot the user's
+        # deposit even if our parser missed it.
+        probes.append(_probe('Universal transfers raw (USDT, 365d, paged)', lambda: gw.spot.fetch_transfers('USDT', since=int((datetime.utcnow() - timedelta(days=30)).timestamp() * 1000)) or []))
+        # PM account snapshot — confirms we're talking to a PM-enabled key
+        # and surfaces the totalWalletBalance / totalEquity for cross-check.
+        probes.append(_probe('PM /papi/v1/account', lambda: gw._papi(gw.spot, ('papiGetAccount', 'papi_get_account'))({}) if gw._papi(gw.spot, ('papiGetAccount', 'papi_get_account')) else 'papiGetAccount not in this ccxt build'))
         probes.append(_probe('Open perp positions', lambda: gw.open_perp_positions_raw()))
         probes.append(_probe('Capital-flow ingest (deposits + withdrawals + sub-transfers, 365d)', lambda: {
             'rows': gw.list_capital_flow_records(lookback_days=365),
@@ -1256,6 +1344,12 @@ def _gather_exchange_status() -> list[dict]:
         kc_probes.append(_probe('Futures fetch_balance()', lambda: kgw.futures.fetch_balance()))
         kc_probes.append(_probe('Funding rates (markets-derived)', lambda: kgw.funding_rates_dict()))
         kc_probes.append(_probe('Open perp positions', lambda: kgw.open_perp_positions_raw()))
+        kc_probes.append(_probe('Deposit history (USDT, 365d)', lambda: kgw.spot.fetch_deposits('USDT', since=int((datetime.utcnow() - timedelta(days=365)).timestamp() * 1000))))
+        kc_probes.append(_probe('Withdrawal history (USDT, 365d)', lambda: kgw.spot.fetch_withdrawals('USDT', since=int((datetime.utcnow() - timedelta(days=365)).timestamp() * 1000))))
+        kc_probes.append(_probe('Universal transfers raw (USDT, 365d)', lambda: kgw.spot.fetch_transfers('USDT', since=int((datetime.utcnow() - timedelta(days=365)).timestamp() * 1000))))
+        # UTA account-mode probe — surfaces the live account state so the
+        # operator can confirm the API key sees UTA/Classic correctly.
+        kc_probes.append(_probe('Account mode (UTA check)', lambda: {'is_uta_enabled': kgw.spot.is_uta_enabled()}))
         kc_probes.append(_probe('Capital-flow ingest (deposits + sub-transfers)', lambda: {
             'rows': kgw.list_capital_flow_records(lookback_days=365),
             'errors': kgw.last_history_errors,
