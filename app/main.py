@@ -629,18 +629,19 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
 
         # Fees paid across every trade in this mode. Avg fee % = total fees
         # / total notional, the realistic round-trip cost the bot is paying.
-        # Per-(venue, leg) breakdown surfaces whether spot or perp legs
-        # are the dominant cost driver, and which venue charges more.
+        # Notional is computed inline (Trade has quantity + price; no stored
+        # notional column) so the figures stay consistent if old rows were
+        # written before any historical normalisation.
         fee_rows = db.scalars(select(Trade).where(Trade.mode == v)).all()
         total_fees = sum(float(t.fee or 0.0) for t in fee_rows)
-        total_notional = sum(float(t.notional or 0.0) for t in fee_rows) or 1.0
+        total_notional = sum(float(t.quantity or 0.0) * float(t.price or 0.0) for t in fee_rows)
         avg_fee_pct = (total_fees / total_notional) * 100.0 if total_notional > 0 else 0.0
         fee_breakdown: dict[tuple[str, str], dict] = {}
         for t in fee_rows:
             key = (t.exchange or '?', t.venue or '?')  # ('binance', 'spot') etc.
             slot = fee_breakdown.setdefault(key, {'fees': 0.0, 'notional': 0.0, 'count': 0})
             slot['fees'] += float(t.fee or 0.0)
-            slot['notional'] += float(t.notional or 0.0)
+            slot['notional'] += float(t.quantity or 0.0) * float(t.price or 0.0)
             slot['count'] += 1
         ctx['fees'] = {
             'total_usd': total_fees,
