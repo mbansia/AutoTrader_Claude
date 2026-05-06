@@ -122,16 +122,6 @@
       </details>
       {% endif %}
       {% if earn.last_error %}<span class="bad" title="{{ earn.last_error }}" style="font-size:11px;">{{ earn.last_error|truncate(60) }}</span>{% endif %}
-      {% if view == 'live' %}
-      <div style="margin-top:4px;display:flex;gap:6px;flex-wrap:wrap;">
-        <form action="/admin/force-earn-sweep" method="post" style="display:inline;">
-          <button class="btn" type="submit" style="padding:2px 8px;font-size:11px;" title="Bypass the per-asset earn cooldown and sweep idle USDT to earn on every venue right now.">Sweep now</button>
-        </form>
-        <form action="/admin/migrate-earn-to-pm" method="post" style="display:inline;" onsubmit="return confirm('Redeem all Binance Simple Earn USDT to spot? Auto-collection will then convert to BFUSD under PM (if enabled in Binance UI). Idempotent — safe to retry.');">
-          <button class="btn" type="submit" style="padding:2px 8px;font-size:11px;" title="One-time: redeem legacy Simple Earn flexible USDT to the PM unified margin pool. Under Binance auto-collection it converts to BFUSD automatically.">Migrate Earn → PM</button>
-        </form>
-      </div>
-      {% endif %}
     </div>
   </div>
   {% endif %}

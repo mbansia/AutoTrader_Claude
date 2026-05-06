@@ -1170,15 +1170,21 @@ class BinanceGateway(VenueGateway):
         return 'Unknown', 'PM probe rejected, Classic probe returned nothing'
 
     def _fetch_balances_uncached(self) -> dict:
-        """Read unified PM balance and synthesise the bot's classic three-
-        bucket shape (spot · earn · futures). Under PM there is no real
-        wallet split — everything is one cross-margin pool — but the rest
-        of the bot operates in spot/earn/futures terms, so we map:
-        * ``spot.USDT``    = total non-BFUSD USDT free in the PM pool
-        * ``earn.USDT``    = BFUSD balance (yield-bearing collateral)
+        """Read PM unified balance + classic Spot wallet, then synthesise
+        the bot's three-bucket shape (spot · earn · futures). Two reads
+        because PM and classic Spot are SEPARATE wallets even on a PM
+        account: Simple Earn redeems land in classic Spot, deposits via
+        the spot deposit address land in classic Spot, and only an
+        explicit Wallet→Cross Margin transfer (or Binance's auto-
+        collection) moves them into the PM pool. We read both and sum
+        so neither balance hides from the dashboard.
+
+        Buckets:
+        * ``spot.USDT``    = PM-pool USDT + classic Spot USDT
+        * ``earn.USDT``    = BFUSD balance (yield-bearing PM collateral)
         * ``futures.USDT`` = mirrors spot (PM unifies; both can fund a perp)
         Per-base-asset spot holdings (long leg of an open arb) are read
-        verbatim so equity_breakdown still values them correctly."""
+        from PM-pool first; classic spot adds on if PM didn't surface it."""
         fn = self._papi(self.spot, ('papiGetBalance', 'papi_get_balance'))
         if fn is None:
             # Fall back to classic ccxt fetch_balance — bot will still see
@@ -1208,6 +1214,31 @@ class BinanceGateway(VenueGateway):
                 bfusd_total += total
             elif total > 0:
                 per_asset[asset] = {'free': free, 'used': max(0.0, total - free), 'total': total}
+        # Classic Spot wallet — read separately and merge. This catches the
+        # USDT that lands here after a Simple Earn redeem, an external
+        # deposit, or any other path that doesn't land directly in the PM
+        # pool. Without this read the dashboard would show 0 for $30+ of
+        # cash that's clearly visible in the Binance UI.
+        try:
+            spot_classic = self.spot.fetch_balance()
+            classic_usdt = float((spot_classic.get('USDT') or {}).get('total') or 0)
+            classic_usdt_free = float((spot_classic.get('USDT') or {}).get('free') or 0)
+            usdt_total += classic_usdt
+            usdt_free += classic_usdt_free
+            META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
+            for asset, bal in spot_classic.items():
+                if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+                    continue
+                qty = float(bal.get('total') or 0)
+                if qty <= 0:
+                    continue
+                # Prefer PM-pool record if both have the same asset.
+                if asset not in per_asset:
+                    per_asset[asset] = {'free': float(bal.get('free') or 0), 'used': float(bal.get('used') or 0), 'total': qty}
+        except Exception:
+            # Classic spot read isn't critical — if it errors (rate limit,
+            # permission), PM-pool numbers are still correct.
+            pass
         spot = {'USDT': {'free': usdt_free, 'used': max(0.0, usdt_total - usdt_free), 'total': usdt_total},
                 **per_asset,
                 'free': {'USDT': usdt_free, **{k: v['free'] for k, v in per_asset.items()}},
