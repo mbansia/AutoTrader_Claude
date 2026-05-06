@@ -1001,11 +1001,34 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         base = c.spot_symbol.split('/')[0]
                         if base in held_bases:
                             continue
-                        # Size based on the binding constraint across both legs.
+                        # Size based on multiple binding constraints:
+                        #  * Equity / wallet:  free cash on the binding leg
+                        #  * Strategy cap:     desired_notional (% of equity)
+                        #  * Book depth:       at most 25% of the tightest
+                        #                      side's depth at the entry band.
+                        #                      Single-fill slippage past 25%
+                        #                      of book starts being material.
+                        #  * 24h volume:       at most 0.5% of quote volume.
+                        #                      Concentration above this means
+                        #                      our exits move the market.
                         free_for_arb = min(spot_free, fut_free)
-                        sized_notional = min(free_for_arb * 0.97, desired_notional)
+                        wallet_cap = free_for_arb * 0.97
+                        depth_cap = 0.25 * (c.min_depth_usdt or 0)
+                        volume_cap = 0.005 * (c.quote_volume or 0)
+                        # If depth/volume readings are zero (scan didn't
+                        # populate), don't let them clamp to zero —
+                        # min_depth_usdt is a hard reject upstream when it
+                        # actually fails. Treat 0 as "unknown, no constraint".
+                        if depth_cap <= 0:
+                            depth_cap = float('inf')
+                        if volume_cap <= 0:
+                            volume_cap = float('inf')
+                        sized_notional = min(wallet_cap, desired_notional, depth_cap, volume_cap)
                         if sized_notional < min_notional:
-                            reason = f'below min position pct ({sized_notional:.2f} < {min_notional:.2f} USDT; spot_free={spot_free:.2f} fut_free={fut_free:.2f})'
+                            reason = (f'below min position pct ({sized_notional:.2f} < {min_notional:.2f} USDT; '
+                                      f'wallet={wallet_cap:.2f} max_pct={desired_notional:.2f} '
+                                      f'depth_cap={depth_cap if depth_cap != float("inf") else "—"} '
+                                      f'vol_cap={volume_cap if volume_cap != float("inf") else "—"})')
                             db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=reason, funding_rate=c.funding_apr))
                             scan_action = 'below_min_pct'
                             continue

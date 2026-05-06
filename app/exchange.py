@@ -1255,16 +1255,27 @@ class BinanceGateway(VenueGateway):
 # ─── KuCoin gateway ─────────────────────────────────────────────────────────
 # Implements the venue-specific overrides; everything else inherits from
 # :class:`VenueGateway`. Notable differences vs Binance:
-#   * Spot ↔ futures transfers go through KuCoin's ``innerTransfer`` SAPI on
-#     the spot client (Binance uses ``sapiPostAssetTransfer``).
-#   * Earn / Pool-X is deferred — KuCoin's lend product pays in the deposited
-#     asset rather than USDT, which doesn't fit the bot's compounded-USDT
-#     APY accounting. Inherit the no-op earn_* methods.
-#   * Net-injected-capital history is venue-specific and not yet wired —
-#     dashboard falls back to manual CapitalFlow rows on KuCoin until then.
+#   * No Portfolio-Margin equivalent. KuCoin offers Cross-Margin Spot and a
+#     Unified Trading Account (UTA) but neither cross-collateralises spot,
+#     futures, and earn the way Binance PM does for our funding-arb shape.
+#     UTA does pool spot+futures collateral but its API surface diverges
+#     significantly (different order endpoints, different liquidation
+#     model) and KuCoin's yield-bearing collateral assets are limited. We
+#     therefore stay on KuCoin's classic isolated wallets:
+#       trade   = spot trading wallet (Trading Account in UI)
+#       contract = USDM-perp futures wallet
+#       main     = funding wallet — what KuCoin's auto-lend draws from,
+#                  so the bot models it as the "Earn" surface.
+#     Future cross-venue trade types (binance ↔ kucoin) are orchestrated
+#     externally and don't need PM-style cross collateral on KuCoin.
+#   * Spot ↔ futures transfers use ccxt's unified ``transfer()`` so the
+#     v3 universal-transfer endpoint is invoked for trade ↔ contract;
+#     inner-transfer is only used for spot-side wallet moves.
+#   * Capital-flow history reads ``privateGetTransferList`` (v1 audit log)
+#     plus deposit/withdrawal history. fetch_transfers fills any gaps.
 #   * Symbol shape: ccxt normalises both KuCoin's perp suffix
 #     (``XBTUSDTM`` → ``BTC/USDT:USDT``) and Binance's, so the bot's symbol
-#     handling is unchanged.
+#     handling is unchanged across venues.
 
 class KuCoinGateway(VenueGateway):
     venue_id = 'kucoin'

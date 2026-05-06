@@ -519,7 +519,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             for c in top:
                 if 'apr' not in c:
                     c['apr'] = annualize_rate(c.get('fr', 0.0), c.get('interval_h', 8.0))
-                c['effective_apy'] = effective_position_apy(c['apr'], cfg.perp_leverage or 1)
+                c['effective_apy'] = effective_position_apy(c['apr'], cfg.max_perp_leverage or cfg.perp_leverage or 1)
             latest_scans.append({
                 'venue_id': gw.venue_id,
                 'venue_name': gw.name,
@@ -730,7 +730,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
                 'basis_now_bps': basis_bps(spot_now, perp_now) if (spot_now and perp_now) else 0.0,
                 'entry_funding_apy': annualize_rate(p.entry_funding_rate, interval_h),
                 'last_funding_apy': annualize_rate(p.last_funding_rate, interval_h),
-                'effective_apy': effective_position_apy(annualize_rate(p.last_funding_rate, interval_h), cfg.perp_leverage or 1),
+                'effective_apy': effective_position_apy(annualize_rate(p.last_funding_rate, interval_h), cfg.max_perp_leverage or cfg.perp_leverage or 1),
                 'interval_hours': interval_h,
                 'opened_at': _fmt_ts(p.opened_at),
                 'age': _fmt_age(datetime.utcnow() - p.opened_at),
@@ -992,7 +992,7 @@ def logs_page(request: Request, view: str | None = None, view_cookie: str | None
                     apy = top[0].get('apr')  # legacy field name; the value is now compounded APY
                     if apy is None:
                         apy = annualize_rate(top[0].get('fr', 0.0), top[0].get('interval_h', 8.0))
-                    eff = effective_position_apy(apy, ctx['cfg'].perp_leverage or 1)
+                    eff = effective_position_apy(apy, ctx['cfg'].max_perp_leverage or ctx['cfg'].perp_leverage or 1)
                     top_label = f"{top[0]['perp']} @ {apy*100:.2f}% funding APY ({eff*100:.2f}% effective)"
             except Exception:
                 pass
@@ -1051,7 +1051,9 @@ def save_config(
     earn_idle_threshold_usdt: float = Form(...),
     earn_paper_apr: float = Form(...),
     auto_transfer_enabled: int = Form(...),
-    auto_rebalance_threshold: float = Form(1.0),
+    # auto_rebalance_threshold removed — continuous rebalance was retired
+    # in favour of the earn-first model. Field kept on the model for
+    # back-compat but not surfaced in the form.
     earn_subscribe_spot_assets: int = Form(0),
     perp_leverage: int = Form(1),         # legacy field — kept for back-compat
     max_perp_leverage: int = Form(1),     # current name; surfaced on /config
@@ -1084,7 +1086,6 @@ def save_config(
         cfg.earn_idle_threshold_usdt = earn_idle_threshold_usdt
         cfg.earn_paper_apr = earn_paper_apr
         cfg.auto_transfer_enabled = bool(auto_transfer_enabled)
-        cfg.auto_rebalance_threshold = max(0.20, auto_rebalance_threshold)
         cfg.earn_subscribe_spot_assets = bool(earn_subscribe_spot_assets)
         # Take ``max_perp_leverage`` (the current form field) preferentially;
         # ``perp_leverage`` is a legacy field kept for older form submissions.
