@@ -623,6 +623,27 @@ def _compute_equity_and_free(db, gateway: VenueGateway, mode: str, cfg: Strategy
     return total_equity, min(spot_free, fut_free)
 
 
+# Per-(mode, venue) timestamp of the last capital-flow ingest. The bot
+# loop calls _maybe_ingest_capital_flows every cycle but the actual SAPI
+# walk only fires once per hour — capital-flow rows don't change between
+# cycles unless the user moves money, and the chunked walk eats several
+# rate-limited requests. Manual triggers (the dashboard's "Re-ingest"
+# button) bypass the throttle.
+_CAPITAL_INGEST_INTERVAL_S = 3600.0
+_LAST_CAPITAL_INGEST_AT: dict[tuple[str, str], float] = {}
+
+
+def _maybe_ingest_capital_flows(db, gateway: VenueGateway, mode: str) -> int:
+    key = (mode, gateway.venue_id)
+    now = time.time()
+    last = _LAST_CAPITAL_INGEST_AT.get(key, 0.0)
+    if (now - last) < _CAPITAL_INGEST_INTERVAL_S:
+        return 0
+    inserted = _ingest_api_capital_flows(db, gateway, mode)
+    _LAST_CAPITAL_INGEST_AT[key] = now
+    return inserted
+
+
 def _ingest_api_capital_flows(db, gateway: VenueGateway, mode: str, lookback_days: int = 365) -> int:
     """Pull the venue's deposit / withdrawal / sub-transfer history and
     persist any rows we haven't seen before as ``CapitalFlow`` records. The
@@ -1105,12 +1126,18 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         earn.last_error = err
                         log_event(db, f'Earn sweep blocked: {sweep:.2f} USDT idle in spot — {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
-            # End-of-cycle bookkeeping: ingest any new venue-side capital
-            # flows (deposits, withdrawals, sub-transfers) so XIRR and the
-            # capital-flow timeline stay in sync with reality without manual
-            # entry; then snapshot the per-(mode, venue) balance and append
-            # an equity-curve point. Idempotent via ``CapitalFlow.external_id``.
-            _ingest_api_capital_flows(db, gateway, mode)
+            # End-of-cycle bookkeeping. Two cadences:
+            #   * Capital-flow ingest (deposits / withdrawals / transfers)
+            #     is throttled to once per hour per venue. Master ↔ sub
+            #     transfers don't change every 30s, and the SAPI walk
+            #     (especially when chunked into 30-day windows) eats
+            #     several rate-limited calls. The "Re-ingest from venue
+            #     APIs" button on /dashboard runs this on demand for the
+            #     user when they expect a fresh row.
+            #   * Balance snapshot + equity-curve point are continuous —
+            #     these are cheap (cached safe_balances) and feed the
+            #     real-time total-account-value indicator.
+            _maybe_ingest_capital_flows(db, gateway, mode)
             snap = _take_balance_snapshot(db, gateway, mode, cfg, earn)
             db.add(EquityCurve(mode=mode, exchange=gateway.venue_id, equity_usdt=snap.total_usdt))
             db.commit()

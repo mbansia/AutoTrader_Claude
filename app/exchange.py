@@ -968,25 +968,42 @@ class BinanceGateway(VenueGateway):
         # sub-transfer endpoint). Folded in as ``transfer`` rows so we don't
         # double-count: when we see the same tranId in both sub_in/out and
         # here, the dedup-by-external_id keeps the first one.
+        #
+        # Binance caps the time-range parameter at 30 days on this endpoint
+        # (errors with -5026 "Start time query records range is too large"
+        # otherwise). We walk the full lookback in 30-day chunks; ccxt
+        # threads ``since`` and ``params['endTime']`` straight through.
         since_ms = int((datetime.utcnow() - timedelta(days=lookback_days)).timestamp() * 1000)
-        try:
-            for t in (self.spot.fetch_transfers('USDT', since=since_ms) or []):
-                ts = _ms_to_dt(t.get('timestamp'))
-                raw_amt = float(t.get('amount') or 0)
-                # Direction inference: status 'ok' + a positive amount could
-                # be in either direction depending on type. Use 'fromAccount'
-                # to disambiguate when present.
-                from_a = (t.get('fromAccount') or '').lower()
-                to_a = (t.get('toAccount') or '').lower()
-                signed = raw_amt
-                if 'sub' in from_a and 'main' in to_a:
-                    signed = -abs(raw_amt)
-                elif 'main' in to_a and 'funding' not in from_a and 'spot' not in from_a:
-                    signed = abs(raw_amt)
-                ext = str(t.get('id') or '') or _row_hash('binance', 'transfer', ts, signed)
-                rows.append({'ts': ts, 'amount': signed, 'kind': 'transfer', 'external_id': ext, 'note': f'Universal transfer {from_a}→{to_a}'})
-        except Exception as e:
-            self.last_history_errors['transfers'] = str(e)[:160]
+        chunk_ms = 30 * 86400 * 1000
+        end_ms = int(time.time() * 1000)
+        cursor = end_ms
+        transfer_rows: list[dict] = []
+        while cursor > since_ms:
+            window_start = max(since_ms, cursor - chunk_ms)
+            try:
+                chunk = self.spot.fetch_transfers('USDT', since=window_start, params={'endTime': cursor}) or []
+                transfer_rows.extend(chunk)
+            except Exception as e:
+                # Save the most recent error so the operator can see what
+                # went wrong; keep walking in case earlier windows succeed.
+                self.last_history_errors['transfers'] = str(e)[:160]
+                break
+            if cursor - chunk_ms <= since_ms:
+                break
+            cursor = window_start
+        for t in transfer_rows:
+            ts = _ms_to_dt(t.get('timestamp'))
+            raw_amt = float(t.get('amount') or 0)
+            from_a = (t.get('fromAccount') or '').lower()
+            to_a = (t.get('toAccount') or '').lower()
+            # Direction inference using fromAccount/toAccount labels.
+            signed = raw_amt
+            if 'sub' in from_a and 'main' in to_a:
+                signed = -abs(raw_amt)
+            elif 'main' in to_a and 'funding' not in from_a and 'spot' not in from_a:
+                signed = abs(raw_amt)
+            ext = str(t.get('id') or '') or _row_hash('binance', 'transfer', ts, signed)
+            rows.append({'ts': ts, 'amount': signed, 'kind': 'transfer', 'external_id': ext, 'note': f'Universal transfer {from_a}→{to_a}'})
         return [r for r in rows if r['ts'] is not None and abs(r['amount']) > 1e-9]
 
 
@@ -1255,12 +1272,19 @@ class KuCoinGateway(VenueGateway):
         # on vintage; probe an ordered list and stop on the first one that
         # actually responds (success OR a real API error). If none exist, we
         # log a cause so /monitoring shows what to fix.
+        # Inter-account transfer audit. KuCoin reorganised this surface
+        # several times; ccxt's current build exposes ``privateGetTransferList``
+        # (the v1 unified transfer history) which surfaces master ↔ sub
+        # moves to a sub-account API key. We probe an ordered list and use
+        # the first that's actually a callable on the client.
         sub_endpoint_used = None
         for name in (
-            'privateGetSubTransferRecord',         # newer ccxt
-            'private_get_sub_transfer_record',     # snake-case alias
-            'privateGetAccountsSubTransfer',       # older ccxt
-            'futuresPrivateGetSubTransferRecord',  # futures-side variant
+            'privateGetTransferList',               # v1 transfer history (current ccxt)
+            'private_get_transfer_list',
+            'privateGetSubTransferRecord',          # legacy
+            'private_get_sub_transfer_record',
+            'privateGetAccountsSubTransfer',
+            'futuresPrivateGetSubTransferRecord',
         ):
             fn = getattr(self.spot, name, None)
             if not callable(fn):
@@ -1273,13 +1297,15 @@ class KuCoinGateway(VenueGateway):
                 self.last_history_errors['sub_transfer'] = f'{name}: {str(e)[:140]}'
                 items = []
             for r in items:
-                direction = (r.get('direction') or '').lower()
+                # KuCoin transfer-list rows can carry either ``direction``
+                # ('in'/'out') or ``type`` ('IN'/'OUT'/'INNER'); try both.
+                direction = (r.get('direction') or r.get('type') or '').lower()
                 ts = _ms_to_dt(r.get('createdAt') or r.get('time'))
                 amt_raw = float(r.get('amount') or 0)
-                if direction == 'in':
-                    rows.append({'ts': ts, 'amount': amt_raw, 'kind': 'sub_in', 'external_id': str(r.get('id') or _row_hash('kucoin', 'sub_in', ts, amt_raw)), 'note': 'Master → KuCoin sub transfer'})
-                elif direction == 'out':
-                    rows.append({'ts': ts, 'amount': -abs(amt_raw), 'kind': 'sub_out', 'external_id': str(r.get('id') or _row_hash('kucoin', 'sub_out', ts, -amt_raw)), 'note': 'KuCoin sub → master transfer'})
+                kind = 'sub_in' if direction == 'in' else ('sub_out' if direction == 'out' else 'transfer')
+                signed = amt_raw if direction == 'in' else (-abs(amt_raw) if direction == 'out' else amt_raw)
+                ext = str(r.get('id') or r.get('bizNo') or '') or _row_hash('kucoin', kind, ts, signed)
+                rows.append({'ts': ts, 'amount': signed, 'kind': kind, 'external_id': ext, 'note': f'KuCoin {sub_endpoint_used} ({direction or "inner"})'})
             break
         if sub_endpoint_used is None:
             self.last_history_errors['sub_transfer'] = 'no sub-transfer endpoint exposed by this ccxt build'
