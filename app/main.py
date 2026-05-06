@@ -621,7 +621,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             'per_venue': {
                 vid: {
                     'deployed': earn_deployed_by_venue.get(vid, 0.0),
-                    'yield': earn_yield_by_venue.get(vid, 0.0),
+                    'income': earn_yield_by_venue.get(vid, 0.0),
                 }
                 for vid in set(earn_deployed_by_venue) | set(earn_yield_by_venue)
             },

@@ -116,7 +116,7 @@
         <summary>per-venue breakdown</summary>
         <ul class="kpi-breakdown">
           {% for vid, pv in earn.per_venue.items() %}
-          <li><span class="muted">{{ vid }}</span><span class="mono">{{ '%.2f' % pv.deployed }} <span class="muted">· yield {{ '%+.4f' % pv.yield }}</span></span></li>
+          <li><span class="muted">{{ vid }}</span><span class="mono">{{ '%.2f' % pv.deployed }} <span class="muted">· yield {{ '%+.4f' % pv.income }}</span></span></li>
           {% endfor %}
         </ul>
       </details>
