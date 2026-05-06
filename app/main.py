@@ -1048,8 +1048,10 @@ def save_config(
     auto_transfer_enabled: int = Form(...),
     auto_rebalance_threshold: float = Form(1.0),
     earn_subscribe_spot_assets: int = Form(0),
-    perp_leverage: int = Form(1),
+    perp_leverage: int = Form(1),         # legacy field — kept for back-compat
+    max_perp_leverage: int = Form(1),     # current name; surfaced on /config
     futures_buffer_pct: float = Form(0.20),
+    binance_max_bfusd_pct: float = Form(0.20),
     min_order_book_depth_usdt: float = Form(500.0),
     depth_band_bps: float = Form(10.0),
     _: None = Depends(auth),
@@ -1079,8 +1081,13 @@ def save_config(
         cfg.auto_transfer_enabled = bool(auto_transfer_enabled)
         cfg.auto_rebalance_threshold = max(0.20, auto_rebalance_threshold)
         cfg.earn_subscribe_spot_assets = bool(earn_subscribe_spot_assets)
-        cfg.perp_leverage = max(1, perp_leverage)
+        # Take ``max_perp_leverage`` (the current form field) preferentially;
+        # ``perp_leverage`` is a legacy field kept for older form submissions.
+        new_lev = max(1, max_perp_leverage or perp_leverage or 1)
+        cfg.max_perp_leverage = new_lev
+        cfg.perp_leverage = new_lev  # keep mirrored so any legacy reader sees the same value
         cfg.futures_buffer_pct = max(0.05, min(1.0, futures_buffer_pct))
+        cfg.binance_max_bfusd_pct = max(0.0, min(1.0, binance_max_bfusd_pct))
         cfg.min_order_book_depth_usdt = max(0.0, min_order_book_depth_usdt)
         cfg.depth_band_bps = max(1.0, depth_band_bps)
         db.commit()

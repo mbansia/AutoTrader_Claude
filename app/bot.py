@@ -335,7 +335,7 @@ def _ensure_close_readiness(db, gateway: VenueGateway, p: Position, cfg: Strateg
     perp_now = gateway.safe_price(p.perp_symbol, perp=True) or p.perp_entry_price or 0.0
     if perp_now <= 0:
         return  # can't size the requirement; the close attempt will surface the failure
-    leverage = max(1, cfg.perp_leverage or 1)
+    leverage = max(1, cfg.max_perp_leverage or cfg.perp_leverage or 1)
     needed_margin = p.quantity * perp_now / leverage
     target = needed_margin * 1.005  # +50 bps buffer for fee + tiny adverse drift
     if fut_free >= target:

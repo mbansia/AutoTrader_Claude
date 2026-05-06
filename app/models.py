@@ -195,6 +195,17 @@ class StrategyConfig(Base):
     # for memes/low-liquidity tokens. Cross margin shares this buffer across
     # all open perps on the same venue, so the safety scales naturally.
     futures_buffer_pct: Mapped[float] = mapped_column(Float, default=0.20)
+    # Max perp leverage the bot configures on every USDM perp before entry.
+    # 1x is the only safe choice for a delta-neutral arb (perp margin ==
+    # spot notional). Bump only if you understand the liquidation math.
+    max_perp_leverage: Mapped[int] = mapped_column(Integer, default=1)
+    # Max share of total Binance equity that may be auto-converted to
+    # BFUSD (Binance's yield-bearing margin asset under Portfolio Margin).
+    # The cap is a safety throttle on rollout: BFUSD redeems are usually
+    # instant but can queue under stress, so we keep some plain USDT for
+    # immediate-deploy. Default 0.20 (20% of equity); bump to 0.80 once
+    # BFUSD redemption behaviour has been observed under your trading load.
+    binance_max_bfusd_pct: Mapped[float] = mapped_column(Float, default=0.20)
     # Subscribe base assets (SOL, ETH, etc.) to Binance Simple Earn Flexible after
     # the spot buy fills. Default off — opt-in because not every asset has a
     # flexible product and redeem-on-close is one extra failure mode.

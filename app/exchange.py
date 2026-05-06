@@ -1006,6 +1006,251 @@ class BinanceGateway(VenueGateway):
             rows.append({'ts': ts, 'amount': signed, 'kind': 'transfer', 'external_id': ext, 'note': f'Universal transfer {from_a}→{to_a}'})
         return [r for r in rows if r['ts'] is not None and abs(r['amount']) > 1e-9]
 
+    # ─── Portfolio Margin overrides (active when account is in PM mode) ────
+    # Binance Portfolio Margin replaces the Classic spot/futures/earn split
+    # with a unified margin pool that holds USDT, BFUSD (yield-bearing
+    # USDT-pegged), USDC, and other margin assets simultaneously. Orders
+    # route through ``/papi/v1/*`` (separate from ``/api/v3/*`` and
+    # ``/fapi/v1/*``); calling Classic endpoints on a PM account returns
+    # -2015. The user has confirmed the sub-account is in PM mode, so we
+    # always go through these paths — no Classic fallback to maintain.
+    #
+    # Endpoint references (Binance API docs, Sept 2024 revision):
+    #   /papi/v1/balance           — unified balance per asset
+    #   /papi/v1/account           — overall account / margin state
+    #   /papi/v1/um/order          — USDM-perp order placement
+    #   /papi/v1/um/leverage       — set leverage on a UM symbol
+    #   /papi/v1/margin/order      — cross-margin spot order placement
+    #   /papi/v1/um/positionRisk   — open UM positions
+    #   /papi/v1/asset-collection  — collect margin from one PM bucket to another
+    #
+    # We don't directly subscribe / redeem BFUSD via API — Binance's
+    # auto-collection feature (toggled in the Binance UI per asset) does
+    # that automatically as USDT lands in the margin pool. The bot reads
+    # the BFUSD balance and surfaces it as the "Earn" bucket on the
+    # dashboard. ``earn_subscribe`` is a no-op under PM with a clear log
+    # line; the user enables auto-collection once and walks away.
+
+    @staticmethod
+    def _papi(client, candidates: tuple[str, ...]):
+        """Probe a small list of ccxt method names for a /papi/ endpoint;
+        return the first callable. ccxt sometimes flips between ``papiPost…``
+        and ``papi_post_…`` naming across versions."""
+        for name in candidates:
+            fn = getattr(client, name, None)
+            if callable(fn):
+                return fn
+        return None
+
+    def _fetch_balances_uncached(self) -> dict:
+        """Read unified PM balance and synthesise the bot's classic three-
+        bucket shape (spot · earn · futures). Under PM there is no real
+        wallet split — everything is one cross-margin pool — but the rest
+        of the bot operates in spot/earn/futures terms, so we map:
+        * ``spot.USDT``    = total non-BFUSD USDT free in the PM pool
+        * ``earn.USDT``    = BFUSD balance (yield-bearing collateral)
+        * ``futures.USDT`` = mirrors spot (PM unifies; both can fund a perp)
+        Per-base-asset spot holdings (long leg of an open arb) are read
+        verbatim so equity_breakdown still values them correctly."""
+        fn = self._papi(self.spot, ('papiGetBalance', 'papi_get_balance'))
+        if fn is None:
+            # Fall back to classic ccxt fetch_balance — bot will still see
+            # SOMETHING, and the dashboard banner will surface the missing
+            # endpoint. Should never happen on a current ccxt build.
+            return {'spot': self.spot.fetch_balance(), 'futures': self.futures.fetch_balance()}
+        rows = fn({})
+        if isinstance(rows, dict):
+            rows = rows.get('data') or rows.get('balances') or []
+        usdt_total = usdt_free = bfusd_total = 0.0
+        per_asset: dict[str, dict] = {}
+        for r in rows:
+            asset = r.get('asset') or r.get('currency') or ''
+            try:
+                # ``crossMarginFree`` is the actually-deployable cross-margin
+                # quantity; ``totalWalletBalance`` is total holdings across
+                # margin + UM. Different ccxt builds expose different field
+                # names — try the obvious ones in order.
+                free = float(r.get('crossMarginFree') or r.get('umWalletBalance') or r.get('free') or 0)
+                total = float(r.get('totalWalletBalance') or r.get('crossMarginAsset') or r.get('total') or free)
+            except (TypeError, ValueError):
+                continue
+            if asset == 'USDT':
+                usdt_total += total
+                usdt_free += free
+            elif asset == 'BFUSD':
+                bfusd_total += total
+            elif total > 0:
+                per_asset[asset] = {'free': free, 'used': max(0.0, total - free), 'total': total}
+        spot = {'USDT': {'free': usdt_free, 'used': max(0.0, usdt_total - usdt_free), 'total': usdt_total},
+                **per_asset,
+                'free': {'USDT': usdt_free, **{k: v['free'] for k, v in per_asset.items()}},
+                'used': {'USDT': max(0.0, usdt_total - usdt_free), **{k: v['used'] for k, v in per_asset.items()}},
+                'total': {'USDT': usdt_total, **{k: v['total'] for k, v in per_asset.items()}}}
+        # Futures bucket mirrors spot under PM — the bot's downstream code
+        # reads bals['futures']['USDT'] for margin checks; keeping it equal
+        # to spot reflects the unified-margin reality.
+        futures = {'USDT': {'free': usdt_free, 'used': max(0.0, usdt_total - usdt_free), 'total': usdt_total},
+                   'free': {'USDT': usdt_free}, 'used': {'USDT': max(0.0, usdt_total - usdt_free)},
+                   'total': {'USDT': usdt_total}}
+        earn = {'USDT': {'free': bfusd_total, 'used': 0.0, 'total': bfusd_total},
+                'free': {'USDT': bfusd_total}, 'used': {'USDT': 0.0}, 'total': {'USDT': bfusd_total}}
+        return {'spot': spot, 'earn': earn, 'futures': futures}
+
+    def earn_balance_usdt(self) -> tuple[float | None, str]:
+        """Under PM, the 'earn' surface is BFUSD — yield-bearing margin
+        collateral. The cached balance dict already contains it, so we
+        just read; no extra API call."""
+        bals = self.safe_balances()
+        if bals is None:
+            return None, self.last_balance_error
+        return float((bals.get('earn', {}).get('USDT') or {}).get('total') or 0), ''
+
+    def earn_balance(self, asset: str = 'USDT') -> tuple[float | None, str]:
+        if asset != 'USDT':
+            return 0.0, ''  # only BFUSD (USDT-pegged) is wired
+        return self.earn_balance_usdt()
+
+    def earn_subscribe(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        # Binance auto-collection (enabled in the Binance UI per asset)
+        # converts idle USDT to BFUSD automatically as it lands in the PM
+        # pool. The bot doesn't issue an explicit subscribe call — that
+        # would race with auto-collection and risks errors.
+        if paper_mode:
+            return True, 'paper'
+        return False, 'PM mode: BFUSD subscription is automatic via Binance UI auto-collection (idle USDT auto-converts). No bot-side action needed.'
+
+    def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        # Same logic — BFUSD auto-redeems to USDT when futures need
+        # margin. provision_margin is therefore a no-op under PM.
+        if paper_mode:
+            return True, 'paper'
+        return True, 'PM mode: redeem is automatic — BFUSD auto-converts to USDT when margin needs it'
+
+    def transfer_spot_to_futures(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        # PM unifies margin; there's nothing to transfer.
+        return True, 'PM mode: unified margin (no spot↔futures transfer needed)'
+
+    def transfer_futures_to_spot(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+        return True, 'PM mode: unified margin (no spot↔futures transfer needed)'
+
+    def open_perp_positions_raw(self) -> list[dict]:
+        """Replace the Classic ``futures.fetch_positions()`` (which hits
+        /fapi/v2/positionRisk and returns -2015 under PM) with the PM
+        equivalent ``/papi/v1/um/positionRisk``."""
+        fn = self._papi(self.spot, ('papiGetUmPositionRisk', 'papi_get_um_position_risk'))
+        if fn is None:
+            return []
+        try:
+            rows = fn({})
+        except Exception:
+            return []
+        # Convert PM rows to ccxt-shaped position dicts that downstream
+        # leg-state checks expect (symbol, contracts, etc.).
+        out: list[dict] = []
+        for r in rows or []:
+            try:
+                amt = float(r.get('positionAmt') or 0)
+            except (TypeError, ValueError):
+                continue
+            if abs(amt) <= 0:
+                continue
+            sym_raw = r.get('symbol') or ''  # e.g. "ETHUSDT"
+            # Convert to ccxt-style "ETH/USDT:USDT"
+            base = sym_raw[:-4] if sym_raw.endswith('USDT') else sym_raw
+            ccxt_symbol = f'{base}/USDT:USDT' if base else sym_raw
+            out.append({
+                'symbol': ccxt_symbol,
+                'contracts': abs(amt),
+                'side': 'long' if amt > 0 else 'short',
+                'info': r,
+            })
+        return out
+
+    def configure_perp_for_arb(self, symbol: str) -> tuple[bool, str]:
+        """Override of the base method. Under PM, margin mode is implicit
+        cross — only leverage is configurable. Reads ``max_perp_leverage``
+        from the StrategyConfig at call time so dashboard edits take effect
+        without a restart. Calls /papi/v1/um/leverage."""
+        # Strip ccxt's "ETH/USDT:USDT" suffix to Binance's "ETHUSDT".
+        ex_symbol = symbol.split(':')[0].replace('/', '') if '/' in symbol else symbol
+        fn = self._papi(self.spot, ('papiPostUmLeverage', 'papi_post_um_leverage'))
+        if fn is None:
+            return False, 'papiPostUmLeverage not exposed by this ccxt build'
+        # Lazy import to avoid circular import with app.bot.
+        try:
+            from app.bot import get_strategy_config
+            from app.db import SessionLocal as _SL
+            with _SL() as db:
+                leverage = max(1, int(get_strategy_config(db).max_perp_leverage or 1))
+        except Exception:
+            leverage = 1
+        try:
+            fn({'symbol': ex_symbol, 'leverage': leverage})
+        except Exception as e:
+            msg = str(e)
+            if 'no need to change' not in msg.lower() and 'already' not in msg.lower():
+                return False, msg
+        return True, ''
+
+    def _market_order(self, leg: str, symbol: str, side: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float) -> dict:
+        """PM-routed market order. Spot legs go through margin-spot
+        (``/papi/v1/margin/order``) since PM doesn't expose Classic spot
+        for trading; futures legs go through UM (``/papi/v1/um/order``).
+        Paper mode uses the parent class's synthesized fill."""
+        if paper_mode:
+            return super()._market_order(leg, symbol, side, amount, paper_mode, slippage_bps, fee_bps)
+        ex_symbol = symbol.split(':')[0].replace('/', '') if '/' in symbol else symbol
+        if leg == 'futures':
+            fn = self._papi(self.spot, ('papiPostUmOrder', 'papi_post_um_order'))
+            if fn is None:
+                raise RuntimeError('papiPostUmOrder not exposed by this ccxt build')
+            params = {
+                'symbol': ex_symbol,
+                'side': side.upper(),
+                'type': 'MARKET',
+                'quantity': self.futures.amount_to_precision(symbol, amount),
+            }
+        else:
+            fn = self._papi(self.spot, ('papiPostMarginOrder', 'papi_post_margin_order'))
+            if fn is None:
+                raise RuntimeError('papiPostMarginOrder not exposed by this ccxt build')
+            params = {
+                'symbol': ex_symbol,
+                'side': side.upper(),
+                'type': 'MARKET',
+                'quantity': self.spot.amount_to_precision(symbol, amount),
+            }
+        resp = fn(params)
+        # Normalise the response into ccxt-shaped fill dict so downstream
+        # record_trade / position-update logic stays unchanged.
+        try:
+            fill_price = float(resp.get('avgPrice') or resp.get('price') or 0)
+        except (TypeError, ValueError):
+            fill_price = 0.0
+        try:
+            executed_qty = float(resp.get('executedQty') or resp.get('cumQty') or amount)
+        except (TypeError, ValueError):
+            executed_qty = amount
+        # Sum commission across the fills array if present, else 0.
+        fee_cost = 0.0
+        for f in resp.get('fills') or []:
+            try:
+                fee_cost += float(f.get('commission') or 0)
+            except (TypeError, ValueError):
+                pass
+        self.invalidate_balance_cache()
+        return {
+            'id': str(resp.get('orderId') or ''),
+            'symbol': symbol,
+            'side': side,
+            'amount': executed_qty,
+            'venue': leg,
+            'status': 'closed',
+            'price': fill_price,
+            'fee': {'cost': fee_cost},
+            'info': resp,
+        }
+
 
 # ─── KuCoin gateway ─────────────────────────────────────────────────────────
 # Implements the venue-specific overrides; everything else inherits from

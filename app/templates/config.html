@@ -63,12 +63,15 @@
           <option value="0" {{ 'selected' if not cfg.auto_transfer_enabled }}>no</option>
         </select>
         <span class="hint">Live only. Pre-trade redeems from earn and tops up the right wallet (spot or futures) for the leg about to open; post-trade drains futures back and sweeps idle into earn. Requires "Permits Universal Transfer" on each venue's API key.</span></div>
-      <div class="form-row"><label>Perp leverage</label>
-        <input type="number" step="1" name="perp_leverage" value="{{ cfg.perp_leverage }}">
-        <span class="hint">Bot configures CROSS margin + this leverage on every perp before opening. <strong>1 is the only safe choice for an arb hedge</strong> — keeps perp margin == spot notional and avoids "Margin is insufficient" close errors.</span></div>
+      <div class="form-row"><label>Max perp leverage</label>
+        <input type="number" step="1" min="1" max="125" name="max_perp_leverage" value="{{ cfg.max_perp_leverage }}">
+        <span class="hint">Bot calls /papi/v1/um/leverage with this value on every perp before opening. <strong>1 is the only safe choice for a delta-neutral arb hedge</strong> — keeps perp margin == spot notional. Bump only if you understand maintenance-margin math.</span></div>
       <div class="form-row"><label>Futures liquidation buffer (% of notional)</label>
         <input type="number" step="0.01" min="0.05" max="1.0" name="futures_buffer_pct" value="{{ '%.2f' % cfg.futures_buffer_pct }}">
-        <span class="hint">Free margin kept in the futures wallet between cycles. With cross + 1x, used_margin = notional, so this buffer is what an adverse mark-price move eats into before maintenance liquidation. <strong>0.20 (default)</strong> covers ~20% drop. Bump to 0.30+ for memes / low-liquidity tokens. Note: Binance cross does NOT include spot or earn balances — only the futures wallet — so we can't auto-cross-collateralize without switching to Portfolio Margin (separate signup, different liquidation rules).</span></div>
+        <span class="hint">Free margin kept above maintenance requirement on each perp. <strong>0.20 (default)</strong> covers ~20% adverse mark-price move on a 1x short. Bump to 0.30+ for memes / low-liquidity tokens. Under Binance Portfolio Margin, BFUSD held as collateral counts toward this buffer too.</span></div>
+      <div class="form-row"><label>Max BFUSD share of equity (Binance PM only)</label>
+        <input type="number" step="0.01" min="0.0" max="1.0" name="binance_max_bfusd_pct" value="{{ '%.2f' % cfg.binance_max_bfusd_pct }}">
+        <span class="hint">Cap on the share of total Binance equity auto-converted to BFUSD (yield-bearing margin asset). <strong>0.20 (default)</strong> keeps 80% as plain USDT for instant deploy; bump higher once BFUSD redemption behaviour has been observed under your trading load. Auto-conversion is enabled in the Binance UI, not by the bot.</span></div>
     </div>
   </div>
 </div>
