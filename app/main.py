@@ -456,7 +456,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         agg_ys: list[float] = []
 
         # Stable per-venue colours that match the equity-composition donut.
-        VENUE_COLOR = {'binance': '#fbbf24', 'kucoin': '#38bdf8', 'ibkr': '#a78bfa', 'paper': '#4ade80'}
+        VENUE_COLOR = {'binance': '#fbbf24', 'kucoin': '#38bdf8', 'ibkr': '#a78bfa', 'onchain': '#f472b6', 'paper': '#4ade80'}
 
         if equity_curves_by_venue:
             # Common Y range so all polylines share the same scale.
@@ -1276,6 +1276,27 @@ def _gather_exchange_status() -> list[dict]:
         'capital_subtotal_usdt': 0.0,
         'capital_breakdown': [],
         'role': 'cross-asset / equities (future) — for high-funding stock perps like INCL, MSTR',
+    })
+
+    # ---- Onchain (future — DEX perps + lending) -----------------------
+    # Hyperliquid, Drift, Aevo, GMX-class venues let us trade perps with
+    # collateral that simultaneously earns yield (USDC.e on Aave, sUSDe,
+    # etc.) — exactly the "yield + liquidation buffer" combo the user
+    # asked about. Wallet keys + RPC endpoint go here once we pick a
+    # primary protocol. Placeholder section so the maintenance UI shows
+    # the venue is on the roadmap.
+    sections.append({
+        'name': 'Onchain',
+        'venue_id': 'onchain',
+        'configured': False,
+        'key_masked': '<not yet wired>',
+        'secret_masked': '<not yet wired>',
+        'extra_creds': [{'label': 'Wallet address', 'value': '<not yet set>'}, {'label': 'RPC endpoint', 'value': '<not yet set>'}],
+        'probes': [],
+        'last_balance_error': '',
+        'capital_subtotal_usdt': 0.0,
+        'capital_breakdown': [],
+        'role': 'DEX perps + yield-bearing collateral (future) — Hyperliquid / Drift / Aevo class',
     })
 
     return sections
