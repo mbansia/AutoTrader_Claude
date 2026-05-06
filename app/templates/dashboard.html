@@ -106,18 +106,18 @@
   {% if earn.enabled or earn.deployed > 0 %}
   {% set idle_pct = (earn.deployed / current_equity * 100) if current_equity > 0 else 0 %}
   <div class="kpi">
-    <div class="label">In Earn (USDT)</div>
+    <div class="label">Yielding collateral</div>
     <div class="value">{{ '%.2f' % earn.deployed }} <span class="muted" style="font-size:14px;">USDT</span></div>
     <div class="sub" style="display:flex;flex-direction:column;gap:3px;">
-      <span>coverage <span class="{{ 'good' if idle_pct > 50 else ('warn' if idle_pct > 20 else 'muted') }}">{{ '%.0f%%' % idle_pct }}</span> of {{ '%.2f' % current_equity }} USDT equity</span>
-      <span>income <span class="{{ 'good' if earn.cumulative_yield > 0 else 'muted' }}">{{ '%+.4f' % earn.cumulative_yield }}</span> USDT</span>
+      <span>{{ '%.0f%%' % idle_pct }} of equity earning · realised APY <span class="{{ 'good' if (earn.realised_apy or 0) > 0 else 'muted' }}">{% if earn.realised_apy is not none %}{{ '%.2f%%' % (earn.realised_apy * 100) }}{% else %}—{% endif %}</span></span>
+      <span>income <span class="{{ 'good' if earn.cumulative_yield > 0 else 'muted' }}">{{ '%+.4f' % earn.cumulative_yield }}</span> USDT till date</span>
       {% if earn.per_venue %}
       <details class="kpi-details" style="margin-top:2px;">
-        <summary>per-venue breakdown</summary>
+        <summary>by source</summary>
         <ul class="kpi-breakdown">
-          {% for vid, pv in earn.per_venue.items() %}
-          <li><span class="muted">{{ vid }}</span><span class="mono">{{ '%.2f' % pv.deployed }} <span class="muted">· yield {{ '%+.4f' % pv.income }}</span></span></li>
-          {% endfor %}
+          {% for vid, pv in earn.per_venue.items() %}{% if pv.deployed > 0 or pv.income > 0 %}
+          <li><span class="muted">{{ pv.source }} <span style="font-size:9px;">({{ vid }})</span></span><span class="mono">{{ '%.2f' % pv.deployed }} <span class="muted">· {% if pv.realised_apy is not none %}{{ '%.2f%%' % (pv.realised_apy * 100) }} APY{% else %}— APY{% endif %} · income {{ '%+.4f' % pv.income }}</span></span></li>
+          {% endif %}{% endfor %}
         </ul>
       </details>
       {% endif %}

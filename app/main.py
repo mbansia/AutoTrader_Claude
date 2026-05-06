@@ -575,6 +575,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         earn_states = get_all_earn_states(db, v)
         earn_yield_by_venue = {es.exchange: es.cumulative_yield_usdt for es in earn_states}
         earn_err_by_venue = {es.exchange: es.last_error for es in earn_states if es.last_error}
+        earn_first_accrual_by_venue = {es.exchange: es.last_accrual_ts for es in earn_states if es.last_accrual_ts}
         earn_deployed_by_venue: dict[str, float] = {}
         if v == MODE_LIVE and gateways:
             for gw in gateways:
@@ -588,18 +589,52 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             earn_deployed_by_venue = {es.exchange: es.deployed_usdt for es in earn_states}
         earn_total = sum(earn_deployed_by_venue.values())
         earn_yield_total = sum(earn_yield_by_venue.values())
+
+        # Source label per venue — what's actually generating the yield?
+        # Lets the dashboard say "BFUSD mint" or "KuCoin auto-lend" rather
+        # than the generic "Earn".
+        EARN_SOURCE_LABEL = {
+            'binance': 'BFUSD',
+            'kucoin': 'auto-lent USDT',
+            'paper': 'simulated',
+        }
+        # Realised APY estimate per venue. Uses the EarnState's first-
+        # accrual timestamp as the start point and divides cumulative
+        # yield by the days deployed × current balance to get an
+        # annualised rate. Returns None when there's not enough history
+        # (less than 1 day) so we don't show meaningless extrapolation.
+        def _estimate_apy(deployed: float, income: float, since: datetime | None) -> float | None:
+            if deployed <= 0.01 or since is None:
+                return None
+            days = max(0.0, (datetime.utcnow() - since).total_seconds() / 86400.0)
+            if days < 1.0:
+                return None
+            return (income / deployed) * (365.0 / days)
+
+        per_venue_earn = {}
+        for vid in set(earn_deployed_by_venue) | set(earn_yield_by_venue):
+            deployed = earn_deployed_by_venue.get(vid, 0.0)
+            income = earn_yield_by_venue.get(vid, 0.0)
+            apy = _estimate_apy(deployed, income, earn_first_accrual_by_venue.get(vid))
+            per_venue_earn[vid] = {
+                'deployed': deployed,
+                'income': income,
+                'source': EARN_SOURCE_LABEL.get(vid, vid),
+                'realised_apy': apy,  # None or float (e.g. 0.045 = 4.5%)
+            }
+        # Pool-wide APY estimate.
+        pool_apy = _estimate_apy(
+            earn_total,
+            earn_yield_total,
+            min(earn_first_accrual_by_venue.values()) if earn_first_accrual_by_venue else None,
+        )
         ctx['earn'] = {
             'enabled': cfg.earn_enabled,
             'deployed': earn_total,
             'cumulative_yield': earn_yield_total,
             'last_error': '; '.join(earn_err_by_venue.values()),
-            'per_venue': {
-                vid: {
-                    'deployed': earn_deployed_by_venue.get(vid, 0.0),
-                    'income': earn_yield_by_venue.get(vid, 0.0),
-                }
-                for vid in set(earn_deployed_by_venue) | set(earn_yield_by_venue)
-            },
+            'per_venue': per_venue_earn,
+            'realised_apy': pool_apy,
         }
 
         # Fees paid across every trade in this mode. Avg fee % = total fees

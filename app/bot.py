@@ -1162,6 +1162,14 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                 )).all()
                 bals_after = gateway.safe_balances() or {}
                 fut_free_now = float((bals_after.get('futures', {}).get('USDT') or {}).get('free') or 0)
+                # Under unified margin (Binance PM, KuCoin UTA), the pool
+                # funds both spot and perp legs — there's no separate
+                # futures wallet to drain. ``futures.USDT.total`` is 0 in
+                # those cases by convention; skip the drain entirely so
+                # we don't generate spurious "Drained X USDT" log lines.
+                fut_total_now = float((bals_after.get('futures', {}).get('USDT') or {}).get('total') or 0)
+                if fut_total_now <= 0.001:
+                    fut_free_now = 0.0  # disables the drain branch below
                 if open_ps:
                     # Keep ``cfg.futures_buffer_pct`` of open notional as free
                     # margin in the futures wallet so the perp short can absorb

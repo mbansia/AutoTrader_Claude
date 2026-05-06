@@ -1343,9 +1343,16 @@ class BinanceGateway(VenueGateway):
         # Futures bucket mirrors spot under PM — the bot's downstream code
         # reads bals['futures']['USDT'] for margin checks; keeping it equal
         # to spot reflects the unified-margin reality.
-        futures = {'USDT': {'free': usdt_free, 'used': max(0.0, usdt_total - usdt_free), 'total': usdt_total},
-                   'free': {'USDT': usdt_free}, 'used': {'USDT': max(0.0, usdt_total - usdt_free)},
-                   'total': {'USDT': usdt_total}}
+        # Under PM there is no separate futures wallet — the pool funds
+        # both spot-margin and UM-perp legs. We expose ``futures.USDT.free``
+        # as the pool's free amount so the bot's trade-sizing logic
+        # (which reads ``min(spot_free, fut_free)``) still works, but
+        # ``futures.USDT.total`` is 0 so the equity-sum loop
+        # (``spot_total + fut_total + ...``) doesn't double-count the
+        # same pool USDT.
+        futures = {'USDT': {'free': usdt_free, 'used': 0.0, 'total': 0.0},
+                   'free': {'USDT': usdt_free}, 'used': {'USDT': 0.0},
+                   'total': {'USDT': 0.0}}
         earn = {'USDT': {'free': bfusd_total, 'used': 0.0, 'total': bfusd_total},
                 'free': {'USDT': bfusd_total}, 'used': {'USDT': 0.0}, 'total': {'USDT': bfusd_total}}
         return {'spot': spot, 'earn': earn, 'futures': futures}
@@ -1767,9 +1774,13 @@ class KuCoinGateway(VenueGateway):
                             'free': {'USDT': usdt_free, **{k: v['free'] for k, v in per_asset.items()}},
                             'used': {'USDT': max(0.0, usdt_total - usdt_free), **{k: v['used'] for k, v in per_asset.items()}},
                             'total': {'USDT': usdt_total, **{k: v['total'] for k, v in per_asset.items()}}}
-                    futures = {'USDT': {'free': usdt_free, 'used': max(0.0, usdt_total - usdt_free), 'total': usdt_total},
-                               'free': {'USDT': usdt_free}, 'used': {'USDT': max(0.0, usdt_total - usdt_free)},
-                               'total': {'USDT': usdt_total}}
+                    # UTA unifies spot + futures into one pool; mirror the
+                    # PM convention — fut.free reflects pool capacity for
+                    # the bot's trade-sizing min(), but fut.total is 0 so
+                    # the equity-sum loop doesn't double-count the pool.
+                    futures = {'USDT': {'free': usdt_free, 'used': 0.0, 'total': 0.0},
+                               'free': {'USDT': usdt_free}, 'used': {'USDT': 0.0},
+                               'total': {'USDT': 0.0}}
                     earn = {'USDT': {'free': lent_total, 'used': 0.0, 'total': lent_total},
                             'free': {'USDT': lent_total}, 'used': {'USDT': 0.0}, 'total': {'USDT': lent_total}}
                     return {'spot': spot, 'earn': earn, 'futures': futures}
