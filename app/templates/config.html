@@ -85,7 +85,7 @@
           <option value="1" {{ 'selected' if cfg.earn_enabled }}>yes</option>
           <option value="0" {{ 'selected' if not cfg.earn_enabled }}>no</option>
         </select>
-        <span class="hint">When on, idle USDT routes into the venue's yield surface — <strong>Binance PM:</strong> bot mints BFUSD via /sapi/v1/portfolio/mint (yield-bearing PM collateral); <strong>KuCoin:</strong> moved to the funding (main) wallet where auto-lend draws from (UTA: unified-pool auto-lend). Pre-trade the bot redeems BFUSD via /sapi/v1/portfolio/redeem when futures need raw USDT. Disabling leaves idle USDT in the trading wallet earning nothing.</span></div>
+        <span class="hint">When on, idle USDT routes into the venue's yield surface. <strong>Binance PM:</strong> bot calls /sapi/v1/portfolio/mint (USDT→BFUSD) and /sapi/v1/portfolio/redeem (BFUSD→USDT). BFUSD is PM cross-collateral so it stays usable as margin while earning yield. <strong>KuCoin UTA:</strong> auto-lend handles routing — toggle it per asset in KuCoin UI → Margin → Lending → Auto-Lend. Auto-lent USDT continues to count as cross-margin collateral; the bot only reads the balance and surfaces it on the dashboard. <strong>KuCoin Classic:</strong> bot moves idle USDT to the funding (main) wallet which is the auto-lend source; same UI toggle applies. Disabling leaves idle USDT in the trading wallet earning nothing.</span></div>
       <div class="form-row"><label>Idle threshold (USDT)</label>
         <input type="number" step="0.1" name="earn_idle_threshold_usdt" value="{{ cfg.earn_idle_threshold_usdt }}">
         <span class="hint">only sweep when idle USDT exceeds this floor. Avoids sweeping dust.</span></div>

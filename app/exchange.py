@@ -630,6 +630,47 @@ class VenueGateway:
         ``('Unknown', 'no probe wired')`` — venue subclasses override."""
         return 'Unknown', 'no probe wired'
 
+    def equity_buckets(self) -> list[dict]:
+        """Return per-bucket equity items for the dashboard donut, with
+        venue-correct labels (e.g. ``Binance · PM USDT`` and
+        ``Binance · BFUSD`` rather than the legacy
+        ``spot / futures / earn`` triple — those don't apply under PM
+        or UTA, where the account is a single unified pool plus
+        optional yield-bearing collateral).
+        Each item: ``{label, value, color, venue}``. ``value`` is in
+        USDT-equivalent. Default implementation falls back to the
+        classic three-bucket breakdown by reading ``safe_balances`` and
+        ``earn_balance_usdt``; venue subclasses with non-classic
+        account types override to use their proper terminology."""
+        bals = self.safe_balances() or {}
+        items: list[dict] = []
+        spot_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
+        fut_usdt = float((bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
+        if spot_usdt > 0:
+            items.append({'label': f'{self.name} · Spot USDT', 'value': spot_usdt, 'venue': self.venue_id, 'color': '#38bdf8'})
+        if fut_usdt > 0:
+            items.append({'label': f'{self.name} · Futures USDT', 'value': fut_usdt, 'venue': self.venue_id, 'color': '#fbbf24'})
+        spot_assets_value = 0.0
+        META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
+        for asset, bal in (bals.get('spot') or {}).items():
+            if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+                continue
+            qty = float(bal.get('total') or 0)
+            if qty <= 0:
+                continue
+            px = self.safe_price(f'{asset}/USDT') or 0
+            spot_assets_value += qty * px
+        if spot_assets_value > 0:
+            items.append({'label': f'{self.name} · Spot assets', 'value': spot_assets_value, 'venue': self.venue_id, 'color': '#818cf8'})
+        try:
+            earn_usdt, _ = self.earn_balance_usdt()
+            earn_usdt = earn_usdt or 0.0
+        except Exception:
+            earn_usdt = 0.0
+        if earn_usdt > 0:
+            items.append({'label': f'{self.name} · Earn', 'value': earn_usdt, 'venue': self.venue_id, 'color': '#4ade80'})
+        return items
+
 
 # ─── Binance gateway ────────────────────────────────────────────────────────
 # Implements the full surface — Earn, universal-transfer, deposit /
@@ -1168,6 +1209,61 @@ class BinanceGateway(VenueGateway):
         except Exception as e:
             return 'Unknown', f'both probes failed: {str(e)[:80]}'
         return 'Unknown', 'PM probe rejected, Classic probe returned nothing'
+
+    def equity_buckets(self) -> list[dict]:
+        """PM-correct equity buckets for Binance. Replaces the Classic
+        spot/futures/earn triple with the actual PM concepts:
+          * ``Binance · PM USDT``        — USDT in the unified margin pool
+          * ``Binance · BFUSD``          — yield-bearing PM collateral
+          * ``Binance · PM collateral``  — non-USDT/BFUSD assets in the
+                                            pool (e.g. ETH from a long leg)
+          * ``Binance · Classic Spot``   — legacy spot wallet (separate
+                                            from PM; gets populated by
+                                            Simple Earn redeems and
+                                            external deposits)
+          * ``Binance · Simple Earn``    — legacy Simple Earn flexible
+                                            position (still a real
+                                            balance until the user
+                                            mints BFUSD from it)
+        Buckets with zero balance are omitted so the donut/legend
+        stays tight."""
+        bals = self.safe_balances() or {}
+        items: list[dict] = []
+        # PM unified pool (synthesised into 'spot' by _fetch_balances_uncached;
+        # 'futures' is the same number under PM). Show as a single PM USDT
+        # bucket — naming the same number twice would be confusing.
+        pm_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
+        if pm_usdt > 0:
+            items.append({'label': f'{self.name} · PM USDT', 'value': pm_usdt, 'venue': self.venue_id, 'color': '#38bdf8'})
+        # BFUSD (the yield-bearing margin asset). _fetch_balances_uncached
+        # surfaces it in 'earn' for compatibility with downstream readers.
+        bfusd = float((bals.get('earn', {}).get('USDT') or {}).get('total') or 0)
+        if bfusd > 0:
+            items.append({'label': f'{self.name} · BFUSD', 'value': bfusd, 'venue': self.venue_id, 'color': '#4ade80'})
+        # Non-USDT collateral (e.g. ETH held as the long spot leg of an arb).
+        collateral_value = 0.0
+        META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
+        for asset, bal in (bals.get('spot') or {}).items():
+            if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+                continue
+            qty = float(bal.get('total') or 0)
+            if qty <= 0:
+                continue
+            px = self.safe_price(f'{asset}/USDT') or 0
+            collateral_value += qty * px
+        if collateral_value > 0:
+            items.append({'label': f'{self.name} · PM collateral assets', 'value': collateral_value, 'venue': self.venue_id, 'color': '#818cf8'})
+        # Legacy Simple Earn USDT — still a real balance until the user
+        # mints BFUSD from it. earn_balance_usdt() aggregates BFUSD +
+        # Simple Earn; we already counted BFUSD above, so subtract.
+        try:
+            earn_total, _ = self.earn_balance_usdt()
+            simple_earn = max(0.0, (earn_total or 0.0) - bfusd)
+        except Exception:
+            simple_earn = 0.0
+        if simple_earn > 0.01:
+            items.append({'label': f'{self.name} · Simple Earn (legacy)', 'value': simple_earn, 'venue': self.venue_id, 'color': '#facc15'})
+        return items
 
     def _fetch_balances_uncached(self) -> dict:
         """Read PM unified balance + classic Spot wallet, then synthesise
@@ -1713,6 +1809,59 @@ class KuCoinGateway(VenueGateway):
                     pass
             return 'Unified Trading Account (UTA)', mode_detail
         return 'Classic', 'isolated trade / contract / main wallets'
+
+    def equity_buckets(self) -> list[dict]:
+        """KuCoin-correct equity buckets. Two shapes depending on
+        account mode:
+
+        UTA — single unified-margin pool plus optional auto-lent USDT
+        (yield-bearing). Buckets:
+          * ``KuCoin · UTA USDT``           — unified-pool USDT
+          * ``KuCoin · UTA auto-lent USDT`` — auto-lent portion (yield)
+          * ``KuCoin · UTA collateral``     — non-USDT assets in the pool
+
+        Classic — three isolated wallets (Trade, Contract, Main):
+          * ``KuCoin · Trade USDT``         — spot trading wallet
+          * ``KuCoin · Contract USDT``      — futures wallet
+          * ``KuCoin · Main USDT (auto-lend)`` — funding wallet (the
+            yield surface; auto-lend draws from here when toggled in
+            the KuCoin UI)
+          * ``KuCoin · Trade collateral``   — non-USDT spot assets
+
+        Buckets with zero balance are omitted so the donut/legend
+        stays tight."""
+        bals = self.safe_balances() or {}
+        items: list[dict] = []
+        spot_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
+        fut_usdt = float((bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
+        earn_usdt = float((bals.get('earn', {}).get('USDT') or {}).get('total') or 0)
+        if self._is_uta:
+            if spot_usdt > 0:
+                items.append({'label': f'{self.name} · UTA USDT', 'value': spot_usdt, 'venue': self.venue_id, 'color': '#38bdf8'})
+            if earn_usdt > 0:
+                items.append({'label': f'{self.name} · UTA auto-lent USDT', 'value': earn_usdt, 'venue': self.venue_id, 'color': '#4ade80'})
+        else:
+            if spot_usdt > 0:
+                items.append({'label': f'{self.name} · Trade USDT', 'value': spot_usdt, 'venue': self.venue_id, 'color': '#38bdf8'})
+            if fut_usdt > 0:
+                items.append({'label': f'{self.name} · Contract USDT', 'value': fut_usdt, 'venue': self.venue_id, 'color': '#fbbf24'})
+            if earn_usdt > 0:
+                items.append({'label': f'{self.name} · Main USDT (auto-lend surface)', 'value': earn_usdt, 'venue': self.venue_id, 'color': '#4ade80'})
+        # Non-USDT collateral assets (spot leg of an open arb, etc.).
+        collateral_value = 0.0
+        META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
+        for asset, bal in (bals.get('spot') or {}).items():
+            if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+                continue
+            qty = float(bal.get('total') or 0)
+            if qty <= 0:
+                continue
+            px = self.safe_price(f'{asset}/USDT') or 0
+            collateral_value += qty * px
+        if collateral_value > 0:
+            label = f'{self.name} · UTA collateral' if self._is_uta else f'{self.name} · Trade collateral'
+            items.append({'label': label, 'value': collateral_value, 'venue': self.venue_id, 'color': '#818cf8'})
+        return items
 
     def _main_wallet_usdt(self) -> tuple[float | None, str]:
         """Read the USDT balance of the ``main`` (Funding) wallet from the

@@ -159,35 +159,20 @@ def equity_breakdown(db, gateways, mode: str, earn_deployed: float) -> list[dict
         gateways = [gateways] if gateways is not None else []
     items: list[dict] = []
     if mode == MODE_LIVE:
+        # Each gateway returns its own venue-correct buckets via
+        # ``equity_buckets()`` — Binance under PM yields PM USDT / BFUSD /
+        # PM collateral / Classic Spot / Simple Earn (legacy); KuCoin
+        # under UTA yields UTA USDT / UTA auto-lent / UTA collateral;
+        # Classic accounts still get the trade/contract/main triple.
+        # The dashboard donut renders whatever each venue provides, no
+        # hardcoded labels here.
         for gw in gateways:
-            bals = gw.safe_balances() or {}
-            spot_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
-            fut_usdt = float((bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
-            spot_assets = 0.0
-            META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
-            for asset, bal in (bals.get('spot') or {}).items():
-                if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
-                    continue
-                qty = float(bal.get('total') or 0)
-                if qty <= 0:
-                    continue
-                px = gw.safe_price(f'{asset}/USDT') or 0
-                spot_assets += qty * px
-            # Earn balance is fetched live per venue every render — this is a
-            # trading dashboard and stale earn numbers are misleading. Each
-            # gateway hits its own earn endpoint (Binance simple-earn,
-            # KuCoin funding wallet). One extra SAPI call per venue per
-            # render is acceptable; the cost of a stale number is higher.
             try:
-                gw_earn, _ = gw.earn_balance_usdt()
-                gw_earn = gw_earn or 0.0
+                items.extend(gw.equity_buckets())
             except Exception:
-                gw_earn = 0.0
-            items.append({'label': f'{gw.name} · Spot USDT', 'value': spot_usdt, 'color': PALETTE['spot_usdt'], 'venue': gw.venue_id})
-            items.append({'label': f'{gw.name} · Futures USDT', 'value': fut_usdt, 'color': PALETTE['fut_usdt'], 'venue': gw.venue_id})
-            items.append({'label': f'{gw.name} · Spot assets', 'value': spot_assets, 'color': PALETTE['spot_assets'], 'venue': gw.venue_id})
-            if gw_earn > 0:
-                items.append({'label': f'{gw.name} · Earn', 'value': gw_earn, 'color': PALETTE['earn'], 'venue': gw.venue_id})
+                # Fail-soft per venue — one venue's outage shouldn't
+                # blank the whole dashboard.
+                continue
     else:
         # Paper mode — use the first gateway (typically Binance) for price lookups.
         price_gw = gateways[0] if gateways else None
