@@ -74,6 +74,7 @@ def run_schema_migrations() -> None:
     _add_column_if_missing('strategy_config', 'futures_buffer_pct', 'FLOAT NOT NULL DEFAULT 0.20')
     _add_column_if_missing('strategy_config', 'max_perp_leverage', 'INTEGER NOT NULL DEFAULT 1')
     _add_column_if_missing('strategy_config', 'binance_max_bfusd_pct', 'FLOAT NOT NULL DEFAULT 0.20')
+    _add_column_if_missing('strategy_config', 'kucoin_auto_lend_enabled', 'BOOLEAN NOT NULL DEFAULT 1')
     # Trade-type taxonomy — every position / trade carries one tag so the
     # dashboard can group by strategy and the orchestrator can apply the
     # right buffer / sizing rules per type. Same-venue funding-arb is the

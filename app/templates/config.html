@@ -71,7 +71,13 @@
         <span class="hint">Free margin kept above maintenance requirement on each perp. <strong>0.20 (default)</strong> covers ~20% adverse mark-price move on a 1x short. Bump to 0.30+ for memes / low-liquidity tokens. Under Binance Portfolio Margin, BFUSD held as collateral counts toward this buffer too.</span></div>
       <div class="form-row"><label>Max BFUSD share of equity (Binance PM only)</label>
         <input type="number" step="0.01" min="0.0" max="1.0" name="binance_max_bfusd_pct" value="{{ '%.2f' % cfg.binance_max_bfusd_pct }}">
-        <span class="hint">Cap on the share of total Binance equity auto-converted to BFUSD (yield-bearing margin asset). <strong>0.20 (default)</strong> keeps 80% as plain USDT for instant deploy; bump higher once BFUSD redemption behaviour has been observed under your trading load. Auto-conversion is enabled in the Binance UI, not by the bot.</span></div>
+        <span class="hint">Cap on the share of total Binance equity auto-converted to BFUSD (yield-bearing margin asset). <strong>0.20 (default)</strong> keeps 80% as plain USDT for instant deploy; bump higher once BFUSD redemption behaviour has been observed under your trading load. Bot mints/redeems BFUSD via /sapi/v1/portfolio/mint and /redeem.</span></div>
+      <div class="form-row"><label>KuCoin auto-lend (USDT)</label>
+        <select name="kucoin_auto_lend_enabled">
+          <option value="1" {{ 'selected' if cfg.kucoin_auto_lend_enabled }}>enabled</option>
+          <option value="0" {{ 'selected' if not cfg.kucoin_auto_lend_enabled }}>disabled</option>
+        </select>
+        <span class="hint">Bot calls /api/v1/margin/toggle-auto-lend on each startup (USDT, retainSize=0, dailyIntRate=0, term=7d) so idle USDT auto-lends to margin traders for variable yield (~3–8% APY typical). Under UTA the lent portion still counts as cross-margin collateral; under Classic margin lent funds lock for the term so trades may need to wait for them to return. Useful when your sub-account can't access Hold-to-Earn UI toggles directly.</span></div>
     </div>
   </div>
 </div>

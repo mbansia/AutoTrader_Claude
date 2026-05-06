@@ -246,6 +246,15 @@ class StrategyConfig(Base):
     # immediate-deploy. Default 0.20 (20% of equity); bump to 0.80 once
     # BFUSD redemption behaviour has been observed under your trading load.
     binance_max_bfusd_pct: Mapped[float] = mapped_column(Float, default=0.20)
+    # Enable KuCoin auto-lend for USDT (sub-account API key calls
+    # /api/v1/margin/toggle-auto-lend). When on, idle USDT in the
+    # margin / unified pool is auto-lent to margin traders and earns
+    # variable interest. Under UTA the lent portion still counts as
+    # cross-margin collateral; under Classic margin the funds are
+    # locked for the lend term (7d default) so auto-lend is best on
+    # UTA. Default True — the bot retries the toggle on every startup
+    # so the setting always converges to what the operator wants.
+    kucoin_auto_lend_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     # Subscribe base assets (SOL, ETH, etc.) to Binance Simple Earn Flexible after
     # the spot buy fills. Default off — opt-in because not every asset has a
     # flexible product and redeem-on-close is one extra failure mode.

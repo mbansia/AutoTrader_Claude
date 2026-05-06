@@ -1033,6 +1033,7 @@ def save_config(
     max_perp_leverage: int = Form(1),     # current name; surfaced on /config
     futures_buffer_pct: float = Form(0.20),
     binance_max_bfusd_pct: float = Form(0.20),
+    kucoin_auto_lend_enabled: int = Form(1),
     min_order_book_depth_usdt: float = Form(500.0),
     depth_band_bps: float = Form(10.0),
     _: None = Depends(auth),
@@ -1068,6 +1069,7 @@ def save_config(
         cfg.perp_leverage = new_lev  # keep mirrored so any legacy reader sees the same value
         cfg.futures_buffer_pct = max(0.05, min(1.0, futures_buffer_pct))
         cfg.binance_max_bfusd_pct = max(0.0, min(1.0, binance_max_bfusd_pct))
+        cfg.kucoin_auto_lend_enabled = bool(kucoin_auto_lend_enabled)
         cfg.min_order_book_depth_usdt = max(0.0, min_order_book_depth_usdt)
         cfg.depth_band_bps = max(1.0, depth_band_bps)
         db.commit()

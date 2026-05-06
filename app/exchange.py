@@ -1890,6 +1890,36 @@ class KuCoinGateway(VenueGateway):
             return 0.0, ''  # only USDT auto-lend is wired
         return self._main_wallet_usdt()
 
+    # ─── Auto-lend toggle (KuCoin) ────────────────────────────────────────
+    # Calls /api/v1/margin/toggle-auto-lend with sensible defaults:
+    #   isEnable     = True (or False to disable)
+    #   currency     = USDT
+    #   retainSize   = 0    — lend everything; sub-account API keys can
+    #                          revoke per-call as needed
+    #   dailyIntRate = 0    — accept any rate; better than missing fills
+    #                          on tight days and the realised yield will
+    #                          track the venue's clearing rate
+    #   term         = 7    — KuCoin's standard lend term in days
+    # Idempotent: repeated calls with the same isEnable just return the
+    # existing state. The bot calls this once per startup so the setting
+    # converges to whatever ``cfg.kucoin_auto_lend_enabled`` is.
+    def toggle_auto_lend(self, enabled: bool = True, asset: str = 'USDT') -> tuple[bool, str]:
+        fn = (getattr(self.spot, 'privatePostMarginToggleAutoLend', None)
+              or getattr(self.spot, 'private_post_margin_toggle_auto_lend', None))
+        if fn is None:
+            return False, 'privatePostMarginToggleAutoLend not exposed by this ccxt build'
+        try:
+            fn({
+                'currency': asset,
+                'isEnable': bool(enabled),
+                'retainSize': '0',
+                'dailyIntRate': '0',
+                'term': 7,
+            })
+        except Exception as e:
+            return False, str(e)[:200]
+        return True, ''
+
     def earn_subscribe(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
         if paper_mode:
             return True, 'paper'

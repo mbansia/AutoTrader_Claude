@@ -1254,6 +1254,32 @@ def run_one_cycle(gateways: list | None = None, mode: str | None = None) -> int:
     return sleep_seconds
 
 
+def _enforce_venue_yield_settings(gateways: list, db) -> None:
+    """One-shot per-startup: push each venue's yield surface into the
+    state the operator wants. Idempotent — calling repeatedly with the
+    same flags just confirms the existing setting.
+
+    KuCoin: toggles auto-lend for USDT according to
+    ``cfg.kucoin_auto_lend_enabled``. The sub-account API key calls
+    /api/v1/margin/toggle-auto-lend directly — the user doesn't need
+    UI access on the sub-account (which they can't get when master
+    settings don't propagate). Auto-lent USDT continues to count as
+    margin collateral under UTA, so the position-opening flow is
+    unaffected.
+
+    Binance: BFUSD mint is event-driven (post-trade earn sweep) — no
+    one-shot toggle needed."""
+    cfg = get_strategy_config(db)
+    for gw in gateways:
+        if gw.venue_id == 'kucoin':
+            target_enabled = bool(cfg.kucoin_auto_lend_enabled)
+            ok, err = gw.toggle_auto_lend(enabled=target_enabled, asset='USDT')
+            if ok:
+                log_event(db, f'KuCoin auto-lend USDT: {"ENABLED" if target_enabled else "DISABLED"} via /margin/toggle-auto-lend', mode=MODE_LIVE, exchange=gw.venue_id)
+            else:
+                log_event(db, f'KuCoin auto-lend toggle failed: {err}', mode=MODE_LIVE, level='WARN', exchange=gw.venue_id)
+
+
 def run_loop() -> None:
     gateways = make_gateways()
     for gw in gateways:
@@ -1263,6 +1289,9 @@ def run_loop() -> None:
             with SessionLocal() as db:
                 log_event(db, f'{gw.name} load_markets failed: {e}', mode=MODE_PAPER, level='ERROR', exchange=gw.venue_id)
                 db.commit()
+    with SessionLocal() as db:
+        _enforce_venue_yield_settings(gateways, db)
+        db.commit()
     for gw in gateways:
         reconcile_positions(gw)
     while True:
