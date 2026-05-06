@@ -68,6 +68,7 @@ from app.models import (
     ScanResult,
     StrategyConfig,
     Trade,
+    venue_to_trade_type,
 )
 from app.safety import (
     check_hedge,
@@ -260,14 +261,17 @@ def get_strategy_config(db) -> StrategyConfig:
     return cfg
 
 
-def record_trade(db, position_id: int | None, mode: str, symbol: str, venue: str, side: str, qty: float, order: dict, exchange: str = VENUE_BINANCE):
+def record_trade(db, position_id: int | None, mode: str, symbol: str, venue: str, side: str, qty: float, order: dict, exchange: str = VENUE_BINANCE, trade_type: str | None = None):
     """Record a single fill. ``venue`` is the leg ('spot' / 'futures').
     ``exchange`` is the broker the fill happened on (Binance, KuCoin, IBKR…)
     — the system treats the whole portfolio as a single pool distributed
-    across these exchanges."""
+    across these exchanges. ``trade_type`` mirrors the parent position's
+    strategy tag; defaults to the same-venue funding-arb derived from the
+    exchange when not supplied (back-compat)."""
     db.add(Trade(
         mode=mode,
         exchange=exchange,
+        trade_type=trade_type or venue_to_trade_type(exchange),
         position_id=position_id,
         symbol=symbol,
         venue=venue,
@@ -588,7 +592,7 @@ def reconcile_positions(gateway: VenueGateway) -> None:
             if existing or pos_amt == 0:
                 continue
             base = symbol.split('/')[0]
-            db.add(Position(mode=MODE_LIVE, exchange=gateway.venue_id, symbol=base, spot_symbol=f'{base}/USDT', perp_symbol=symbol, quantity=abs(pos_amt), entry_funding_rate=0.0))
+            db.add(Position(mode=MODE_LIVE, exchange=gateway.venue_id, trade_type=venue_to_trade_type(gateway.venue_id), symbol=base, spot_symbol=f'{base}/USDT', perp_symbol=symbol, quantity=abs(pos_amt), entry_funding_rate=0.0))
             log_event(db, f'Rehydrated orphan position {symbol} on {gateway.name} qty={pos_amt}', mode=MODE_LIVE, exchange=gateway.venue_id)
         db.commit()
 
@@ -1031,6 +1035,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         pos = Position(
                             mode=mode,
                             exchange=gateway.venue_id,
+                            trade_type=venue_to_trade_type(gateway.venue_id),
                             symbol=c.spot_symbol.split('/')[0],
                             spot_symbol=c.spot_symbol,
                             perp_symbol=c.perp_symbol,

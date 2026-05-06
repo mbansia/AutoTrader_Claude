@@ -39,6 +39,38 @@ VENUE_IBKR = 'ibkr'
 ALL_VENUES = (VENUE_BINANCE, VENUE_KUCOIN, VENUE_IBKR)
 
 
+# Trade-type taxonomy. Each bot-originated position carries one of these
+# tags so we can compute per-strategy PnL, run different buffer / sizing
+# rules per type, and (later) route entries through the right multi-venue
+# orchestrator. Tags are stored as plain strings so we can introduce new
+# types without a schema migration; see TRADE_TYPE_LABELS for the
+# human-readable display strings.
+TRADE_TYPE_BINANCE_FUNDING_ARB = 'binance_same_venue_funding_arb'   # long spot + short perp on Binance only
+TRADE_TYPE_KUCOIN_FUNDING_ARB = 'kucoin_same_venue_funding_arb'     # long spot + short perp on KuCoin only
+TRADE_TYPE_BINANCE_KUCOIN_ARB = 'binance_kucoin_cross_funding_arb'  # spot one side, perp the other (Phase 2)
+TRADE_TYPE_ONCHAIN_BINANCE_ARB = 'onchain_binance_funding_arb'      # DEX perp + CEX spot (Phase 3)
+TRADE_TYPE_IBKR_BINANCE_ARB = 'ibkr_binance_funding_arb'            # IBKR equity / option leg + Binance perp (future)
+TRADE_TYPE_IBKR_KUCOIN_ARB = 'ibkr_kucoin_funding_arb'              # IBKR + KuCoin equivalent (future)
+TRADE_TYPE_LABELS: dict[str, str] = {
+    TRADE_TYPE_BINANCE_FUNDING_ARB: 'binance · same-venue funding arb',
+    TRADE_TYPE_KUCOIN_FUNDING_ARB: 'kucoin · same-venue funding arb',
+    TRADE_TYPE_BINANCE_KUCOIN_ARB: 'binance ↔ kucoin · cross-venue arb',
+    TRADE_TYPE_ONCHAIN_BINANCE_ARB: 'onchain ↔ binance · cross-venue arb',
+    TRADE_TYPE_IBKR_BINANCE_ARB: 'ibkr ↔ binance · cross-asset arb',
+    TRADE_TYPE_IBKR_KUCOIN_ARB: 'ibkr ↔ kucoin · cross-asset arb',
+}
+
+
+def venue_to_trade_type(venue_id: str) -> str:
+    """Default mapping for the same-venue funding arb the bot runs today.
+    Used when opening a new position; later, multi-venue orchestrators
+    will pick the trade type explicitly when they create the position."""
+    return {
+        VENUE_BINANCE: TRADE_TYPE_BINANCE_FUNDING_ARB,
+        VENUE_KUCOIN: TRADE_TYPE_KUCOIN_FUNDING_ARB,
+    }.get(venue_id, TRADE_TYPE_BINANCE_FUNDING_ARB)
+
+
 class Position(Base):
     __tablename__ = 'positions'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -48,6 +80,11 @@ class Position(Base):
     # column once their gateways land. The dashboard breaks down equity, PnL
     # and exposure across venues using this tag.
     exchange: Mapped[str] = mapped_column(String(16), default=VENUE_BINANCE, index=True)
+    # Trade-type tag — see TRADE_TYPE_* constants above. Same-venue funding
+    # arbs (Binance/KuCoin) are the only types the bot opens today; cross-
+    # venue and onchain entries land in this column once their orchestrators
+    # are wired. Indexed because the dashboard groups by it.
+    trade_type: Mapped[str] = mapped_column(String(48), default=TRADE_TYPE_BINANCE_FUNDING_ARB, index=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
     spot_symbol: Mapped[str] = mapped_column(String(32))
     perp_symbol: Mapped[str] = mapped_column(String(32))
@@ -80,6 +117,9 @@ class Trade(Base):
     # full coordinate of the fill. ``exchange`` is the dimension we'll add
     # KuCoin / Interactive Brokers to.
     exchange: Mapped[str] = mapped_column(String(16), default=VENUE_BINANCE, index=True)
+    # Trade-type tag mirrored from the parent Position so per-strategy
+    # PnL / fee analysis can group trade rows directly without joining.
+    trade_type: Mapped[str] = mapped_column(String(48), default=TRADE_TYPE_BINANCE_FUNDING_ARB, index=True)
     position_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
     venue: Mapped[str] = mapped_column(String(16))  # 'spot' | 'futures' — the leg, kept for backwards compat

@@ -85,6 +85,7 @@ from app.models import (
     RejectedCandidate,
     RuntimeState,
     ScanResult,
+    TRADE_TYPE_LABELS,
     Trade,
 )
 from app.network import get_outbound_ip
@@ -715,6 +716,8 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
                 'symbol': p.symbol,
                 'venue': p.exchange,
                 'quantity': p.quantity,
+                'trade_type': p.trade_type or '',
+                'trade_type_label': TRADE_TYPE_LABELS.get(p.trade_type or '', p.trade_type or ''),
                 'spot_symbol': p.spot_symbol,
                 'perp_symbol': p.perp_symbol,
                 'spot_entry': p.spot_entry_price,
@@ -812,6 +815,8 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
                 'id': c.id,
                 'symbol': c.symbol,
                 'venue': c.exchange,
+                'trade_type': c.trade_type or '',
+                'trade_type_label': TRADE_TYPE_LABELS.get(c.trade_type or '', c.trade_type or ''),
                 'spot_symbol': c.spot_symbol,
                 'perp_symbol': c.perp_symbol,
                 'quantity': c.quantity,
@@ -1131,12 +1136,30 @@ def _truncate_json(value, max_chars: int = 4000) -> str:
     return text
 
 
+def _json_safe(v):
+    """Recursively coerce datetimes (and other non-JSON types) into
+    plain JSON-serializable values. Used by ``_probe`` so the
+    monitoring template's ``tojson`` filter doesn't 500 when a probe
+    returns rows that include ``datetime`` objects (e.g. capital-flow
+    ingest)."""
+    if isinstance(v, datetime):
+        return v.isoformat() + 'Z'
+    if isinstance(v, dict):
+        return {k: _json_safe(val) for k, val in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_json_safe(x) for x in v]
+    return v
+
+
 def _probe(label: str, fn) -> dict:
-    """Run a probe callable and capture (ok, raw, err, latency_ms)."""
+    """Run a probe callable and capture (ok, raw, err, latency_ms).
+    The ``raw`` payload is sanitised through :func:`_json_safe` so the
+    monitoring template can render it via Jinja's ``tojson`` filter
+    without choking on datetime / set / Decimal values."""
     started = time.time()
     try:
         raw = fn()
-        return {'label': label, 'ok': True, 'raw': raw, 'err': '', 'latency_ms': int((time.time() - started) * 1000)}
+        return {'label': label, 'ok': True, 'raw': _json_safe(raw), 'err': '', 'latency_ms': int((time.time() - started) * 1000)}
     except Exception as e:
         return {'label': label, 'ok': False, 'raw': None, 'err': str(e)[:400], 'latency_ms': int((time.time() - started) * 1000)}
 
