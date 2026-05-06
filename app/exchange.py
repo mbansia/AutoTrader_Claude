@@ -1302,20 +1302,65 @@ class BinanceGateway(VenueGateway):
         return self.earn_balance_usdt()
 
     def earn_subscribe(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
-        # Binance auto-collection (enabled in the Binance UI per asset)
-        # converts idle USDT to BFUSD automatically as it lands in the PM
-        # pool. The bot doesn't issue an explicit subscribe call — that
-        # would race with auto-collection and risks errors.
+        """Mint BFUSD from idle USDT under Portfolio Margin. Calls
+        ``/sapi/v1/portfolio/mint`` with ``fromAsset=USDT``,
+        ``targetAsset=BFUSD``. The minted BFUSD lands in the unified
+        margin pool where it (a) earns daily yield and (b) counts as
+        cross-collateral for futures positions. There is no Binance UI
+        "auto-toggle" for USDT→BFUSD conversion (a common
+        misconception) — every conversion is an explicit mint call,
+        which the bot now issues automatically as part of the earn
+        sweep flow."""
         if paper_mode:
             return True, 'paper'
-        return False, 'PM mode: BFUSD subscription is automatic via Binance UI auto-collection (idle USDT auto-converts). No bot-side action needed.'
+        if amount_usdt <= 0:
+            return True, 'noop'
+        # Cooldown reuses the existing per-asset throttle so we don't
+        # spam Binance with mint calls if a previous one is still
+        # propagating.
+        cool_until = self._earn_subscribe_cooldown_until.get('BFUSD', 0.0)
+        now = time.time()
+        if now < cool_until:
+            remaining = int(cool_until - now)
+            return False, f'BFUSD: mint cooldown active ({remaining}s remaining)'
+        fn = getattr(self.spot, 'sapiPostPortfolioMint', None) or getattr(self.spot, 'sapi_post_portfolio_mint', None)
+        if fn is None:
+            return False, 'BFUSD mint endpoint (sapiPostPortfolioMint) not exposed by this ccxt build'
+        try:
+            resp = fn({
+                'fromAsset': 'USDT',
+                'targetAsset': 'BFUSD',
+                'amount': f'{amount_usdt:.2f}',
+            })
+        except Exception as e:
+            err = str(e)
+            if BINANCE_ERR_EARN_TOO_MANY_SUBS in err:
+                self._earn_subscribe_cooldown_until['BFUSD'] = now + self.EARN_SUBSCRIBE_RATE_LIMITED_COOLDOWN_S
+                return False, f'BFUSD mint rate-limited (77505), backing off 24h: {err[:120]}'
+            return False, f'BFUSD mint failed: {err[:160]}'
+        self._earn_subscribe_cooldown_until['BFUSD'] = now + self.EARN_SUBSCRIBE_DEFAULT_COOLDOWN_S
+        return True, ''
 
     def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
-        # Same logic — BFUSD auto-redeems to USDT when futures need
-        # margin. provision_margin is therefore a no-op under PM.
+        """Redeem BFUSD back to USDT via ``/sapi/v1/portfolio/redeem``.
+        Triggered pre-trade by ``provision_margin`` when the bot needs
+        more raw USDT than the unified pool currently has."""
         if paper_mode:
             return True, 'paper'
-        return True, 'PM mode: redeem is automatic — BFUSD auto-converts to USDT when margin needs it'
+        if amount_usdt <= 0:
+            return True, 'noop'
+        fn = getattr(self.spot, 'sapiPostPortfolioRedeem', None) or getattr(self.spot, 'sapi_post_portfolio_redeem', None)
+        if fn is None:
+            return False, 'BFUSD redeem endpoint (sapiPostPortfolioRedeem) not exposed by this ccxt build'
+        try:
+            fn({
+                'fromAsset': 'BFUSD',
+                'targetAsset': 'USDT',
+                'amount': f'{amount_usdt:.2f}',
+            })
+        except Exception as e:
+            return False, f'BFUSD redeem failed: {str(e)[:160]}'
+        return True, ''
 
     def transfer_spot_to_futures(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
         # PM unifies margin; there's nothing to transfer.

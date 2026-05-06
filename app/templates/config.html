@@ -85,7 +85,7 @@
           <option value="1" {{ 'selected' if cfg.earn_enabled }}>yes</option>
           <option value="0" {{ 'selected' if not cfg.earn_enabled }}>no</option>
         </select>
-        <span class="hint">When on, idle USDT routes into the venue's yield surface — <strong>Binance:</strong> auto-converted to BFUSD via Portfolio Margin's auto-collection (configured in the Binance UI per asset); <strong>KuCoin:</strong> moved to the funding (main) wallet where KuCoin's auto-lend draws from. Redemption is automatic when futures need margin (PM) or via inner-transfer (KuCoin). Disabling leaves idle USDT in the trading wallet earning nothing.</span></div>
+        <span class="hint">When on, idle USDT routes into the venue's yield surface — <strong>Binance PM:</strong> bot mints BFUSD via /sapi/v1/portfolio/mint (yield-bearing PM collateral); <strong>KuCoin:</strong> moved to the funding (main) wallet where auto-lend draws from (UTA: unified-pool auto-lend). Pre-trade the bot redeems BFUSD via /sapi/v1/portfolio/redeem when futures need raw USDT. Disabling leaves idle USDT in the trading wallet earning nothing.</span></div>
       <div class="form-row"><label>Idle threshold (USDT)</label>
         <input type="number" step="0.1" name="earn_idle_threshold_usdt" value="{{ cfg.earn_idle_threshold_usdt }}">
         <span class="hint">only sweep when idle USDT exceeds this floor. Avoids sweeping dust.</span></div>
