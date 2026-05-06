@@ -54,7 +54,7 @@
 </div>
 
 <div class="card">
-  <h3>Wallet auto-transfer &amp; rebalance</h3>
+  <h3>Wallet routing &amp; liquidation buffer</h3>
   <div class="body">
     <div class="form-grid">
       <div class="form-row"><label>Auto-transfer USDT spot ⇄ futures</label>
@@ -85,7 +85,7 @@
           <option value="1" {{ 'selected' if cfg.earn_enabled }}>yes</option>
           <option value="0" {{ 'selected' if not cfg.earn_enabled }}>no</option>
         </select>
-        <span class="hint">when on, idle USDT is swept into the venue's Earn product (Binance Simple Earn today; KuCoin Pool-X is deferred so it's a no-op there) after each cycle. The bot redeems automatically before opening a position. Live mode requires API key Earn permission on the venue.</span></div>
+        <span class="hint">When on, idle USDT routes into the venue's yield surface — <strong>Binance:</strong> auto-converted to BFUSD via Portfolio Margin's auto-collection (configured in the Binance UI per asset); <strong>KuCoin:</strong> moved to the funding (main) wallet where KuCoin's auto-lend draws from. Redemption is automatic when futures need margin (PM) or via inner-transfer (KuCoin). Disabling leaves idle USDT in the trading wallet earning nothing.</span></div>
       <div class="form-row"><label>Idle threshold (USDT)</label>
         <input type="number" step="0.1" name="earn_idle_threshold_usdt" value="{{ cfg.earn_idle_threshold_usdt }}">
         <span class="hint">only sweep when idle USDT exceeds this floor. Avoids sweeping dust.</span></div>
@@ -97,7 +97,7 @@
           <option value="1" {{ 'selected' if cfg.earn_subscribe_spot_assets }}>yes</option>
           <option value="0" {{ 'selected' if not cfg.earn_subscribe_spot_assets }}>no</option>
         </select>
-        <span class="hint">Opt-in. On Binance, subscribes the base asset (SOL, ETH…) to Simple Earn Flexible after the spot buy (immediately redeemable). Auto-redeems before close. KuCoin: no-op until Pool-X is wired. Skips silently if no flexible product exists for the asset.</span></div>
+        <span class="hint">Opt-in. On Binance under Portfolio Margin the base asset (SOL, ETH…) automatically counts as cross-margin collateral and accrues lending interest if a flexible Earn product exists for it. KuCoin: the base asset sits in the trade wallet during the open position (no separate yield surface). Skips silently if the asset has no Earn product available.</span></div>
     </div>
   </div>
 </div>

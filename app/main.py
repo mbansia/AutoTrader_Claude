@@ -1220,13 +1220,19 @@ def _gather_exchange_status() -> list[dict]:
             {'label': 'Earn · USDT', 'value': earn_usdt},
         ]
         capital_subtotal = spot_usdt + spot_assets + fut_usdt + earn_usdt
+    bn_account_label = bn_account_detail = ''
+    if has_creds:
+        try:
+            bn_account_label, bn_account_detail = gw.account_type()
+        except Exception as e:
+            bn_account_label, bn_account_detail = 'Unknown', f'probe error: {str(e)[:80]}'
     sections.append({
         'name': 'Binance',
         'venue_id': 'binance',
         'configured': has_creds,
         'key_masked': _mask(settings.binance_api_key),
         'secret_masked': _mask(settings.binance_api_secret),
-        'extra_creds': [],
+        'extra_creds': [{'label': 'Account type (live)', 'value': f'{bn_account_label} — {bn_account_detail}' if bn_account_label else '<not probed>'}] if has_creds else [],
         'probes': probes,
         'last_balance_error': gw.last_balance_error,
         'capital_subtotal_usdt': capital_subtotal,
@@ -1280,13 +1286,22 @@ def _gather_exchange_status() -> list[dict]:
             {'label': 'Earn · USDT (main / funding wallet)', 'value': kc_earn_usdt},
         ]
         kc_capital_subtotal = kc_spot_usdt + kc_spot_assets + kc_fut_usdt + kc_earn_usdt
+    kc_account_label = kc_account_detail = ''
+    if kc_configured:
+        try:
+            kc_account_label, kc_account_detail = kgw.account_type()
+        except Exception as e:
+            kc_account_label, kc_account_detail = 'Unknown', f'probe error: {str(e)[:80]}'
+    kc_extra = [{'label': 'Passphrase', 'value': _mask(kc_pass)}]
+    if kc_configured:
+        kc_extra.append({'label': 'Account type (live)', 'value': f'{kc_account_label} — {kc_account_detail}'})
     sections.append({
         'name': 'KuCoin',
         'venue_id': 'kucoin',
         'configured': kc_configured,
         'key_masked': _mask(kc_key),
         'secret_masked': _mask(kc_secret),
-        'extra_creds': [{'label': 'Passphrase', 'value': _mask(kc_pass)}],
+        'extra_creds': kc_extra,
         'probes': kc_probes,
         'last_balance_error': kc_balance_err,
         'capital_subtotal_usdt': kc_capital_subtotal,

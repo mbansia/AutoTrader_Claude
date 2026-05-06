@@ -114,11 +114,13 @@
   <div class="body">
     <div class="muted" style="font-size:13px;line-height:1.6;">
       Single-pool framing means capital can (and eventually will) move between venues
-      automatically — the same way the bot already moves USDT between Binance spot ↔
-      futures wallets today. When KuCoin and IBKR gateways land, the rebalancer will
-      route capital toward whichever venue currently has the best risk-adjusted yield
-      (highest funding APY net of fees + transfer cost). For now the only active
-      rebalancing is intra-Binance (Spot ↔ Futures ↔ Earn), surfaced on the Configuration tab.
+      automatically — today the bot runs same-venue funding arbs only, on Binance
+      (Portfolio Margin with BFUSD as yield-bearing collateral) and KuCoin (classic
+      isolated wallets with funding-wallet auto-lend). When the cross-venue and
+      onchain orchestrators land, the router will allocate toward whichever venue
+      currently has the best risk-adjusted yield (funding APY net of fees + transfer
+      cost). The trade-type taxonomy (per-position tags on the Dashboard) is the
+      seam where new venue combinations slot in.
     </div>
   </div>
 </div>

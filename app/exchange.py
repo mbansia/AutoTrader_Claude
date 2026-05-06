@@ -550,6 +550,15 @@ class VenueGateway:
         Default returns ``[]`` — venues without history simply ingest nothing."""
         return []
 
+    def account_type(self) -> tuple[str, str]:
+        """Read the account type live from the venue's API. Returns
+        ``(label, detail)`` where ``label`` is the human-readable name
+        (e.g. "Portfolio Margin", "Classic", "UTA") and ``detail`` is a
+        short raw string from the API (e.g. account-mode field) for the
+        operator to verify against the venue's own UI. Default returns
+        ``('Unknown', 'no probe wired')`` — venue subclasses override."""
+        return 'Unknown', 'no probe wired'
+
 
 # ─── Binance gateway ────────────────────────────────────────────────────────
 # Implements the full surface — Earn, universal-transfer, deposit /
@@ -996,6 +1005,20 @@ class BinanceGateway(VenueGateway):
             raw_amt = float(t.get('amount') or 0)
             from_a = (t.get('fromAccount') or '').lower()
             to_a = (t.get('toAccount') or '').lower()
+            # Filter out intra-account moves — these are the bot's own
+            # spot↔futures shuttle, NOT capital flowing in/out of the
+            # account. The user's $30 deposit was master→sub via
+            # /sapi/v1/sub-account/sub/transfer/history (separate
+            # endpoint), so anything here that's intra-account is just
+            # noise polluting Net Injected Capital.
+            INTRA_ACCOUNT = {
+                'spot', 'main', 'funding', 'mining', 'margin',
+                'cross_margin', 'isolated_margin', 'isolatedmargin', 'crossmargin',
+                'linear', 'inverse', 'swap', 'umfuture', 'cmfuture',
+                'pm', 'portfolio_margin', 'portfoliomargin',
+            }
+            if from_a in INTRA_ACCOUNT and to_a in INTRA_ACCOUNT:
+                continue
             # Direction inference using fromAccount/toAccount labels.
             signed = raw_amt
             if 'sub' in from_a and 'main' in to_a:
@@ -1041,6 +1064,39 @@ class BinanceGateway(VenueGateway):
             if callable(fn):
                 return fn
         return None
+
+    def account_type(self) -> tuple[str, str]:
+        """Read Binance's account type live. Calls /papi/v1/account first
+        (only succeeds on PM accounts) — if that returns 200, account is
+        in Portfolio Margin. Falls back to /sapi/v1/account/apiTradingStatus
+        which works on Classic too. Returns (label, detail) for /monitoring."""
+        fn = self._papi(self.spot, ('papiGetAccount', 'papi_get_account'))
+        if fn is not None:
+            try:
+                resp = fn({})
+                if isinstance(resp, dict) and resp:
+                    detail = str(resp.get('accountType') or resp.get('actualEquity') or 'PM account')
+                    return 'Portfolio Margin', detail[:80]
+            except Exception as e:
+                msg = str(e).lower()
+                if '-2015' in msg or 'invalid api-key' in msg or 'permission' in msg:
+                    # PM endpoint refused — could be Classic OR a permissions
+                    # issue. Probe a Classic-only endpoint to disambiguate.
+                    pass
+                else:
+                    return 'Portfolio Margin (probe error)', str(e)[:80]
+        # Fall back to Classic detection: /sapi/v1/account/apiTradingStatus
+        # works on Classic accounts; -2015 here means the key really is bad.
+        try:
+            resp = self._call_sapi((
+                'sapiV1GetAccountApiTradingStatus',
+                'sapi_v1_get_account_api_trading_status',
+            ), {})
+            if resp:
+                return 'Classic', 'spot + futures separate (no PM)'
+        except Exception as e:
+            return 'Unknown', f'both probes failed: {str(e)[:80]}'
+        return 'Unknown', 'PM probe rejected, Classic probe returned nothing'
 
     def _fetch_balances_uncached(self) -> dict:
         """Read unified PM balance and synthesise the bot's classic three-
@@ -1370,6 +1426,32 @@ class KuCoinGateway(VenueGateway):
             'futures': self.futures.fetch_balance(),
         }
 
+    def account_type(self) -> tuple[str, str]:
+        """Read KuCoin's account mode live. Calls ccxt's ``is_uta_enabled``
+        (which queries /api/v3/uta/check) first; if UTA is on, also pulls
+        the account-mode detail via ``utaPrivateGetAccountMode``. Returns
+        ``(label, detail)`` for /monitoring so the operator can see what
+        the API actually reports rather than a hardcoded string."""
+        try:
+            uta = bool(self.spot.is_uta_enabled())
+        except Exception as e:
+            return 'Unknown', f'UTA probe failed: {str(e)[:80]}'
+        if uta:
+            mode_detail = 'UTA enabled'
+            fn = getattr(self.spot, 'utaPrivateGetAccountMode', None) or getattr(self.spot, 'utaprivateGetAccountMode', None)
+            if callable(fn):
+                try:
+                    resp = fn({})
+                    if isinstance(resp, dict):
+                        d = resp.get('data') or {}
+                        mode_str = d.get('mode') or d.get('accountMode') or ''
+                        if mode_str:
+                            mode_detail = f'UTA · {mode_str}'
+                except Exception:
+                    pass
+            return 'Unified Trading Account (UTA)', mode_detail
+        return 'Classic', 'isolated trade / contract / main wallets'
+
     def _main_wallet_usdt(self) -> tuple[float | None, str]:
         """Read the USDT balance of the ``main`` (Funding) wallet from the
         cached balance dict. Used by :meth:`earn_balance_usdt` since KuCoin's
@@ -1528,56 +1610,41 @@ class KuCoinGateway(VenueGateway):
         # on vintage; probe an ordered list and stop on the first one that
         # actually responds (success OR a real API error). If none exist, we
         # log a cause so /monitoring shows what to fix.
-        # Inter-account transfer audit. KuCoin reorganised this surface
-        # several times; ccxt's current build exposes ``privateGetTransferList``
-        # (the v1 unified transfer history) which surfaces master ↔ sub
-        # moves to a sub-account API key. We probe an ordered list and use
-        # the first that's actually a callable on the client.
-        sub_endpoint_used = None
-        for name in (
-            'privateGetTransferList',               # v1 transfer history (current ccxt)
-            'private_get_transfer_list',
-            'privateGetSubTransferRecord',          # legacy
-            'private_get_sub_transfer_record',
-            'privateGetAccountsSubTransfer',
-            'futuresPrivateGetSubTransferRecord',
-        ):
-            fn = getattr(self.spot, name, None)
-            if not callable(fn):
-                continue
-            sub_endpoint_used = name
-            try:
-                resp = fn({'currency': 'USDT', 'startAt': since_ms})
-                items = ((resp or {}).get('data') or {}).get('items') or []
-            except Exception as e:
-                self.last_history_errors['sub_transfer'] = f'{name}: {str(e)[:140]}'
-                items = []
-            for r in items:
-                # KuCoin transfer-list rows can carry either ``direction``
-                # ('in'/'out') or ``type`` ('IN'/'OUT'/'INNER'); try both.
-                direction = (r.get('direction') or r.get('type') or '').lower()
-                ts = _ms_to_dt(r.get('createdAt') or r.get('time'))
-                amt_raw = float(r.get('amount') or 0)
-                kind = 'sub_in' if direction == 'in' else ('sub_out' if direction == 'out' else 'transfer')
-                signed = amt_raw if direction == 'in' else (-abs(amt_raw) if direction == 'out' else amt_raw)
-                ext = str(r.get('id') or r.get('bizNo') or '') or _row_hash('kucoin', kind, ts, signed)
-                rows.append({'ts': ts, 'amount': signed, 'kind': kind, 'external_id': ext, 'note': f'KuCoin {sub_endpoint_used} ({direction or "inner"})'})
-            break
-        if sub_endpoint_used is None:
-            self.last_history_errors['sub_transfer'] = 'no sub-transfer endpoint exposed by this ccxt build'
+        # KuCoin's bespoke sub-transfer endpoints (privateGetTransferList,
+        # privateGetSubTransferRecord, etc.) are either missing or 404 in
+        # current ccxt builds. We rely on ccxt's unified fetch_transfers
+        # below, which queries the v3 universal-transfer log and surfaces
+        # master ↔ sub moves to a sub-account API key.
         # ccxt's unified fetch_transfers — KuCoin's universal-transfer log
-        # surfaces master ↔ sub moves and inner-account moves. Cheap
-        # fallback if the bespoke sub-transfer endpoints don't exist or
-        # were rejected by the API key.
+        # surfaces master ↔ sub moves and inner-account moves. We filter
+        # intra-account ones below so Net Injected Capital is clean.
         try:
             for t in (self.spot.fetch_transfers('USDT', since=since_ms) or []):
                 ts = _ms_to_dt(t.get('timestamp'))
                 raw_amt = float(t.get('amount') or 0)
                 from_a = (t.get('fromAccount') or '').lower()
                 to_a = (t.get('toAccount') or '').lower()
-                # KuCoin labels: 'main' / 'trade' / 'contract' / 'sub'.
-                # A row whose toAccount is on this account = inflow.
-                signed = abs(raw_amt) if 'sub' not in to_a else -abs(raw_amt)
+                # Filter intra-account transfers — these are bot-driven
+                # moves between trade / main / contract on the same KuCoin
+                # account, not capital flowing in/out.
+                INTRA_KC = {'main', 'trade', 'contract', 'margin', 'isolated', 'pool', 'mining', 'unified'}
+                if from_a in INTRA_KC and to_a in INTRA_KC:
+                    continue
+                # KuCoin's master-sub flag rides on transferType / type
+                # rather than from/to labels — fetch the type field for the
+                # direction inference. 'IN' is master→this-sub, 'OUT' is
+                # this-sub→master.
+                direction = (t.get('type') or '').upper()
+                if direction == 'IN':
+                    signed = abs(raw_amt)
+                elif direction == 'OUT':
+                    signed = -abs(raw_amt)
+                else:
+                    # Fall back: anything with 'sub' on either side that
+                    # isn't intra-account — assume inflow if toAccount is
+                    # the current account (no 'sub' label), outflow if
+                    # toAccount is a sub.
+                    signed = -abs(raw_amt) if 'sub' in to_a else abs(raw_amt)
                 ext = str(t.get('id') or '') or _row_hash('kucoin', 'transfer', ts, signed)
                 rows.append({'ts': ts, 'amount': signed, 'kind': 'transfer', 'external_id': ext, 'note': f'Universal transfer {from_a}→{to_a}'})
         except Exception as e:

@@ -143,3 +143,18 @@ def run_schema_migrations() -> None:
             # only live data from the venue). Wipe any leftover manual rows
             # so net-injected-capital and XIRR reflect API truth only.
             conn.execute(text("DELETE FROM capital_flows WHERE detected_by = 'manual'"))
+            # One-shot cleanup: earlier ingest of Binance universal-transfer
+            # history kept *intra-account* moves (spot↔futures, margin↔spot,
+            # etc.) — those are the bot's own pre-PM shuttle, not capital
+            # flowing in/out of the account. The notes carry the "Universal
+            # transfer X→Y" label; purge any auto rows whose note matches an
+            # intra-account direction so Net Injected Capital is clean.
+            for direction in (
+                'spot→linear', 'linear→spot', 'spot→inverse', 'inverse→spot',
+                'spot→margin', 'margin→spot', 'spot→funding', 'funding→spot',
+                'main→linear', 'linear→main', 'main→margin', 'margin→main',
+                'main→funding', 'funding→main', 'main→spot', 'spot→main',
+                'spot→swap', 'swap→spot', 'umfuture→spot', 'spot→umfuture',
+                'cmfuture→spot', 'spot→cmfuture',
+            ):
+                conn.execute(text(f"DELETE FROM capital_flows WHERE detected_by = 'auto' AND note LIKE '%{direction}%'"))
