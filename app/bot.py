@@ -48,6 +48,7 @@ from sqlalchemy import func, select
 
 from app.config import settings
 from app.db import SessionLocal
+from app.events import bus
 from app.exchange import BINANCE_ERR_NO_EARN_POSITION, VenueGateway, _interval_hours, annualize_rate, make_gateways
 from app.finance import position_realized_pnl, position_unrealized_pnl, total_realized_pnl
 from app.models import (
@@ -111,6 +112,43 @@ def get_mode_state(db, mode: str) -> ModeState:
         db.add(state)
         db.flush()
     return state
+
+
+def _earn_sweep_for_venue(mode: str, exchange: str, **_ignored) -> None:
+    """Event handler: try an earn-sweep on (mode, exchange) right now.
+    Subscribed to ``position_closed`` and ``deposit_detected`` so freed-up
+    or newly-arrived cash flows to earn without waiting for the next
+    cycle. Respects the gateway's per-asset cooldown (use the dashboard
+    "Sweep now" button to bypass that).
+
+    Side-effect-only — opens its own DB session and gateway, doesn't
+    return anything. Safe to call from any thread because the gateway
+    instances we make here are throwaway."""
+    if mode != MODE_LIVE:
+        return
+    gateways = make_gateways()
+    target = next((g for g in gateways if g.venue_id == exchange), None)
+    if target is None:
+        return
+    with SessionLocal() as db:
+        cfg = get_strategy_config(db)
+        if not cfg.earn_enabled:
+            return
+        bals = target.safe_balances(force_refresh=True) or {}
+        spot_free = float((bals.get('spot', {}).get('USDT') or {}).get('free') or 0)
+        if spot_free <= cfg.earn_idle_threshold_usdt:
+            return
+        amount = max(0.0, spot_free - 0.10)
+        ok, err = target.earn_subscribe(amount, paper_mode=False)
+        if ok:
+            log_event(db, f'Event-driven sweep: {amount:.2f} USDT spot → earn', mode=mode, exchange=exchange)
+        else:
+            log_event(db, f'Event-driven sweep blocked: {amount:.2f} USDT — {err}', mode=mode, level='WARN', exchange=exchange)
+        db.commit()
+
+
+bus.subscribe('position_closed', _earn_sweep_for_venue)
+bus.subscribe('deposit_detected', _earn_sweep_for_venue)
 
 
 def get_earn_state(db, mode: str, exchange: str = 'binance') -> EarnState:
@@ -485,7 +523,11 @@ def _force_close_both(db, gateway: VenueGateway, p: Position, cfg: StrategyConfi
         p.last_close_error = ''
         _CLOSE_ERROR_CACHE.pop((p.id, 'spot'), None)
         _CLOSE_ERROR_CACHE.pop((p.id, 'perp'), None)
-        log_event(db, f'Closed {p.perp_symbol} ({reason}); realized={position_realized_pnl(db, p):+.4f}', mode=p.mode, exchange=p.exchange)
+        realized = position_realized_pnl(db, p)
+        log_event(db, f'Closed {p.perp_symbol} ({reason}); realized={realized:+.4f}', mode=p.mode, exchange=p.exchange)
+        bus.emit('position_closed',
+                 position_id=p.id, mode=p.mode, exchange=p.exchange,
+                 symbol=p.symbol, realized_usdt=realized)
 
 
 def _close_naked_leg(db, gateway: VenueGateway, p: Position, cfg: StrategyConfig, surviving_leg: str | None, reason: str) -> None:
@@ -687,6 +729,14 @@ def _ingest_api_capital_flows(db, gateway: VenueGateway, mode: str, lookback_day
         ))
         seen_ids.add(ext)
         inserted += 1
+        # Fire one event per inflow so subscribers (earn-sweep) can route
+        # the new cash without waiting for the next cycle. Outflows
+        # don't trigger anything — the wallet is already short by the
+        # withdrawal amount; nothing to sweep.
+        if r['amount'] > 0:
+            bus.emit('deposit_detected',
+                     mode=mode, exchange=gateway.venue_id,
+                     amount_usdt=r['amount'], kind=r.get('kind') or 'deposit', ts=r['ts'])
     if inserted:
         db.flush()
     summary = ', '.join(f'{k}={v}' for k, v in counts.items()) or 'no rows returned by any endpoint'
@@ -1041,6 +1091,10 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         held_bases.add(base)
                         scan_action = f'opened {c.perp_symbol}'
                         log_event(db, f'Opened {c.perp_symbol} qty={qty:.6f} funding_apy={c.funding_apr:.2%} earn_apr={c.spot_earn_apr:.2%} combined={c.combined_apy:.2%} depth=${c.min_depth_usdt:.0f}', mode=mode, exchange=gateway.venue_id)
+                        bus.emit('position_opened',
+                                 position_id=pos.id, mode=mode, exchange=gateway.venue_id,
+                                 symbol=c.spot_symbol, quantity=qty,
+                                 notional=qty * pos.spot_entry_price)
                         break
             else:
                 if not mstate.entry_enabled:
