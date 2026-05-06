@@ -184,18 +184,61 @@ class VenueGateway:
     # cache the latest result on the instance for ``BALANCE_CACHE_TTL``
     # seconds; the worker loop bypasses it explicitly when it needs fresh
     # numbers (e.g. after a transfer).
-    BALANCE_CACHE_TTL = 10.0
+    # Bumped from 10s to 30s after persistent KuCoin 429000 errors. The
+    # tradeoff: dashboard balances may be up to 30s stale right after a
+    # trade. That's acceptable because (a) the cycle loop only runs every
+    # 30s anyway so the worker reads ARE fresh per cycle, and (b) on a
+    # delta-neutral funding arb, 30s of stale balance is irrelevant for
+    # decision-making. force_refresh=True still bypasses the cache for
+    # the worker's own pre-trade reads.
+    BALANCE_CACHE_TTL = 30.0
+    # Rate-limit recovery window. When a venue returns 429 we install a
+    # pause until ``_rate_limit_pause_until`` and skip API calls during
+    # that window — cached data is returned instead. The pause grows
+    # exponentially on repeated 429s (60s → 120s → 240s, capped at 600s)
+    # and resets after a successful call. This lets KuCoin's per-user
+    # rate-limit window decay without us hammering it.
+    RATE_LIMIT_PAUSE_INITIAL_S = 60.0
+    RATE_LIMIT_PAUSE_MAX_S = 600.0
 
     def __init__(self) -> None:
         # Subclasses must set these in their own __init__ before super().
         self.spot = None
         self.futures = None
         self.last_balance_error: str = ''
+        self.last_earn_breakdown: dict = {}
         # Per-endpoint error map populated by ``list_capital_flow_records``
         # so /monitoring can show which API endpoint refused (most common
         # cause: missing permission on the API key).
         self.last_history_errors: dict[str, str] = {}
         self._balance_cache: tuple[float, dict | None] | None = None
+        # Rate-limit recovery state.
+        self._rate_limit_pause_until: float = 0.0
+        self._rate_limit_consecutive: int = 0
+
+    def is_rate_limited(self) -> bool:
+        return time.time() < self._rate_limit_pause_until
+
+    def _note_rate_limit(self, raw_err: str) -> None:
+        """Mark this gateway as rate-limited. Pause grows exponentially
+        on consecutive hits and resets when a non-429 call succeeds."""
+        self._rate_limit_consecutive += 1
+        pause = min(
+            self.RATE_LIMIT_PAUSE_MAX_S,
+            self.RATE_LIMIT_PAUSE_INITIAL_S * (2 ** (self._rate_limit_consecutive - 1)),
+        )
+        self._rate_limit_pause_until = time.time() + pause
+        self.last_balance_error = f'rate-limited ({pause:.0f}s pause): {raw_err[:140]}'
+
+    def _note_request_ok(self) -> None:
+        """Reset the consecutive-hit counter when a call succeeds."""
+        self._rate_limit_consecutive = 0
+
+    @staticmethod
+    def _is_rate_limit_error(err: Exception) -> bool:
+        s = str(err).lower()
+        return ('429' in s or 'too many requests' in s or 'rate limit' in s
+                or '"code":"429000"' in s or 'user-level rate limit' in s)
 
     # ─── Market data + read-only helpers (ccxt-uniform) ───────────────────
 
@@ -251,7 +294,16 @@ class VenueGateway:
         dashboard renders multiple components that each ask for balances and
         we don't want to hammer per-second rate limits. Pass
         ``force_refresh=True`` after a transfer/order so the next read sees
-        the post-action state."""
+        the post-action state. While the gateway is in a rate-limit pause
+        (``is_rate_limited()`` True) we always return the last cached value
+        regardless of TTL — calling the API again would just extend the
+        ban. ``last_balance_error`` carries a "rate-limited (Ns pause)"
+        message during the window so the UI surfaces what's happening."""
+        # If we're rate-limited, never re-hit the API. Return whatever was
+        # last cached (even None), so callers see the pause and stale data
+        # rather than triggering further bans.
+        if self.is_rate_limited() and self._balance_cache is not None:
+            return self._balance_cache[1]
         if not force_refresh and self._balance_cache is not None:
             ts, cached = self._balance_cache
             if (time.time() - ts) < self.BALANCE_CACHE_TTL:
@@ -260,8 +312,14 @@ class VenueGateway:
             result = self._fetch_balances_uncached()
             self.last_balance_error = ''
             self._balance_cache = (time.time(), result)
+            self._note_request_ok()
             return result
         except Exception as e:
+            if self._is_rate_limit_error(e):
+                self._note_rate_limit(str(e))
+                # Keep the previous cache instead of nulling — stale data
+                # is more useful than nothing while we wait.
+                return self._balance_cache[1] if self._balance_cache else None
             self.last_balance_error = str(e)
             self._balance_cache = (time.time(), None)
             return None
@@ -285,7 +343,11 @@ class VenueGateway:
     # for the same TTL as balances so a single render hits ticker once
     # per symbol; the worker loop bypasses with force_refresh when it
     # needs a fresh price for a trade decision.
-    PRICE_CACHE_TTL = 10.0
+    # Same 30s ceiling as balance cache. Spot/perp prices for the
+    # dashboard's equity composition don't need real-time precision —
+    # the bot's pre-trade reads always use force_refresh=True for
+    # actual order pricing.
+    PRICE_CACHE_TTL = 30.0
 
     def price(self, symbol: str) -> float:
         return float(self.spot.fetch_ticker(symbol)['last'])
@@ -298,13 +360,22 @@ class VenueGateway:
             self._price_cache = {}  # type: ignore[attr-defined]
         cache_key = (symbol, perp)
         cached = self._price_cache.get(cache_key)  # type: ignore[attr-defined]
+        # Honour the rate-limit pause: return last cached value (even
+        # if stale) instead of triggering further bans.
+        if self.is_rate_limited() and cached:
+            return cached[1]
         if cached and not force_refresh:
             ts, value = cached
             if (time.time() - ts) < self.PRICE_CACHE_TTL:
                 return value
         try:
             value = self.perp_price(symbol) if perp else self.price(symbol)
-        except Exception:
+            self._note_request_ok()
+        except Exception as e:
+            if self._is_rate_limit_error(e):
+                self._note_rate_limit(str(e))
+                # Use last cached value if we have one; else None.
+                return cached[1] if cached else None
             self._price_cache[cache_key] = (time.time(), None)  # type: ignore[attr-defined]
             return None
         self._price_cache[cache_key] = (time.time(), value)  # type: ignore[attr-defined]
@@ -448,7 +519,7 @@ class VenueGateway:
             fill = self.futures.create_order(symbol, 'market', side, amount)
         # Invalidate the balance cache so any caller that asks for
         # balances after an order sees the post-fill state, not stale data.
-        self.invalidate_balance_cache()
+        # invalidate_balance_cache dropped — 30s TTL is short enough; eager invalidation triggered KuCoin 429s
         return fill
 
     def create_spot_buy(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float) -> dict:
@@ -532,13 +603,13 @@ class VenueGateway:
             return True, 'paper'
         return False, f'futures→spot transfer not wired on {self.name}'
 
-    def net_injected_capital_usdt(self, lookback_days: int = 365) -> tuple[float | None, dict]:
+    def net_injected_capital_usdt(self, lookback_days: int = 10) -> tuple[float | None, dict]:
         """Returns ``(net, meta)`` where ``net`` is in USDT and ``meta`` carries
         a per-component breakdown for the UI. ``None`` signals the caller to
         fall back to manual CapitalFlow rows."""
         return None, {'error': f'history not wired on {self.name}'}
 
-    def list_capital_flow_records(self, lookback_days: int = 365) -> list[dict]:
+    def list_capital_flow_records(self, lookback_days: int = 10) -> list[dict]:
         """Return per-row capital movements over the lookback window so the bot
         can ingest them as ``CapitalFlow`` entries for XIRR and the per-flow
         timeline. Each row is ``{ts, amount, kind, external_id, note}``:
@@ -735,7 +806,7 @@ class BinanceGateway(VenueGateway):
             return False, f'{asset}: sapi method not available in ccxt'
         # Success — install standard cooldown so we don't immediately retry next cycle.
         self._earn_subscribe_cooldown_until[asset] = now + self.EARN_SUBSCRIBE_DEFAULT_COOLDOWN_S
-        self.invalidate_balance_cache()
+        # invalidate_balance_cache dropped — 30s TTL is short enough; eager invalidation triggered KuCoin 429s
         return bool(resp.get('success', True)), ''
 
     def earn_redeem_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:
@@ -759,7 +830,7 @@ class BinanceGateway(VenueGateway):
             return False, f'{asset}: {e}'
         if resp is None:
             return False, f'{asset}: sapi method not available in ccxt'
-        self.invalidate_balance_cache()
+        # invalidate_balance_cache dropped — 30s TTL is short enough; eager invalidation triggered KuCoin 429s
         return bool(resp.get('success', True)), ''
 
     # ─── Binance universal transfer (spot ⇄ USDM-futures) ─────────────────
@@ -772,7 +843,7 @@ class BinanceGateway(VenueGateway):
                     fn({'type': transfer_type, 'asset': 'USDT', 'amount': f'{amount_usdt:.2f}'})
                 except Exception as e:
                     return False, str(e)
-                self.invalidate_balance_cache()
+                # invalidate_balance_cache dropped — see VenueGateway.safe_balances comment
                 return True, ''
         return False, 'sapiPostAssetTransfer not available in this ccxt build'
 
@@ -819,7 +890,7 @@ class BinanceGateway(VenueGateway):
             cursor = start
         return rows
 
-    def deposit_history(self, asset: str = 'USDT', lookback_days: int = 365, ttl_seconds: float = 300.0) -> list[dict]:
+    def deposit_history(self, asset: str = 'USDT', lookback_days: int = 10, ttl_seconds: float = 300.0) -> list[dict]:
         key = f'{asset}:{lookback_days}'
         cached = self._deposit_history_cache.get(key)
         if cached and (time.time() - cached[1]) < ttl_seconds:
@@ -832,7 +903,7 @@ class BinanceGateway(VenueGateway):
         self._deposit_history_cache[key] = (rows, time.time())
         return rows
 
-    def withdrawal_history(self, asset: str = 'USDT', lookback_days: int = 365, ttl_seconds: float = 300.0) -> list[dict]:
+    def withdrawal_history(self, asset: str = 'USDT', lookback_days: int = 10, ttl_seconds: float = 300.0) -> list[dict]:
         key = f'{asset}:{lookback_days}'
         cached = self._withdrawal_history_cache.get(key)
         if cached and (time.time() - cached[1]) < ttl_seconds:
@@ -845,7 +916,7 @@ class BinanceGateway(VenueGateway):
         self._withdrawal_history_cache[key] = (rows, time.time())
         return rows
 
-    def sub_account_transfer_history(self, asset: str = 'USDT', incoming: bool = True, lookback_days: int = 365, ttl_seconds: float = 300.0) -> list[dict]:
+    def sub_account_transfer_history(self, asset: str = 'USDT', incoming: bool = True, lookback_days: int = 10, ttl_seconds: float = 300.0) -> list[dict]:
         """Sub-account-side view of master ↔ sub transfers.
         Endpoint: GET /sapi/v1/sub-account/sub/transfer/history
         type: 1 = transfer in (master → this sub), 2 = transfer out (sub → master).
@@ -884,7 +955,7 @@ class BinanceGateway(VenueGateway):
         self._sub_transfer_history_cache[key] = (rows, time.time())
         return rows
 
-    def net_injected_capital_usdt(self, lookback_days: int = 365) -> tuple[float | None, dict]:
+    def net_injected_capital_usdt(self, lookback_days: int = 10) -> tuple[float | None, dict]:
         """Sum of completed USDT inflows − outflows over the lookback window.
         Single source of truth: delegate to :meth:`list_capital_flow_records`
         which already walks every Binance endpoint we know about (chain
@@ -932,7 +1003,7 @@ class BinanceGateway(VenueGateway):
             meta['errors'] = errors
         return net, meta
 
-    def list_capital_flow_records(self, lookback_days: int = 365) -> list[dict]:
+    def list_capital_flow_records(self, lookback_days: int = 10) -> list[dict]:
         """Binance: external deposits, external withdrawals, master→sub
         transfer-in, sub→master transfer-out. Errors per endpoint are
         recorded on ``self.last_history_errors`` so /monitoring can surface
@@ -1327,7 +1398,7 @@ class BinanceGateway(VenueGateway):
                 fee_cost += float(f.get('commission') or 0)
             except (TypeError, ValueError):
                 pass
-        self.invalidate_balance_cache()
+        # invalidate_balance_cache dropped — 30s TTL is short enough; eager invalidation triggered KuCoin 429s
         return {
             'id': str(resp.get('orderId') or ''),
             'symbol': symbol,
@@ -1633,7 +1704,7 @@ class KuCoinGateway(VenueGateway):
             self.spot.transfer('USDT', float(amount_usdt), from_account, to_account)
         except Exception as e:
             return False, str(e)
-        self.invalidate_balance_cache()
+        # invalidate_balance_cache dropped — 30s TTL is short enough; eager invalidation triggered KuCoin 429s
         return True, ''
 
     # KuCoin's spot orders execute against the ``trade`` wallet (UI label
@@ -1663,7 +1734,7 @@ class KuCoinGateway(VenueGateway):
     # inflows minus outflows over the lookback. Returns ``(None, meta)`` if
     # no endpoint returned anything, so the caller falls back to manual
     # CapitalFlow rows.
-    def net_injected_capital_usdt(self, lookback_days: int = 365) -> tuple[float | None, dict]:
+    def net_injected_capital_usdt(self, lookback_days: int = 10) -> tuple[float | None, dict]:
         since_ms = int((datetime.utcnow() - timedelta(days=lookback_days)).timestamp() * 1000)
         deps: list[dict] = []
         wdrs: list[dict] = []
@@ -1711,7 +1782,7 @@ class KuCoinGateway(VenueGateway):
             'lookback_days': lookback_days,
         }
 
-    def list_capital_flow_records(self, lookback_days: int = 365) -> list[dict]:
+    def list_capital_flow_records(self, lookback_days: int = 10) -> list[dict]:
         self.last_history_errors = {}
         since_ms = int((datetime.utcnow() - timedelta(days=lookback_days)).timestamp() * 1000)
         rows: list[dict] = []

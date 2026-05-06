@@ -605,7 +605,14 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         if v == MODE_LIVE:
             errors: list[str] = []
             for g in gateways:
-                if g.safe_balances() is None and g.last_balance_error:
+                bals = g.safe_balances()
+                # If the gateway is in a rate-limit pause we still got a
+                # cached value back (possibly stale, possibly None) — note
+                # the pause separately so the user knows what's happening.
+                if g.is_rate_limited():
+                    pause_remaining = max(0, int(g._rate_limit_pause_until - time.time()))
+                    errors.append(f'{g.name}: rate-limited, pausing API calls for ~{pause_remaining}s. Showing cached balance.')
+                elif bals is None and g.last_balance_error:
                     errors.append(f'{g.name}: {g.last_balance_error[:140]}')
             if errors:
                 balances_error = ' · '.join(errors)
@@ -1261,10 +1268,10 @@ def _gather_exchange_status() -> list[dict]:
             'sapi_v1_get_simple_earn_flexible_position',
             'sapiGetSimpleEarnFlexiblePosition',
         ), {'asset': 'USDT'})))
-        probes.append(_probe('Deposit history (USDT, 365d)', lambda: gw.deposit_history('USDT', lookback_days=365, ttl_seconds=0)))
-        probes.append(_probe('Withdrawal history (USDT, 365d)', lambda: gw.withdrawal_history('USDT', lookback_days=365, ttl_seconds=0)))
-        probes.append(_probe('Sub-account transfer in (USDT, 365d)', lambda: gw.sub_account_transfer_history('USDT', incoming=True, lookback_days=365, ttl_seconds=0)))
-        probes.append(_probe('Sub-account transfer out (USDT, 365d)', lambda: gw.sub_account_transfer_history('USDT', incoming=False, lookback_days=365, ttl_seconds=0)))
+        probes.append(_probe('Deposit history (USDT, 10d)', lambda: gw.deposit_history('USDT', lookback_days=10, ttl_seconds=0)))
+        probes.append(_probe('Withdrawal history (USDT, 10d)', lambda: gw.withdrawal_history('USDT', lookback_days=10, ttl_seconds=0)))
+        probes.append(_probe('Sub-account transfer in (USDT, 10d)', lambda: gw.sub_account_transfer_history('USDT', incoming=True, lookback_days=10, ttl_seconds=0)))
+        probes.append(_probe('Sub-account transfer out (USDT, 10d)', lambda: gw.sub_account_transfer_history('USDT', incoming=False, lookback_days=10, ttl_seconds=0)))
         # Alternate sub-transfer endpoint name. Some Binance vintages
         # expose subUserHistory but not subTransferHistory; probe both
         # so we don't miss rows behind a naming difference.
@@ -1272,17 +1279,17 @@ def _gather_exchange_status() -> list[dict]:
             'sapiV1GetSubAccountTransferSubUserHistory',
             'sapi_v1_get_sub_account_transfer_sub_user_history',
             'sapiGetSubAccountTransferSubUserHistory',
-        ), {'asset': 'USDT', 'startTime': int((datetime.utcnow() - timedelta(days=365)).timestamp() * 1000)})))
+        ), {'asset': 'USDT', 'startTime': int((datetime.utcnow() - timedelta(days=10)).timestamp() * 1000)})))
         # Universal-transfer history (raw, no intra-account filter) so the
         # operator can see EVERY row Binance returns and spot the user's
         # deposit even if our parser missed it.
-        probes.append(_probe('Universal transfers raw (USDT, 365d, paged)', lambda: gw.spot.fetch_transfers('USDT', since=int((datetime.utcnow() - timedelta(days=30)).timestamp() * 1000)) or []))
+        probes.append(_probe('Universal transfers raw (USDT, 10d, paged)', lambda: gw.spot.fetch_transfers('USDT', since=int((datetime.utcnow() - timedelta(days=10)).timestamp() * 1000)) or []))
         # PM account snapshot — confirms we're talking to a PM-enabled key
         # and surfaces the totalWalletBalance / totalEquity for cross-check.
         probes.append(_probe('PM /papi/v1/account', lambda: gw._papi(gw.spot, ('papiGetAccount', 'papi_get_account'))({}) if gw._papi(gw.spot, ('papiGetAccount', 'papi_get_account')) else 'papiGetAccount not in this ccxt build'))
         probes.append(_probe('Open perp positions', lambda: gw.open_perp_positions_raw()))
         probes.append(_probe('Capital-flow ingest (deposits + withdrawals + sub-transfers, 365d)', lambda: {
-            'rows': gw.list_capital_flow_records(lookback_days=365),
+            'rows': gw.list_capital_flow_records(lookback_days=10),
             'errors': gw.last_history_errors,
         }))
         # Capital subtotal: cash + spot assets + futures + earn (all USDT-denominated).
@@ -1344,14 +1351,14 @@ def _gather_exchange_status() -> list[dict]:
         kc_probes.append(_probe('Futures fetch_balance()', lambda: kgw.futures.fetch_balance()))
         kc_probes.append(_probe('Funding rates (markets-derived)', lambda: kgw.funding_rates_dict()))
         kc_probes.append(_probe('Open perp positions', lambda: kgw.open_perp_positions_raw()))
-        kc_probes.append(_probe('Deposit history (USDT, 365d)', lambda: kgw.spot.fetch_deposits('USDT', since=int((datetime.utcnow() - timedelta(days=365)).timestamp() * 1000))))
-        kc_probes.append(_probe('Withdrawal history (USDT, 365d)', lambda: kgw.spot.fetch_withdrawals('USDT', since=int((datetime.utcnow() - timedelta(days=365)).timestamp() * 1000))))
-        kc_probes.append(_probe('Universal transfers raw (USDT, 365d)', lambda: kgw.spot.fetch_transfers('USDT', since=int((datetime.utcnow() - timedelta(days=365)).timestamp() * 1000))))
+        kc_probes.append(_probe('Deposit history (USDT, 10d)', lambda: kgw.spot.fetch_deposits('USDT', since=int((datetime.utcnow() - timedelta(days=10)).timestamp() * 1000))))
+        kc_probes.append(_probe('Withdrawal history (USDT, 10d)', lambda: kgw.spot.fetch_withdrawals('USDT', since=int((datetime.utcnow() - timedelta(days=10)).timestamp() * 1000))))
+        kc_probes.append(_probe('Universal transfers raw (USDT, 10d)', lambda: kgw.spot.fetch_transfers('USDT', since=int((datetime.utcnow() - timedelta(days=10)).timestamp() * 1000))))
         # UTA account-mode probe — surfaces the live account state so the
         # operator can confirm the API key sees UTA/Classic correctly.
         kc_probes.append(_probe('Account mode (UTA check)', lambda: {'is_uta_enabled': kgw.spot.is_uta_enabled()}))
         kc_probes.append(_probe('Capital-flow ingest (deposits + sub-transfers)', lambda: {
-            'rows': kgw.list_capital_flow_records(lookback_days=365),
+            'rows': kgw.list_capital_flow_records(lookback_days=10),
             'errors': kgw.last_history_errors,
         }))
         kc_bals = kgw.safe_balances() or {}

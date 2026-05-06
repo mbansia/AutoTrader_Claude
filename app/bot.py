@@ -690,7 +690,7 @@ def _maybe_ingest_capital_flows(db, gateway: VenueGateway, mode: str) -> int:
     return inserted
 
 
-def _ingest_api_capital_flows(db, gateway: VenueGateway, mode: str, lookback_days: int = 365) -> int:
+def _ingest_api_capital_flows(db, gateway: VenueGateway, mode: str, lookback_days: int = 10) -> int:
     """Pull the venue's deposit / withdrawal / sub-transfer history and
     persist any rows we haven't seen before as ``CapitalFlow`` records. The
     natural key is ``(exchange, external_id)``; rows with that pair already
