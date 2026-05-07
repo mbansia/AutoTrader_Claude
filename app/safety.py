@@ -54,6 +54,12 @@ def check_hedge(gateway: BinanceGateway, position: Position) -> tuple[bool, str,
     Returns (is_hedged, reason, surviving_leg) where surviving_leg ∈ {'spot', 'perp', None}.
     surviving_leg is the leg that *is* still present when the other has gone naked, so the
     caller knows which side to close to flatten the exposure.
+
+    Tolerance: a leg is considered "present" if its actual quantity is
+    within HEDGE_TOLERANCE (5%) of expected. We also treat sub-LOT_SIZE
+    dust as "absent" — a balance below the venue's market_min_amount
+    can't be sold, so the leg is functionally gone even if the venue's
+    balance API reports a non-zero number.
     """
     raw = gateway.open_perp_positions_raw()
     perp_amt = 0.0
@@ -62,7 +68,9 @@ def check_hedge(gateway: BinanceGateway, position: Position) -> tuple[bool, str,
             perp_amt = abs(float(r.get('contracts') or r.get('info', {}).get('positionAmt') or 0))
             break
     expected = position.quantity
-    perp_present = perp_amt >= expected * (1 - HEDGE_TOLERANCE)
+    spot_min = gateway.market_min_amount(position.spot_symbol, perp=False)
+    perp_min = gateway.market_min_amount(position.perp_symbol, perp=True)
+    perp_present = (perp_amt >= expected * (1 - HEDGE_TOLERANCE)) and (perp_amt >= perp_min)
 
     bals = gateway.safe_balances()
     if bals is None:
@@ -70,7 +78,7 @@ def check_hedge(gateway: BinanceGateway, position: Position) -> tuple[bool, str,
     base = position.spot_symbol.split('/')[0]
     spot_balance = bals.get('spot', {}).get(base) or {}
     spot_total = float(spot_balance.get('total') or 0)
-    spot_present = spot_total >= expected * (1 - HEDGE_TOLERANCE)
+    spot_present = (spot_total >= expected * (1 - HEDGE_TOLERANCE)) and (spot_total >= spot_min)
 
     if perp_present and spot_present:
         return True, 'ok', None

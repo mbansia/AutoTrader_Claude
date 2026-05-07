@@ -224,9 +224,21 @@ def _accrue_paper_funding(db, gateway, mode: str) -> None:
         period_seconds = interval_h * 3600.0
         if period_seconds <= 0:
             continue
-        # Linear accrual within a period — the per-second slice of one funding payment.
-        # Notional reference: spot_entry × qty (close enough; real funding is on mark price × qty).
-        notional = p.spot_entry_price * p.quantity
+        # Linear accrual within a period — the per-second slice of one
+        # funding payment. Real Binance funding is computed on the
+        # mark price × qty, not the entry price; using entry-price
+        # diverges from live by 5%+ over weeks of accrual on a position
+        # whose mark drifts. We pull current mark via gateway's price
+        # cache (already 30s-cached, no extra API calls in steady state).
+        try:
+            from app.exchange import make_gateways
+            _gws = make_gateways()
+            _gw = next((g for g in _gws if g.venue_id == p.exchange), None)
+            mark_px = _gw.safe_price(p.perp_symbol, perp=True) if _gw else None
+            ref_px = float(mark_px) if mark_px else float(p.spot_entry_price or 0)
+        except Exception:
+            ref_px = float(p.spot_entry_price or 0)
+        notional = ref_px * p.quantity
         income = notional * p.last_funding_rate * (elapsed_seconds / period_seconds)
         p.funding_income_accrued += income
         p.last_funding_accrual_ts = now
@@ -710,7 +722,7 @@ def _maybe_ingest_capital_flows(db, gateway: VenueGateway, mode: str) -> int:
     return inserted
 
 
-def _ingest_api_capital_flows(db, gateway: VenueGateway, mode: str, lookback_days: int = 10) -> int:
+def _ingest_api_capital_flows(db, gateway: VenueGateway, mode: str, lookback_days: int = 30) -> int:
     """Pull the venue's deposit / withdrawal / sub-transfer history and
     persist any rows we haven't seen before as ``CapitalFlow`` records. The
     natural key is ``(exchange, external_id)``; rows with that pair already

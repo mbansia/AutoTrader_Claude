@@ -121,7 +121,15 @@
         </ul>
       </details>
       {% endif %}
-      {% if earn.last_error %}<span class="bad" title="{{ earn.last_error }}" style="font-size:11px;">{{ earn.last_error|truncate(60) }}</span>{% endif %}
+      {% if earn.last_error %}
+      <details class="kpi-details" style="margin-top:2px;">
+        <summary class="bad" style="font-size:11px;">⚠ {{ earn.last_error|truncate(80) }}</summary>
+        <pre style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:8px;margin-top:4px;overflow-x:auto;font-size:10px;line-height:1.4;white-space:pre-wrap;word-break:break-all;">{{ earn.last_error }}</pre>
+        {% if '-21015' in earn.last_error %}
+        <span class="muted" style="font-size:10px;">Binance code -21015 typically means the BFUSD mint endpoint isn't enabled on this account / sub-account, or the mint amount is below the minimum (~$10). Check Binance UI → Portfolio Margin → BFUSD page → "Mint" button to verify the product is active for your sub.</span>
+        {% endif %}
+      </details>
+      {% endif %}
     </div>
   </div>
   {% endif %}

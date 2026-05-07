@@ -139,6 +139,16 @@ def _gateway_for(venue_id: str):
 
 @app.on_event('startup')
 def startup() -> None:
+    # Loud warning if the dashboard is running with the default password.
+    # Audit pass: this should fire BEFORE the worker thread spins up so
+    # operators see it on first deploy without scrolling past startup.
+    if settings.dashboard_password in ('change-me', 'changeme', '', 'admin', 'password'):
+        import logging as _lg
+        _lg.getLogger('uvicorn.error').warning(
+            'SECURITY: dashboard is running with the default/weak password (%r). '
+            'Set DASHBOARD_PASSWORD env var to a strong unique value before exposing this service.',
+            settings.dashboard_password,
+        )
     # Migrations first (drops/widens columns on existing tables), then
     # create_all to recreate any tables migrations dropped and to add new
     # tables introduced since the last deploy.
@@ -743,13 +753,28 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         ctx['equity_stale'] = equity_stale
         # Surface the actual deployable free balances aggregated across venues
         # — this is what the bot can deploy on a fresh entry.
+        #
+        # Unified-margin caveat: under Binance PM and KuCoin UTA the spot
+        # and futures wallets are the SAME unified pool; ``spot.free`` and
+        # ``fut.free`` both report ``pool_free``. Summing them would
+        # double-count. We detect unified margin via ``fut.total == 0``
+        # (set by those gateways' _fetch_balances_uncached) and take
+        # spot.free alone in that case. For Classic accounts (still real
+        # for IBKR / future venues) we keep the sum.
         if v == MODE_LIVE:
             spot_free_total = 0.0
             fut_free_total = 0.0
             for g in gateways:
                 bals_for_display = g.safe_balances() or {}
-                spot_free_total += float((bals_for_display.get('spot', {}).get('USDT') or {}).get('free') or 0)
-                fut_free_total += float((bals_for_display.get('futures', {}).get('USDT') or {}).get('free') or 0)
+                gw_spot_free = float((bals_for_display.get('spot', {}).get('USDT') or {}).get('free') or 0)
+                gw_fut_free = float((bals_for_display.get('futures', {}).get('USDT') or {}).get('free') or 0)
+                gw_fut_total = float((bals_for_display.get('futures', {}).get('USDT') or {}).get('total') or 0)
+                spot_free_total += gw_spot_free
+                # Only credit the futures wallet's free amount when it's
+                # genuinely a separate pool (Classic) — under unified
+                # margin spot already covers it.
+                if gw_fut_total > 0.001:
+                    fut_free_total += gw_fut_free
             ctx['live_spot_free'] = spot_free_total
             ctx['live_fut_free'] = fut_free_total
         else:
@@ -1298,10 +1323,10 @@ def _gather_exchange_status() -> list[dict]:
             'sapi_v1_get_simple_earn_flexible_position',
             'sapiGetSimpleEarnFlexiblePosition',
         ), {'asset': 'USDT'})))
-        probes.append(_probe('Deposit history (USDT, 10d)', lambda: gw.deposit_history('USDT', lookback_days=10, ttl_seconds=0)))
-        probes.append(_probe('Withdrawal history (USDT, 10d)', lambda: gw.withdrawal_history('USDT', lookback_days=10, ttl_seconds=0)))
-        probes.append(_probe('Sub-account transfer in (USDT, 10d)', lambda: gw.sub_account_transfer_history('USDT', incoming=True, lookback_days=10, ttl_seconds=0)))
-        probes.append(_probe('Sub-account transfer out (USDT, 10d)', lambda: gw.sub_account_transfer_history('USDT', incoming=False, lookback_days=10, ttl_seconds=0)))
+        probes.append(_probe('Deposit history (USDT, 30d)', lambda: gw.deposit_history('USDT', lookback_days=30, ttl_seconds=0)))
+        probes.append(_probe('Withdrawal history (USDT, 30d)', lambda: gw.withdrawal_history('USDT', lookback_days=30, ttl_seconds=0)))
+        probes.append(_probe('Sub-account transfer in (USDT, 30d)', lambda: gw.sub_account_transfer_history('USDT', incoming=True, lookback_days=30, ttl_seconds=0)))
+        probes.append(_probe('Sub-account transfer out (USDT, 30d)', lambda: gw.sub_account_transfer_history('USDT', incoming=False, lookback_days=30, ttl_seconds=0)))
         # Alternate sub-transfer endpoint name. Some Binance vintages
         # expose subUserHistory but not subTransferHistory; probe both
         # so we don't miss rows behind a naming difference.
@@ -1309,17 +1334,17 @@ def _gather_exchange_status() -> list[dict]:
             'sapiV1GetSubAccountTransferSubUserHistory',
             'sapi_v1_get_sub_account_transfer_sub_user_history',
             'sapiGetSubAccountTransferSubUserHistory',
-        ), {'asset': 'USDT', 'startTime': int((datetime.utcnow() - timedelta(days=10)).timestamp() * 1000)})))
+        ), {'asset': 'USDT', 'startTime': int((datetime.utcnow() - timedelta(days=30)).timestamp() * 1000)})))
         # Universal-transfer history (raw, no intra-account filter) so the
         # operator can see EVERY row Binance returns and spot the user's
         # deposit even if our parser missed it.
-        probes.append(_probe('Universal transfers raw (USDT, 10d, paged)', lambda: gw.spot.fetch_transfers('USDT', since=int((datetime.utcnow() - timedelta(days=10)).timestamp() * 1000)) or []))
+        probes.append(_probe('Universal transfers raw (USDT, 30d, paged)', lambda: gw.spot.fetch_transfers('USDT', since=int((datetime.utcnow() - timedelta(days=30)).timestamp() * 1000)) or []))
         # PM account snapshot — confirms we're talking to a PM-enabled key
         # and surfaces the totalWalletBalance / totalEquity for cross-check.
         probes.append(_probe('PM /papi/v1/account', lambda: gw._papi(gw.spot, ('papiGetAccount', 'papi_get_account'))({}) if gw._papi(gw.spot, ('papiGetAccount', 'papi_get_account')) else 'papiGetAccount not in this ccxt build'))
         probes.append(_probe('Open perp positions', lambda: gw.open_perp_positions_raw()))
         probes.append(_probe('Capital-flow ingest (deposits + withdrawals + sub-transfers, 365d)', lambda: {
-            'rows': gw.list_capital_flow_records(lookback_days=10),
+            'rows': gw.list_capital_flow_records(lookback_days=30),
             'errors': gw.last_history_errors,
         }))
         # Capital subtotal: cash + spot assets + futures + earn (all USDT-denominated).
@@ -1357,7 +1382,10 @@ def _gather_exchange_status() -> list[dict]:
         'configured': has_creds,
         'key_masked': _mask(settings.binance_api_key),
         'secret_masked': _mask(settings.binance_api_secret),
-        'extra_creds': [{'label': 'Account type (live)', 'value': f'{bn_account_label} — {bn_account_detail}' if bn_account_label else '<not probed>'}] if has_creds else [],
+        'extra_creds': ([
+            {'label': 'Account type (live)', 'value': f'{bn_account_label} — {bn_account_detail}' if bn_account_label else '<not probed>'},
+            {'label': 'Rate-limit pause', 'value': (f'PAUSED — {int(gw._rate_limit_pause_until - time.time())}s remaining (consecutive 429s: {gw._rate_limit_consecutive})' if gw.is_rate_limited() else 'none')},
+        ] if has_creds else []),
         'probes': probes,
         'last_balance_error': gw.last_balance_error,
         'capital_subtotal_usdt': capital_subtotal,
@@ -1381,14 +1409,14 @@ def _gather_exchange_status() -> list[dict]:
         kc_probes.append(_probe('Futures fetch_balance()', lambda: kgw.futures.fetch_balance()))
         kc_probes.append(_probe('Funding rates (markets-derived)', lambda: kgw.funding_rates_dict()))
         kc_probes.append(_probe('Open perp positions', lambda: kgw.open_perp_positions_raw()))
-        kc_probes.append(_probe('Deposit history (USDT, 10d)', lambda: kgw.spot.fetch_deposits('USDT', since=int((datetime.utcnow() - timedelta(days=10)).timestamp() * 1000))))
-        kc_probes.append(_probe('Withdrawal history (USDT, 10d)', lambda: kgw.spot.fetch_withdrawals('USDT', since=int((datetime.utcnow() - timedelta(days=10)).timestamp() * 1000))))
-        kc_probes.append(_probe('Universal transfers raw (USDT, 10d)', lambda: kgw.spot.fetch_transfers('USDT', since=int((datetime.utcnow() - timedelta(days=10)).timestamp() * 1000))))
+        kc_probes.append(_probe('Deposit history (USDT, 30d)', lambda: kgw.spot.fetch_deposits('USDT', since=int((datetime.utcnow() - timedelta(days=30)).timestamp() * 1000))))
+        kc_probes.append(_probe('Withdrawal history (USDT, 30d)', lambda: kgw.spot.fetch_withdrawals('USDT', since=int((datetime.utcnow() - timedelta(days=30)).timestamp() * 1000))))
+        kc_probes.append(_probe('Universal transfers raw (USDT, 30d)', lambda: kgw.spot.fetch_transfers('USDT', since=int((datetime.utcnow() - timedelta(days=30)).timestamp() * 1000))))
         # UTA account-mode probe — surfaces the live account state so the
         # operator can confirm the API key sees UTA/Classic correctly.
         kc_probes.append(_probe('Account mode (UTA check)', lambda: {'is_uta_enabled': kgw.spot.is_uta_enabled()}))
         kc_probes.append(_probe('Capital-flow ingest (deposits + sub-transfers)', lambda: {
-            'rows': kgw.list_capital_flow_records(lookback_days=10),
+            'rows': kgw.list_capital_flow_records(lookback_days=30),
             'errors': kgw.last_history_errors,
         }))
         kc_bals = kgw.safe_balances() or {}
@@ -1426,6 +1454,7 @@ def _gather_exchange_status() -> list[dict]:
     kc_extra = [{'label': 'Passphrase', 'value': _mask(kc_pass)}]
     if kc_configured:
         kc_extra.append({'label': 'Account type (live)', 'value': f'{kc_account_label} — {kc_account_detail}'})
+        kc_extra.append({'label': 'Rate-limit pause', 'value': (f'PAUSED — {int(kgw._rate_limit_pause_until - time.time())}s remaining (consecutive 429s: {kgw._rate_limit_consecutive})' if kgw.is_rate_limited() else 'none')})
     sections.append({
         'name': 'KuCoin',
         'venue_id': 'kucoin',

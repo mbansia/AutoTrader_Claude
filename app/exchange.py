@@ -603,13 +603,13 @@ class VenueGateway:
             return True, 'paper'
         return False, f'futures→spot transfer not wired on {self.name}'
 
-    def net_injected_capital_usdt(self, lookback_days: int = 10) -> tuple[float | None, dict]:
+    def net_injected_capital_usdt(self, lookback_days: int = 30) -> tuple[float | None, dict]:
         """Returns ``(net, meta)`` where ``net`` is in USDT and ``meta`` carries
         a per-component breakdown for the UI. ``None`` signals the caller to
         fall back to manual CapitalFlow rows."""
         return None, {'error': f'history not wired on {self.name}'}
 
-    def list_capital_flow_records(self, lookback_days: int = 10) -> list[dict]:
+    def list_capital_flow_records(self, lookback_days: int = 30) -> list[dict]:
         """Return per-row capital movements over the lookback window so the bot
         can ingest them as ``CapitalFlow`` entries for XIRR and the per-flow
         timeline. Each row is ``{ts, amount, kind, external_id, note}``:
@@ -931,7 +931,7 @@ class BinanceGateway(VenueGateway):
             cursor = start
         return rows
 
-    def deposit_history(self, asset: str = 'USDT', lookback_days: int = 10, ttl_seconds: float = 300.0) -> list[dict]:
+    def deposit_history(self, asset: str = 'USDT', lookback_days: int = 30, ttl_seconds: float = 300.0) -> list[dict]:
         key = f'{asset}:{lookback_days}'
         cached = self._deposit_history_cache.get(key)
         if cached and (time.time() - cached[1]) < ttl_seconds:
@@ -944,7 +944,7 @@ class BinanceGateway(VenueGateway):
         self._deposit_history_cache[key] = (rows, time.time())
         return rows
 
-    def withdrawal_history(self, asset: str = 'USDT', lookback_days: int = 10, ttl_seconds: float = 300.0) -> list[dict]:
+    def withdrawal_history(self, asset: str = 'USDT', lookback_days: int = 30, ttl_seconds: float = 300.0) -> list[dict]:
         key = f'{asset}:{lookback_days}'
         cached = self._withdrawal_history_cache.get(key)
         if cached and (time.time() - cached[1]) < ttl_seconds:
@@ -957,7 +957,7 @@ class BinanceGateway(VenueGateway):
         self._withdrawal_history_cache[key] = (rows, time.time())
         return rows
 
-    def sub_account_transfer_history(self, asset: str = 'USDT', incoming: bool = True, lookback_days: int = 10, ttl_seconds: float = 300.0) -> list[dict]:
+    def sub_account_transfer_history(self, asset: str = 'USDT', incoming: bool = True, lookback_days: int = 30, ttl_seconds: float = 300.0) -> list[dict]:
         """Sub-account-side view of master ↔ sub transfers.
         Endpoint: GET /sapi/v1/sub-account/sub/transfer/history
         type: 1 = transfer in (master → this sub), 2 = transfer out (sub → master).
@@ -996,7 +996,7 @@ class BinanceGateway(VenueGateway):
         self._sub_transfer_history_cache[key] = (rows, time.time())
         return rows
 
-    def net_injected_capital_usdt(self, lookback_days: int = 10) -> tuple[float | None, dict]:
+    def net_injected_capital_usdt(self, lookback_days: int = 30) -> tuple[float | None, dict]:
         """Sum of completed USDT inflows − outflows over the lookback window.
         Single source of truth: delegate to :meth:`list_capital_flow_records`
         which already walks every Binance endpoint we know about (chain
@@ -1044,7 +1044,7 @@ class BinanceGateway(VenueGateway):
             meta['errors'] = errors
         return net, meta
 
-    def list_capital_flow_records(self, lookback_days: int = 10) -> list[dict]:
+    def list_capital_flow_records(self, lookback_days: int = 30) -> list[dict]:
         """Binance: external deposits, external withdrawals, master→sub
         transfer-in, sub→master transfer-out. Errors per endpoint are
         recorded on ``self.last_history_errors`` so /monitoring can surface
@@ -2000,7 +2000,7 @@ class KuCoinGateway(VenueGateway):
     # inflows minus outflows over the lookback. Returns ``(None, meta)`` if
     # no endpoint returned anything, so the caller falls back to manual
     # CapitalFlow rows.
-    def net_injected_capital_usdt(self, lookback_days: int = 10) -> tuple[float | None, dict]:
+    def net_injected_capital_usdt(self, lookback_days: int = 30) -> tuple[float | None, dict]:
         since_ms = int((datetime.utcnow() - timedelta(days=lookback_days)).timestamp() * 1000)
         deps: list[dict] = []
         wdrs: list[dict] = []
@@ -2048,7 +2048,7 @@ class KuCoinGateway(VenueGateway):
             'lookback_days': lookback_days,
         }
 
-    def list_capital_flow_records(self, lookback_days: int = 10) -> list[dict]:
+    def list_capital_flow_records(self, lookback_days: int = 30) -> list[dict]:
         self.last_history_errors = {}
         since_ms = int((datetime.utcnow() - timedelta(days=lookback_days)).timestamp() * 1000)
         rows: list[dict] = []
