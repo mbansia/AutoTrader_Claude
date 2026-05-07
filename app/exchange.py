@@ -1405,50 +1405,54 @@ class BinanceGateway(VenueGateway):
         return self.earn_balance_usdt()
 
     def earn_subscribe(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
-        """BFUSD mint via API is not currently possible.
+        """Subscribe USDT into BFUSD (yield-bearing PM collateral) via the
+        Simple Earn flexible-product surface.
 
-        Background: I originally wired this to ``sapiPostPortfolioMint``
-        (i.e. ``POST /sapi/v1/portfolio/mint``). Binance retired that
-        endpoint with the response ``-21015 "The endpoint has been
-        deprecated and removed."``. ccxt exposes no current replacement —
-        the BFUSD subscribe flow is now UI-only on Binance: <em>Wallet
-        → Portfolio Margin → BFUSD → Subscribe</em>.
+        Path: ``POST /sapi/v1/simple-earn/flexible/subscribe`` with the
+        BFUSD productId (discovered via ``earn_product_id('BFUSD')`` →
+        flexible-list lookup). Replaces the deprecated
+        ``/sapi/v1/portfolio/mint`` (-21015) — Binance migrated BFUSD
+        from Portfolio Margin to Simple Earn in Aug 2025. The Simple
+        Earn endpoint accepts ``sourceAccount`` (added 2025) so funds
+        can come from the PM pool / spot wallet directly.
 
-        Behavior:
-        * Returns ``(False, helpful message)`` so the dashboard surfaces
-          the limitation. Doesn't actually call the dead endpoint —
-          that just generated noise on every cycle.
-        * ``earn_balance_usdt`` still reads BFUSD held by the account
-          (whether minted manually or from a prior bot run), so any
-          BFUSD you do hold continues to surface as yielding collateral.
-        * When Binance publishes the replacement endpoint and ccxt
-          wraps it (or we hit /papi/v1/* directly), this method gets
-          re-wired in one place."""
+        Yield: 12-35% base APY with daily accrual, 15-47% boosted when
+        used as collateral in Multi-Asset Mode (rates vary; see Binance
+        UI for the live tier). BFUSD continues to count as cross-
+        collateral for futures positions while earning."""
         if paper_mode:
             return True, 'paper'
         if amount_usdt <= 0:
             return True, 'noop'
-        return False, ('BFUSD subscribe via API is not currently possible — Binance retired the '
-                       'sapiPostPortfolioMint endpoint (-21015). Subscribe manually via Binance UI: '
-                       'Wallet → Portfolio Margin → BFUSD → Subscribe. Bot will read whatever you '
-                       'hold and surface it as yielding collateral.')
+        # Reuse the existing asset-level subscribe helper. earn_product_id
+        # caches the BFUSD productId via the flexible-list endpoint; if
+        # the product isn't surfaced for this sub-account (sometimes
+        # requires explicit enrollment via the Binance UI Earn page),
+        # surface a clear error rather than silently retrying.
+        pid = self.earn_product_id('BFUSD')
+        if not pid:
+            return False, ('BFUSD product not found on this account. Visit Binance UI → Earn → BFUSD '
+                           'page once on this sub-account to enrol the product, then retry. After '
+                           'enrolment the productId becomes visible to the API.')
+        return self.earn_subscribe_asset('BFUSD', amount_usdt, paper_mode)
 
     def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
-        """BFUSD redeem via API is also unavailable on the current ccxt
-        build (paired retirement with Mint, same -21015 error). Until a
-        replacement endpoint is wrapped, BFUSD must be redeemed manually
-        from Binance UI when the bot needs raw USDT for an entry. In
-        practice this is rare — the bot's pre-trade margin check uses
-        the PM unified pool which already includes BFUSD as cross-
-        collateral for futures positions, so an automatic redeem is
-        only required for cross-margin spot legs that need raw USDT."""
+        """Redeem BFUSD back to USDT via Simple Earn flexible redeem.
+        Same migration story as ``earn_subscribe`` — the old portfolio
+        redeem endpoint is gone; the path now is
+        ``/sapi/v1/simple-earn/flexible/redeem`` on the BFUSD product.
+
+        Triggered pre-trade by ``provision_margin`` only when raw USDT
+        is needed beyond what's in the PM pool — most futures-leg
+        margin needs are satisfied directly by BFUSD as cross-
+        collateral, so an automatic redeem is rarely required."""
         if paper_mode:
             return True, 'paper'
         if amount_usdt <= 0:
             return True, 'noop'
-        return False, ('BFUSD redeem via API is not currently possible (paired with the deprecated mint endpoint). '
-                       'Redeem manually via Binance UI when the bot signals insufficient USDT. '
-                       'Note: BFUSD already counts as cross-collateral for futures legs under PM.')
+        # Reuses earn_redeem_asset, which calls Simple Earn flexible
+        # redeem with the BFUSD productId.
+        return self.earn_redeem_asset('BFUSD', amount_usdt, paper_mode)
 
     def transfer_spot_to_futures(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
         # PM unifies margin; there's nothing to transfer.
@@ -1708,8 +1712,13 @@ class KuCoinGateway(VenueGateway):
     # KuCoin separates cash across three wallet types:
     #   * ``trade``    — Trading Account (UI label); spot orders execute here.
     #   * ``main``     — Funding Account (UI label); deposits land here, and
-    #                    KuCoin's auto-lend / Pool-X pulls idle USDT from
-    #                    here. We treat this wallet as the "Earn" surface.
+    #                    KuCoin's auto-lend pulls idle USDT from here. We
+    #                    treat this wallet as the yield-bearing surface
+    #                    on Classic accounts. (Simple Earn / Pool-X are
+    #                    SEPARATE products that don't count as cross-
+    #                    margin collateral under UTA — we don't touch
+    #                    them; auto-lend is the only collateral-yield
+    #                    path on KuCoin that we use.)
     #   * ``contract`` — Futures wallet; perp orders consume margin here.
     #
     # ccxt's default ``fetch_balance()`` only returns ``trade``. To match
@@ -1868,16 +1877,22 @@ class KuCoinGateway(VenueGateway):
             return None, self.last_balance_error
         return float((bals.get('earn', {}).get('USDT') or {}).get('total') or 0), ''
 
-    # ─── Earn-equivalent on KuCoin: park idle cash in the funding wallet ──
-    # KuCoin doesn't expose a single "Simple Earn Flexible" endpoint that
-    # behaves like Binance's. The clean equivalent is to keep idle USDT in
-    # the ``main`` wallet so KuCoin's account-level auto-lend (the user
-    # toggles this in the KuCoin UI) collects interest on it. The bot
-    # therefore models earn_subscribe / earn_redeem as inner-transfers
-    # between trade ↔ main; the displayed "Earn balance" is the main
-    # wallet's USDT total. Cumulative yield is left at 0 because KuCoin
-    # credits lend interest into the same main wallet — there's no
-    # separate yield ledger to read without a per-day diff routine.
+    # ─── Yield-bearing collateral on KuCoin: auto-lend only ─────────────
+    # KuCoin's only cross-margin-compatible yield surface is auto-lend
+    # (calls ``POST /api/v1/margin/toggle-auto-lend`` once per startup
+    # via _enforce_venue_yield_settings). KuCoin Simple Earn / Pool-X
+    # are SEPARATE products: subscribing to them moves USDT out of the
+    # margin pool, so the funds stop counting as cross-collateral. We
+    # deliberately don't touch those — they'd reduce collateral and
+    # add operational complexity for marginal incremental yield.
+    #
+    # Under UTA: auto-lent USDT in the unified pool earns interest AND
+    # remains usable as cross-margin collateral. This is the only
+    # "yield + collateral" combo we use.
+    # Under Classic (legacy fallback): the bot moves idle cash to the
+    # ``main`` wallet which is the auto-lend source. earn_subscribe /
+    # earn_redeem are inner-transfers between trade ↔ main; the
+    # displayed "Earn balance" is the main wallet's USDT total.
     def earn_balance_usdt(self) -> tuple[float | None, str]:
         return self._main_wallet_usdt()
 
