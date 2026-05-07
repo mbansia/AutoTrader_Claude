@@ -115,6 +115,26 @@ def get_mode_state(db, mode: str) -> ModeState:
     return state
 
 
+def get_strategy_state(db, mode: str, trade_type: str) -> 'StrategyState':
+    """Per-(mode, trade_type) entry switch. Bootstrap: the same-venue
+    funding-arb strategies start enabled in paper / disabled in live;
+    cross-venue and onchain strategies start disabled until their
+    orchestrators are wired."""
+    from app.models import StrategyState as _SS
+    s = db.scalar(select(_SS).where(_SS.mode == mode, _SS.trade_type == trade_type))
+    if s is None:
+        same_venue = trade_type in ('binance_same_venue_funding_arb', 'kucoin_same_venue_funding_arb')
+        s = _SS(
+            mode=mode,
+            trade_type=trade_type,
+            entry_enabled=(mode == MODE_PAPER and same_venue),
+            exit_all_pending=False,
+        )
+        db.add(s)
+        db.flush()
+    return s
+
+
 def _earn_sweep_for_venue(mode: str, exchange: str, **_ignored) -> None:
     """Event handler: try an earn-sweep on (mode, exchange) right now.
     Subscribed to ``position_closed`` and ``deposit_detected`` so freed-up
@@ -858,6 +878,28 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                 db.commit()
                 return
 
+            # Per-strategy "exit all & stop" — when the operator clicks
+            # the button on /config for a specific trade-type, the
+            # ``StrategyState.exit_all_pending`` flag is set. The next
+            # cycle force-closes every open position of that trade-type,
+            # then clears the flag and leaves ``entry_enabled=False`` so
+            # the strategy stays quiescent until explicit resume.
+            this_strategy_tt = venue_to_trade_type(gateway.venue_id)
+            sstate_check = get_strategy_state(db, mode, this_strategy_tt)
+            if sstate_check.exit_all_pending:
+                victims = db.scalars(select(Position).where(
+                    Position.status == 'open',
+                    Position.mode == mode,
+                    Position.exchange == gateway.venue_id,
+                    Position.trade_type == this_strategy_tt,
+                )).all()
+                for p in victims:
+                    _force_close_both(db, gateway, p, cfg, f'strategy_exit_all:{this_strategy_tt}')
+                sstate_check.exit_all_pending = False
+                sstate_check.entry_enabled = False
+                log_event(db, f'Strategy {this_strategy_tt} exit-all completed: closed {len(victims)} position(s); entries disabled until manual resume', mode=mode, exchange=gateway.venue_id)
+                db.commit()
+
             open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)).all()
 
             # Phase A: per-position safety — live mode only (paper has no authoritative state to verify against).
@@ -997,6 +1039,18 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     held_bases = {p.spot_symbol.split('/')[0] for p in db.scalars(
                         select(Position).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)
                     ).all()}
+                    # Per-strategy gate. The candidate inherits the
+                    # gateway's trade-type tag (same-venue funding arb
+                    # today; cross-venue / onchain trade types route
+                    # through different orchestrators when wired). If
+                    # the operator has flipped this strategy off on
+                    # /config, skip the whole open path — no candidates
+                    # of this type get filled this cycle.
+                    candidate_trade_type = venue_to_trade_type(gateway.venue_id)
+                    sstate = get_strategy_state(db, mode, candidate_trade_type)
+                    if not sstate.entry_enabled:
+                        scan_action = f'strategy_disabled:{candidate_trade_type}'
+                        passing = []
                     for c in passing[:5]:
                         base = c.spot_symbol.split('/')[0]
                         if base in held_bases:

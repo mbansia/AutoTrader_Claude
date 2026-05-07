@@ -176,6 +176,24 @@ class ModeState(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class StrategyState(Base):
+    """Per-(mode, trade_type) on/off switch. Lets the operator stop new
+    entries on one strategy (e.g. ``binance_same_venue_funding_arb``)
+    without affecting another (e.g. KuCoin) — the global ``ModeState``
+    kill-switch still works as a master override.
+
+    ``exit_all_pending`` is a one-shot flag: when set, the next cycle
+    force-closes every open position of that trade-type, then clears
+    the flag and sets ``entry_enabled=False`` so the strategy stays
+    quiescent until the operator explicitly resumes it."""
+    __tablename__ = 'strategy_state'
+    mode: Mapped[str] = mapped_column(String(8), primary_key=True)
+    trade_type: Mapped[str] = mapped_column(String(48), primary_key=True)
+    entry_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    exit_all_pending: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 # Legacy single-row "active mode" table. Retained so existing DBs don't break,
 # but the bot no longer reads paper_mode for routing — both modes run.
 class RuntimeState(Base):

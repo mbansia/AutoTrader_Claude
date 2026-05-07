@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>{% block title %}Funding Arb{% endblock %}</title>
+  <title>{% block title %}AutoTrader{% endblock %}</title>
   <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
   <link rel="stylesheet" href="/static/style.css">
   <script>
@@ -25,8 +25,7 @@
 <body class="view-{{ view }}">
 <div class="app">
   <aside class="sidebar">
-    <h1>Funding Arb</h1>
-    <div class="subtitle">{% if configured_venues %}{{ configured_venues|join(' · ') }}{% else %}No venue configured{% endif %}</div>
+    <h1>AutoTrader</h1>
     <div class="view-tabs">
       <form action="/view/paper" method="post">
         <button type="submit" class="view-tab {{ 'active' if view == 'paper' }}">PAPER</button>

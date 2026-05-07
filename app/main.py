@@ -330,6 +330,59 @@ def mode_exit_all_stop(mode: str = Path(...), _: None = Depends(auth)):
     return RedirectResponse(url=f'/dashboard?view={mode}', status_code=303)
 
 
+# ─── Per-strategy controls ────────────────────────────────────────────────
+# Mirror /mode/{mode}/{stop,start,exit-all-stop} but scoped to a single
+# trade-type so the operator can pause Binance same-venue arb without
+# touching KuCoin same-venue arb (or, later, cross-venue / onchain).
+
+def _strategy_target(mode: str, trade_type: str):
+    if mode not in ALL_MODES:
+        raise HTTPException(400, 'invalid mode')
+    if trade_type not in TRADE_TYPE_LABELS:
+        raise HTTPException(400, 'invalid trade_type')
+
+
+@app.post('/strategies/{mode}/{trade_type}/stop')
+def strategy_stop(mode: str = Path(...), trade_type: str = Path(...), _: None = Depends(auth)):
+    """Disable new entries for this strategy. Existing positions stay
+    open and continue to be exit-evaluated normally."""
+    _strategy_target(mode, trade_type)
+    from app.bot import get_strategy_state
+    with SessionLocal() as db:
+        s = get_strategy_state(db, mode, trade_type)
+        s.entry_enabled = False
+        db.commit()
+    return RedirectResponse(url='/config', status_code=303)
+
+
+@app.post('/strategies/{mode}/{trade_type}/start')
+def strategy_start(mode: str = Path(...), trade_type: str = Path(...), _: None = Depends(auth)):
+    """Re-enable new entries for this strategy."""
+    _strategy_target(mode, trade_type)
+    from app.bot import get_strategy_state
+    with SessionLocal() as db:
+        s = get_strategy_state(db, mode, trade_type)
+        s.entry_enabled = True
+        s.exit_all_pending = False
+        db.commit()
+    return RedirectResponse(url='/config', status_code=303)
+
+
+@app.post('/strategies/{mode}/{trade_type}/exit-all-stop')
+def strategy_exit_all_stop(mode: str = Path(...), trade_type: str = Path(...), _: None = Depends(auth)):
+    """Close every open position of this trade-type and disable entries.
+    Processed on the next bot cycle so the request returns immediately
+    even if a slow venue is in the path."""
+    _strategy_target(mode, trade_type)
+    from app.bot import get_strategy_state
+    with SessionLocal() as db:
+        s = get_strategy_state(db, mode, trade_type)
+        s.entry_enabled = False
+        s.exit_all_pending = True
+        db.commit()
+    return RedirectResponse(url='/config', status_code=303)
+
+
 @app.post('/positions/{position_id}/close')
 def position_close(position_id: int = Path(...), _: None = Depends(auth)):
     with SessionLocal() as db:
@@ -1029,11 +1082,44 @@ def logs_page(request: Request, view: str | None = None, view_cookie: str | None
 @app.get('/config', response_class=HTMLResponse)
 def config_page(request: Request, saved: int = 0, view: str | None = None, view_cookie: str | None = Cookie(default=None, alias='view'), _: None = Depends(auth)):
     v = _resolve_view(view, view_cookie)
+    from app.bot import get_strategy_state
     with SessionLocal() as db:
         ctx = _shared_ctx(request, v, db)
         ctx['active'] = 'config'
         ctx['cfg'] = get_strategy_config(db)
         ctx['saved'] = bool(saved)
+        # Per-strategy controls. We surface every trade type from the
+        # taxonomy — active ones (Binance / KuCoin same-venue) get real
+        # buttons; placeholder ones (cross-venue, onchain, IBKR) show as
+        # "not yet wired" so the operator can see the roadmap. The
+        # ``mode`` axis distinguishes paper vs live so the operator can
+        # run paper experiments while live is locked down.
+        strategies = []
+        active_types = ('binance_same_venue_funding_arb', 'kucoin_same_venue_funding_arb')
+        for tt, label in TRADE_TYPE_LABELS.items():
+            row = {
+                'trade_type': tt,
+                'label': label,
+                'is_active_strategy': tt in active_types,
+                'paper': None,
+                'live': None,
+            }
+            if tt in active_types:
+                ps = get_strategy_state(db, 'paper', tt)
+                ls = get_strategy_state(db, 'live', tt)
+                # Open-position counts let the UI show "X open" next to
+                # exit-all-stop so the operator knows what's about to
+                # close.
+                paper_open = db.scalar(select(func.count(Position.id)).where(
+                    Position.status == 'open', Position.mode == 'paper', Position.trade_type == tt,
+                )) or 0
+                live_open = db.scalar(select(func.count(Position.id)).where(
+                    Position.status == 'open', Position.mode == 'live', Position.trade_type == tt,
+                )) or 0
+                row['paper'] = {'entry_enabled': ps.entry_enabled, 'exit_all_pending': ps.exit_all_pending, 'open_count': paper_open}
+                row['live'] = {'entry_enabled': ls.entry_enabled, 'exit_all_pending': ls.exit_all_pending, 'open_count': live_open}
+            strategies.append(row)
+        ctx['strategies'] = strategies
     return templates.TemplateResponse(request, 'config.html', ctx)
 
 

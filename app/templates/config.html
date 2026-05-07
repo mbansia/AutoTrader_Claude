@@ -1,11 +1,78 @@
 {% extends 'base.html' %}
-{% block title %}Configuration · Funding Arb{% endblock %}
+{% block title %}Configuration · AutoTrader{% endblock %}
 {% block content %}
 <div class="page-header">
   <h2>Configuration</h2>
 </div>
 
 {% if saved %}<div class="alert alert-info">Configuration saved. Changes apply on the next bot cycle.</div>{% endif %}
+
+{# ============= STRATEGIES (on/off per trade-type) ============= #}
+<div class="card">
+  <h3>Strategies <span class="muted" style="font-size:13px;font-weight:400;">— per-trade-type kill switches</span></h3>
+  <div class="body">
+    <div class="muted" style="font-size:12px;margin-bottom:12px;line-height:1.5;">
+      Each row is one strategy. <strong>Stop new trades</strong> disables fresh entries but lets existing
+      positions exit naturally. <strong>Exit all &amp; stop</strong> closes every open position of that
+      trade-type on the next cycle and disables entries until you click resume. Use the per-mode controls
+      to keep paper running while live is locked down (or vice versa). Strategies marked
+      <em>(not yet wired)</em> will surface here for live control once their orchestrators land.
+    </div>
+    <table>
+      <thead><tr>
+        <th>Strategy</th>
+        <th style="width:100px;">Mode</th>
+        <th style="width:120px;">Status</th>
+        <th>Controls</th>
+      </tr></thead>
+      <tbody>
+      {% for s in strategies %}
+        {% if s.is_active_strategy %}
+          {% for mode_name, ms in [('paper', s.paper), ('live', s.live)] %}
+          <tr>
+            {% if loop.first %}
+            <td rowspan="2"><span class="mono">{{ s.label }}</span><br>
+              <span class="muted" style="font-size:10px;">{{ s.trade_type }}</span></td>
+            {% endif %}
+            <td><span class="tag {{ 'good' if mode_name == 'live' else 'warn' }}" style="font-size:10px;">{{ mode_name|upper }}</span></td>
+            <td>
+              {% if ms.exit_all_pending %}<span class="tag bad" style="font-size:10px;">EXITING</span>
+              {% elif ms.entry_enabled %}<span class="tag good" style="font-size:10px;">entries on</span>
+              {% else %}<span class="tag warn" style="font-size:10px;">stopped</span>{% endif %}
+              <span class="muted" style="font-size:11px;margin-left:6px;">{{ ms.open_count }} open</span>
+            </td>
+            <td>
+              <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                {% if ms.entry_enabled %}
+                <form action="/strategies/{{ mode_name }}/{{ s.trade_type }}/stop" method="post" style="display:inline;">
+                  <button type="submit" class="btn btn-warn" style="padding:4px 10px;font-size:11px;">Stop new trades</button>
+                </form>
+                {% else %}
+                <form action="/strategies/{{ mode_name }}/{{ s.trade_type }}/start" method="post" style="display:inline;">
+                  <button type="submit" class="btn btn-primary" style="padding:4px 10px;font-size:11px;">Resume</button>
+                </form>
+                {% endif %}
+                <form action="/strategies/{{ mode_name }}/{{ s.trade_type }}/exit-all-stop" method="post" style="display:inline;"
+                      onsubmit="return confirm('Market-close every {{ mode_name|upper }} position of {{ s.label }} ({{ ms.open_count }} open) and disable entries?');">
+                  <button type="submit" class="btn btn-danger" style="padding:4px 10px;font-size:11px;" {{ 'disabled' if ms.open_count == 0 and not ms.entry_enabled }}>Exit all &amp; stop</button>
+                </form>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        {% else %}
+        <tr style="opacity:0.5;">
+          <td><span class="mono">{{ s.label }}</span><br>
+            <span class="muted" style="font-size:10px;">{{ s.trade_type }}</span></td>
+          <td colspan="3"><span class="tag" style="font-size:10px;">not yet wired</span>
+            <span class="muted" style="font-size:11px;margin-left:6px;">orchestrator pending</span></td>
+        </tr>
+        {% endif %}
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
 
 <form action="/config" method="post">
 <div class="card">
