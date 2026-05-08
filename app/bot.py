@@ -1084,6 +1084,24 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     for q in ('USDT', 'USDC'):
                         spot_free_by_q[q] = float((bals.get('spot', {}).get(q) or {}).get('free') or 0)
                         fut_free_by_q[q] = float((bals.get('futures', {}).get(q) or {}).get('free') or 0)
+                    # Diagnostic snapshot — one line per (venue, quote)
+                    # per cycle so the operator can see exactly what
+                    # the balance reader returned. Includes the raw
+                    # spot+futures breakdown plus fut.total which is
+                    # the unified-margin marker (PM/UTA → 0; Classic
+                    # → real wallet total). Searchable in /logs by
+                    # "Wallet snapshot" or by venue tag.
+                    is_uta_str = ''
+                    if hasattr(gateway, '_is_uta'):
+                        is_uta_str = ' [UTA]' if gateway._is_uta else ' [Classic]'
+                    for q in ('USDT', 'USDC'):
+                        sf = spot_free_by_q[q]
+                        ff = fut_free_by_q[q]
+                        st = float((bals.get('spot', {}).get(q) or {}).get('total') or 0)
+                        ft = float((bals.get('futures', {}).get(q) or {}).get('total') or 0)
+                        if st > 0 or ft > 0 or sf > 0 or ff > 0:
+                            unified = '·unified' if ft <= 0.001 else '·split'
+                            log_event(db, f'Wallet snapshot {q}{is_uta_str}{unified}: spot free/total={sf:.4f}/{st:.4f}; fut free/total={ff:.4f}/{ft:.4f}', mode=mode, exchange=gateway.venue_id)
                 else:
                     # Paper has a single pool; both quotes draw from the
                     # same paper equity at 1:1 (paper is for strategy
@@ -1189,9 +1207,15 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         sized_notional = min(wallet_cap, desired_notional)
                         if sized_notional < min_notional:
                             quote_label = cq if sq == cq else f'{sq}-spot/{cq}-perp'
-                            reason = (f'below min position pct ({sized_notional:.2f} < {min_notional:.2f}; '
-                                      f'wallet={wallet_cap:.2f} [{quote_label}] '
-                                      f'max_pct={desired_notional:.2f})')
+                            uta_tag = ''
+                            if hasattr(gateway, '_is_uta'):
+                                uta_tag = ' UTA' if gateway._is_uta else ' Classic'
+                            reason = (f'below min position pct ({sized_notional:.4f} < {min_notional:.4f}; '
+                                      f'wallet={wallet_cap:.4f} [{quote_label}{uta_tag}] '
+                                      f'spot_leg_free={spot_leg_free:.4f}[{sq}] '
+                                      f'perp_leg_free={perp_leg_free:.4f}[{cq}] '
+                                      f'max_pct={desired_notional:.4f} '
+                                      f'min_pct={min_notional:.4f})')
                             db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=reason, funding_rate=c.funding_apr))
                             scan_action = 'below_min_pct'
                             continue
@@ -1536,6 +1560,20 @@ def run_loop() -> None:
         except Exception as e:
             with SessionLocal() as db:
                 log_event(db, f'{gw.name} prefetch_trading_fees failed (will fall back to lazy): {str(e)[:120]}', mode=MODE_PAPER, level='WARN', exchange=gw.venue_id)
+                db.commit()
+        # Log the live account type so /logs shows whether the bot
+        # is treating this venue as Classic vs unified-margin
+        # (Binance PM, KuCoin UTA). If a wallet-balance-related
+        # rejection turns out to be a misdetection, this is the
+        # quickest place to verify what the bot actually sees.
+        try:
+            label, detail = gw.account_type()
+            with SessionLocal() as db:
+                log_event(db, f'{gw.name} account type at startup: {label} — {detail}', mode=MODE_PAPER, exchange=gw.venue_id)
+                db.commit()
+        except Exception as e:
+            with SessionLocal() as db:
+                log_event(db, f'{gw.name} account_type probe failed: {str(e)[:120]}', mode=MODE_PAPER, level='WARN', exchange=gw.venue_id)
                 db.commit()
     for gw in gateways:
         reconcile_positions(gw)
