@@ -952,8 +952,32 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     perp_now = gateway.safe_price(p.perp_symbol, perp=True)
                     exit_reason = None
                     mandatory = False
-                    if current_apr < cfg.exit_funding_threshold:
-                        exit_reason = 'funding_below_threshold'
+                    # Forward annualized net profit (the "if I were
+                    # opening this fresh now, what's the rate?" check).
+                    # Same calc as the entry gate so entry/exit
+                    # thresholds are directly comparable. Below the
+                    # exit threshold → close.
+                    interval_h = p.funding_interval_hours or 8.0
+                    funding_window_bps = float(p.last_funding_rate) * 10000.0
+                    if spot_now and perp_now and spot_now > 0:
+                        live_basis_bps = (perp_now - spot_now) / spot_now * 10000.0
+                    else:
+                        live_basis_bps = 0.0
+                    exit_buffer = float(cfg.exit_basis_buffer_multiple or 3.0)
+                    rt_basis_bps = abs(live_basis_bps) * (1.0 + exit_buffer)
+                    spot_fee_bps = gateway.taker_fee_bps(p.spot_symbol, perp=False)
+                    perp_fee_bps = gateway.taker_fee_bps(p.perp_symbol, perp=True)
+                    rt_fees_bps = 2.0 * (spot_fee_bps + perp_fee_bps)
+                    fwd_net_per_window_bps = funding_window_bps - rt_basis_bps - rt_fees_bps
+                    periods_per_year = 24.0 * 365.0 / interval_h
+                    try:
+                        fwd_net_apy = (1.0 + fwd_net_per_window_bps / 10000.0) ** periods_per_year - 1.0
+                    except OverflowError:
+                        fwd_net_apy = float('inf') if fwd_net_per_window_bps > 0 else -1.0
+                    if fwd_net_apy < cfg.exit_funding_threshold:
+                        exit_reason = (f'forward_profit_below_threshold '
+                                       f'(net {fwd_net_apy*100:+.2f}% APY < {cfg.exit_funding_threshold*100:.2f}% required, '
+                                       f'live: funding {funding_window_bps:+.1f}bps − basis {rt_basis_bps:.1f}bps − fees {rt_fees_bps:.1f}bps)')
                     elif age > timedelta(hours=cfg.max_hold_hours):
                         exit_reason = 'max_hold'
                     if p.spot_entry_price > 0 and p.perp_entry_price > 0 and spot_now and perp_now:
@@ -1209,29 +1233,50 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                                 funding_rate=c.funding_apr))
                             scan_action = 'basis_dislocated'
                             continue
-                        # Profitability gate: compute net expected profit
-                        # for a single funding window. The trade must
-                        # earn enough funding to cover entry basis,
-                        # worst-case exit basis (entry × multiplier),
-                        # and round-trip taker fees on both legs.
-                        # All bps are of position notional (= spot_avg
-                        # × qty).
-                        funding_window_bps = c.funding_rate * 10000.0  # signed; bot is short perp
+                        # Profitability gate: compute net expected
+                        # profit per single funding window using actual
+                        # API-reported taker fees, then annualize
+                        # (compounded) and compare to the operator's
+                        # entry-annualized-net-profit threshold. The
+                        # cost components subtracted from the funding
+                        # window are:
+                        #   * round-trip basis = entry_basis × (1 + exit_buffer)
+                        #     (assume worst-case exit basis is
+                        #     `exit_basis_buffer_multiple` × entry)
+                        #   * round-trip taker fees = 2 × spot_taker + 2 × perp_taker
+                        #     (entry + exit on each leg). Pulled live
+                        #     from the venue's API per symbol per hour.
+                        funding_window_bps = c.funding_rate * 10000.0
                         entry_basis_cost_bps = abs(fill_basis_bps)
                         exit_buffer = float(cfg.exit_basis_buffer_multiple or 3.0)
                         round_trip_basis_bps = entry_basis_cost_bps * (1.0 + exit_buffer)
-                        fees_bps = 4.0 * float(cfg.taker_fee_bps or 5.0)
-                        net_profit_bps = funding_window_bps - round_trip_basis_bps - fees_bps
-                        min_profit = float(cfg.min_window_profit_bps or 0.0)
-                        if net_profit_bps < min_profit:
+                        spot_fee_bps = gateway.taker_fee_bps(c.spot_symbol, perp=False)
+                        perp_fee_bps = gateway.taker_fee_bps(c.perp_symbol, perp=True)
+                        round_trip_fees_bps = 2.0 * (spot_fee_bps + perp_fee_bps)
+                        net_per_window_bps = funding_window_bps - round_trip_basis_bps - round_trip_fees_bps
+                        # Annualize (compounded) using each candidate's
+                        # own funding-interval-derived periods/year so
+                        # 4h-cycle pairs (binance-perp) and 8h-cycle
+                        # pairs (most kucoin) annualize correctly.
+                        interval_h = c.funding_interval_hours or 8.0
+                        periods_per_year = 24.0 * 365.0 / interval_h
+                        try:
+                            net_apy = (1.0 + net_per_window_bps / 10000.0) ** periods_per_year - 1.0
+                        except OverflowError:
+                            net_apy = float('inf') if net_per_window_bps > 0 else -1.0
+                        if net_apy < cfg.entry_funding_threshold:
                             db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol,
-                                reason=(f'insufficient_profit '
+                                reason=(f'insufficient_annualized_profit '
                                         f'(funding={funding_window_bps:+.1f}bps − '
                                         f'basis={round_trip_basis_bps:.1f}bps [entry {entry_basis_cost_bps:.1f}× (1+{exit_buffer:.1f})] − '
-                                        f'fees={fees_bps:.1f}bps = net {net_profit_bps:+.1f}bps < {min_profit:.1f}bps required)'),
+                                        f'fees={round_trip_fees_bps:.1f}bps [spot {spot_fee_bps:.1f} + perp {perp_fee_bps:.1f}, ×2 RT] '
+                                        f'= net {net_per_window_bps:+.1f}bps/{int(interval_h)}h '
+                                        f'→ {net_apy*100:+.2f}% APY < {cfg.entry_funding_threshold*100:.2f}% required)'),
                                 funding_rate=c.funding_apr))
-                            scan_action = 'insufficient_profit'
+                            scan_action = 'insufficient_annualized_profit'
                             continue
+                        # Cache the projected APY for the open log.
+                        net_profit_bps = net_per_window_bps  # backwards-compat name used below
                         # Limit prices at the worst-level + tick buffer.
                         # Buy: pay UP TO this. Sell: accept DOWN TO this.
                         tick_bps = float(cfg.entry_tick_buffer_bps or 1.0)
@@ -1319,7 +1364,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         held_bases.add(base)
                         scan_action = f'opened {c.perp_symbol}'
                         cross_stable_tag = '' if sq == cq else f' [cross-stable {sq}-spot / {cq}-perp]'
-                        log_event(db, f'Opened {c.perp_symbol} qty={pos.quantity:.6f} funding_apy={c.funding_apr:.2%} fill_basis={fill_basis_bps:+.1f}bps net_profit_per_window={net_profit_bps:+.1f}bps spot@{spot_avg:.6f} perp@{perp_avg:.6f}{cross_stable_tag}', mode=mode, exchange=gateway.venue_id)
+                        log_event(db, f'Opened {c.perp_symbol} qty={pos.quantity:.6f} funding_apy={c.funding_apr:.2%} fill_basis={fill_basis_bps:+.1f}bps net_profit_per_window={net_profit_bps:+.1f}bps net_apy={net_apy*100:+.2f}% spot@{spot_avg:.6f} perp@{perp_avg:.6f}{cross_stable_tag}', mode=mode, exchange=gateway.venue_id)
                         bus.emit('position_opened',
                                  position_id=pos.id, mode=mode, exchange=gateway.venue_id,
                                  symbol=c.spot_symbol, quantity=pos.quantity,
