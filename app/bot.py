@@ -664,20 +664,41 @@ def _sweep_non_stable_dust(db, gateway: VenueGateway, cfg: StrategyConfig) -> No
             # against BTC). Skip silently — the user can move it
             # manually if they want.
             continue
-        # Skip below LOT_SIZE.minQty + the fiat-floor heuristic so we
-        # don't endlessly retry truly un-tradeable dust.
+        # Skip below LOT_SIZE.minQty (Binance -1013 / KuCoin equivalent)
         min_amt = gateway.market_min_amount(sell_symbol, perp=False)
         if min_amt > 0 and free < min_amt:
             continue
         px = gateway.safe_price(sell_symbol) or 0
-        if px <= 0 or free * px < _DUST_USDT_FLOOR:
+        if px <= 0:
+            continue
+        notional = free * px
+        # Below the heuristic visible-dust floor — not worth the API call.
+        if notional < _DUST_USDT_FLOOR:
+            continue
+        # Skip below the venue's MIN_NOTIONAL filter (Binance -1013
+        # "Filter failure: NOTIONAL"). ccxt exposes this as
+        # market.limits.cost.min — usually $5-10 USDT on Binance,
+        # $1 on KuCoin. Honouring it upfront avoids a guaranteed
+        # rejection + the WARN log noise the user pointed out.
+        try:
+            mkt = gateway.spot.market(sell_symbol)
+            min_cost = float(((mkt.get('limits') or {}).get('cost') or {}).get('min') or 0)
+        except Exception:
+            min_cost = 0.0
+        if min_cost > 0 and notional < min_cost:
             continue
         try:
-            fill = gateway.close_spot(sell_symbol, free, False, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-            log_event(db, f'Dust sweep: sold {free:.6f} {asset} → USDT (~{free*px:.2f} USDT)',
+            gateway.close_spot(sell_symbol, free, False, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+            log_event(db, f'Dust sweep: sold {free:.6f} {asset} → USDT (~{notional:.2f} USDT)',
                       mode=MODE_LIVE, exchange=gateway.venue_id)
         except Exception as e:
-            log_event(db, f'Dust sweep failed for {asset} on {gateway.name}: {str(e)[:120]}',
+            err = str(e)[:140]
+            # MIN_NOTIONAL or LOT_SIZE rejections that slipped past our
+            # pre-checks (e.g. live ticker drifted between the check and
+            # the order) are uninteresting noise — skip the WARN log.
+            if 'NOTIONAL' in err or 'LOT_SIZE' in err or '-1013' in err:
+                continue
+            log_event(db, f'Dust sweep failed for {asset} on {gateway.name}: {err}',
                       mode=MODE_LIVE, level='WARN', exchange=gateway.venue_id)
 
 
@@ -968,7 +989,13 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     'spot_depth': c.spot_depth_usdt,
                     'perp_depth': c.perp_depth_usdt,
                 } for c in passing[:5]]
-                for sym, reason, apr in rejected_scan[:20]:
+                # Cap raised from 20 → 60 so the top-10 below-threshold
+                # candidates per quote (USDT + USDC) survive alongside
+                # any no_spot_market / volume / depth rejections from
+                # the same scan. With ≤60 rows per cycle × 2 venues × 2
+                # modes × 7-day retention the rejected_candidates table
+                # stays well under a million rows.
+                for sym, reason, apr in rejected_scan[:60]:
                     db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=sym, reason=reason, funding_rate=apr))
 
                 total_equity, free_by_quote = _compute_equity_and_free(db, gateway, mode, cfg)

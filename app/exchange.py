@@ -462,6 +462,12 @@ class VenueGateway:
         # return signature.
         per_quote_total = {q: 0 for q in SUPPORTED_QUOTES}
         per_quote_below_threshold = {q: 0 for q in SUPPORTED_QUOTES}
+        # Top below-threshold per quote so the dashboard's
+        # rejected_candidates table can surface "DOGE/USDC missed entry
+        # at 4.2% APY (threshold 10%)" without flooding the table with
+        # every below-threshold row every cycle. We keep the top-10 by
+        # APR per quote (closest-to-passing first).
+        per_quote_top_below: dict[str, list[tuple[str, float]]] = {q: [] for q in SUPPORTED_QUOTES}
         for symbol, row in rates.items():
             fr = row.get('fundingRate')
             if fr is None:
@@ -480,6 +486,7 @@ class VenueGateway:
             apr = annualize_rate(float(fr), interval_h)
             if apr < entry_apr_threshold:
                 per_quote_below_threshold[quote] += 1
+                per_quote_top_below[quote].append((symbol, apr))
                 continue
             base = symbol.split('/')[0]
             spot_symbol = f'{base}/{quote}'
@@ -550,6 +557,20 @@ class VenueGateway:
                 'passing': per_quote_passing.get(q, 0),
             } for q in SUPPORTED_QUOTES
         }
+        # Surface the top below-threshold candidates per quote into
+        # the rejected list with a clear "below_threshold" reason. We
+        # cap at TOP_BELOW_PER_QUOTE per quote per scan to keep the
+        # rejected_candidates table tractable (≤20 extra rows per
+        # cycle per venue), while still giving the operator visibility
+        # into which symbols are closest to passing — including the
+        # USDC ones whose funding rates rarely clear the threshold
+        # (so they'd otherwise be silently invisible).
+        TOP_BELOW_PER_QUOTE = 10
+        thresh_pct = entry_apr_threshold * 100.0
+        for q, rows in per_quote_top_below.items():
+            rows.sort(key=lambda r: r[1], reverse=True)
+            for sym, apr_val in rows[:TOP_BELOW_PER_QUOTE]:
+                rejected.append((sym, f'below_threshold ({apr_val*100:.2f}% APY < {thresh_pct:.2f}%)', apr_val))
         return passing, total, rejected
 
     # ─── Order placement (ccxt-uniform) ───────────────────────────────────
