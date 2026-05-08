@@ -437,6 +437,61 @@ class VenueGateway:
             pass
         return 5.0
 
+    def prefetch_trading_fees(self) -> tuple[int, int]:
+        """Eager batch read of every taker fee on this venue, called
+        once at worker startup. ccxt's `fetch_trading_fees()` (plural,
+        no symbol arg) returns the venue's fee for every loaded market
+        in a single HTTP call per client — populating the per-symbol
+        cache for both spot and futures so Tier 1's approx-profit
+        pre-filter and Tier 3's exact profit gate both find a warm
+        entry from cycle 1. Returns ``(spot_count, futures_count)``
+        for logging. Never raises — silent failures fall back to
+        per-symbol lazy fetch on first miss."""
+        if not hasattr(self, '_taker_fee_cache'):
+            self._taker_fee_cache: dict = {}
+        now = time.time()
+        spot_n = futures_n = 0
+        for client, perp in ((self.spot, False), (self.futures, True)):
+            try:
+                fees = client.fetch_trading_fees() or {}
+            except Exception:
+                continue
+            for symbol, row in fees.items():
+                try:
+                    taker = float((row or {}).get('taker') or 0)
+                except (TypeError, ValueError):
+                    continue
+                if taker <= 0:
+                    continue
+                self._taker_fee_cache[(symbol, perp)] = (taker * 10000.0, now)
+                if perp:
+                    futures_n += 1
+                else:
+                    spot_n += 1
+        return spot_n, futures_n
+
+    def _approx_round_trip_fee_bps(self, perp_symbol: str, perp: bool = True) -> float:
+        """Cheap round-trip-fee estimate for the Tier 1 scan pre-filter.
+        Reads cached fees if warmup has populated them; falls back to
+        5 bps per leg (4 legs × 5 = 20 bps) otherwise. The base symbol
+        for the spot fee is derived from the perp's symbol so this
+        works without first resolving the cross-stable spot pair —
+        spot fees on a base asset are similar across the venue's
+        supported stable pairs."""
+        cache = getattr(self, '_taker_fee_cache', None) or {}
+        # Approximate spot symbol for fee lookup. KuCoin / Binance
+        # spot fees on `BTC/USDT` and `BTC/USDC` are typically
+        # identical (set at the venue level, not per pair), so using
+        # the perp's quote here is fine for an estimate.
+        base = perp_symbol.split('/')[0]
+        quote = perp_symbol.split(':')[-1] if ':' in perp_symbol else 'USDT'
+        spot_sym = f'{base}/{quote}'
+        spot_cached = cache.get((spot_sym, False))
+        perp_cached = cache.get((perp_symbol, True))
+        spot_fee = spot_cached[0] if spot_cached else 5.0
+        perp_fee = perp_cached[0] if perp_cached else 5.0
+        return 2.0 * (spot_fee + perp_fee)
+
     def safe_balances(self, *, force_refresh: bool = False) -> dict | None:
         """Return ``{'spot': {...}, 'futures': {...}}`` from ccxt, or ``None`` on
         error (with the failure message pinned to ``self.last_balance_error``).
@@ -643,7 +698,28 @@ class VenueGateway:
             per_quote_total[quote] += 1
             interval_h = _interval_hours(row)
             apr = annualize_rate(float(fr), interval_h)
-            if apr < entry_apr_threshold:
+            # Approximate-profitability pre-filter: tighten the funding
+            # threshold by subtracting a conservative round-trip fee
+            # estimate. Cuts candidates whose funding clears the raw
+            # threshold but couldn't possibly survive fees, before we
+            # spend any HTTP budget on book walks at Tier 2. Uses
+            # cached per-symbol fees if available (after warmup), else
+            # 5 bps per leg as a sensible default. Basis is assumed
+            # zero (best case) — Tier 3's exact check uses the actual
+            # fill-price basis. ``apr`` (raw funding APY) is still
+            # used for top-below logging so the operator sees the same
+            # "closest-to-passing by funding" view.
+            try:
+                fee_bps_est = self._approx_round_trip_fee_bps(symbol, perp=True)
+            except Exception:
+                fee_bps_est = 20.0  # 4 legs × 5 bps fallback
+            funding_window_bps = float(fr) * 10000.0
+            approx_net_window_bps = funding_window_bps - fee_bps_est
+            try:
+                approx_net_apy = (1.0 + approx_net_window_bps / 10000.0) ** (24.0 * 365.0 / interval_h) - 1.0
+            except OverflowError:
+                approx_net_apy = float('inf') if approx_net_window_bps > 0 else -1.0
+            if approx_net_apy < entry_apr_threshold:
                 per_quote_below_threshold[quote] += 1
                 per_quote_top_below[quote].append((symbol, apr))
                 continue
