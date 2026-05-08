@@ -2164,15 +2164,43 @@ class KuCoinGateway(VenueGateway):
             return False, str(e)
         return True, ''
 
-    # KuCoin's spot orders execute against the ``trade`` wallet (UI label
-    # "Trading Account"); ``contract`` is the futures wallet. Spot↔futures
-    # transfers move trade↔contract under Classic; under UTA the unified
-    # pool removes the need for these transfers entirely.
+    # KuCoin Classic splits spot funds across two wallets: ``trade``
+    # (where spot orders execute) and ``main`` (where deposits land).
+    # The bot's synthesised ``spot.<asset>.free`` aggregates both —
+    # but a raw `_transfer('trade', 'contract', amt)` only sees the
+    # trade wallet, so it'll fail with "insufficient" if the user's
+    # USDT actually lives in main (which is the default deposit
+    # destination on KuCoin). We hop main → trade first to consolidate
+    # the requested amount into trade, then trade → contract.
     def transfer_spot_to_futures(self, amount: float, paper_mode: bool, asset: str = 'USDT') -> tuple[bool, str]:
         if paper_mode:
             return True, 'paper'
         if amount <= 0:
             return True, 'noop'
+        if self._is_uta:
+            return True, 'UTA mode: unified pool, no transfer needed'
+        # Read each spot sub-wallet's free balance.
+        try:
+            trade_free = float((self.spot.fetch_balance({'type': 'trade'}).get(asset) or {}).get('free') or 0)
+        except Exception:
+            trade_free = 0.0
+        try:
+            main_free = float((self.spot.fetch_balance({'type': 'main'}).get(asset) or {}).get('free') or 0)
+        except Exception:
+            main_free = 0.0
+        if trade_free + 1e-9 >= amount:
+            # Enough already in trade — single hop.
+            return self._transfer('trade', 'contract', amount, asset=asset)
+        if trade_free + main_free + 1e-9 < amount:
+            return False, (
+                f'insufficient {asset} on KuCoin spot wallets '
+                f'(trade={trade_free:.4f} + main={main_free:.4f} < {amount:.4f})'
+            )
+        # Hop the shortfall main → trade first, then trade → contract.
+        shortfall = max(0.0, amount - trade_free)
+        ok1, err1 = self._transfer('main', 'trade', shortfall, asset=asset)
+        if not ok1:
+            return False, f'main→trade hop failed: {err1}'
         return self._transfer('trade', 'contract', amount, asset=asset)
 
     def transfer_futures_to_spot(self, amount: float, paper_mode: bool, asset: str = 'USDT') -> tuple[bool, str]:
