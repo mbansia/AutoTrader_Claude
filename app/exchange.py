@@ -201,6 +201,10 @@ class VenueGateway:
         self.spot = None
         self.futures = None
         self.last_balance_error: str = ''
+        # Per-quote coverage from the last scan_funding call. Populated
+        # so the bot loop can surface "scanned N USDT + M USDC perps"
+        # in scan_results.note for dashboard visibility.
+        self.last_scan_per_quote: dict = {}
         # Per-endpoint error map populated by ``list_capital_flow_records``
         # so /monitoring can show which API endpoint refused (most common
         # cause: missing permission on the API key).
@@ -450,6 +454,14 @@ class VenueGateway:
         passing: list[Candidate] = []
         rejected: list[tuple[str, str, float]] = []
         total = 0
+        # Per-quote scan-coverage counts so the dashboard can surface
+        # "scanned N USDT + M USDC perps" — gives the operator real
+        # confidence that USDC pairs are reaching the scan, not silently
+        # being filtered out somewhere upstream. Stored on the gateway
+        # so the bot loop can read it without changing this method's
+        # return signature.
+        per_quote_total = {q: 0 for q in SUPPORTED_QUOTES}
+        per_quote_below_threshold = {q: 0 for q in SUPPORTED_QUOTES}
         for symbol, row in rates.items():
             fr = row.get('fundingRate')
             if fr is None:
@@ -463,9 +475,11 @@ class VenueGateway:
             if quote is None:
                 continue
             total += 1
+            per_quote_total[quote] += 1
             interval_h = _interval_hours(row)
             apr = annualize_rate(float(fr), interval_h)
             if apr < entry_apr_threshold:
+                per_quote_below_threshold[quote] += 1
                 continue
             base = symbol.split('/')[0]
             spot_symbol = f'{base}/{quote}'
@@ -525,6 +539,17 @@ class VenueGateway:
             ))
         # Rank by funding APY first; ties go to the deeper book.
         passing.sort(key=lambda c: (c.funding_apr, c.min_depth_usdt), reverse=True)
+        # Stash per-quote coverage for the scan-result note.
+        per_quote_passing = {q: 0 for q in SUPPORTED_QUOTES}
+        for c in passing:
+            per_quote_passing[c.quote_currency] = per_quote_passing.get(c.quote_currency, 0) + 1
+        self.last_scan_per_quote = {
+            q: {
+                'total': per_quote_total.get(q, 0),
+                'below_threshold': per_quote_below_threshold.get(q, 0),
+                'passing': per_quote_passing.get(q, 0),
+            } for q in SUPPORTED_QUOTES
+        }
         return passing, total, rejected
 
     # ─── Order placement (ccxt-uniform) ───────────────────────────────────

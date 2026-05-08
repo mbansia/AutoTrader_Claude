@@ -624,6 +624,63 @@ def _maybe_prune_rejected_candidates(db) -> None:
     _LAST_REJECTED_PRUNE_AT[0] = now
 
 
+_DUST_USDT_FLOOR = 1.0   # USDT-equivalent below which we don't bother
+                         # selling (most exchanges have $5+ min notional;
+                         # 1 USDT keeps the floor below the visible-clutter
+                         # threshold without spamming retries on truly
+                         # un-tradeable amounts)
+
+
+def _sweep_non_stable_dust(db, gateway: VenueGateway, cfg: StrategyConfig) -> None:
+    """Sell every non-USDT/USDC asset on the venue that isn't part of
+    an open position back into USDT. Live mode only. Best-effort:
+    failures log a single WARN per asset and the next cycle retries."""
+    bals = gateway.safe_balances() or {}
+    spot = bals.get('spot') or {}
+    open_ps = db.scalars(select(Position).where(
+        Position.status == 'open',
+        Position.mode == MODE_LIVE,
+        Position.exchange == gateway.venue_id,
+    )).all()
+    held_bases = {p.spot_symbol.split('/')[0] for p in open_ps}
+    META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
+    for asset, bal in spot.items():
+        if asset in META_KEYS or not isinstance(bal, dict):
+            continue
+        # Stables stay; held-position bases stay; everything else gets sold.
+        if asset in ('USDT', 'USDC'):
+            continue
+        if asset in held_bases:
+            continue
+        try:
+            free = float(bal.get('free') or 0)
+        except (TypeError, ValueError):
+            continue
+        if free <= 0:
+            continue
+        sell_symbol = f'{asset}/USDT'
+        if sell_symbol not in (gateway.spot.markets or {}):
+            # No /USDT pair (e.g. BFUSD, fiat, asset that only trades
+            # against BTC). Skip silently — the user can move it
+            # manually if they want.
+            continue
+        # Skip below LOT_SIZE.minQty + the fiat-floor heuristic so we
+        # don't endlessly retry truly un-tradeable dust.
+        min_amt = gateway.market_min_amount(sell_symbol, perp=False)
+        if min_amt > 0 and free < min_amt:
+            continue
+        px = gateway.safe_price(sell_symbol) or 0
+        if px <= 0 or free * px < _DUST_USDT_FLOOR:
+            continue
+        try:
+            fill = gateway.close_spot(sell_symbol, free, False, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+            log_event(db, f'Dust sweep: sold {free:.6f} {asset} → USDT (~{free*px:.2f} USDT)',
+                      mode=MODE_LIVE, exchange=gateway.venue_id)
+        except Exception as e:
+            log_event(db, f'Dust sweep failed for {asset} on {gateway.name}: {str(e)[:120]}',
+                      mode=MODE_LIVE, level='WARN', exchange=gateway.venue_id)
+
+
 def _maybe_ingest_capital_flows(db, gateway: VenueGateway, mode: str) -> int:
     key = (mode, gateway.venue_id)
     now = time.time()
@@ -889,6 +946,19 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     passing, candidates_total, rejected_scan = [], 0, []
                     log_event(db, f'scan_funding failed: {e}', mode=mode, level='ERROR', exchange=gateway.venue_id)
                 candidates_passing = len(passing)
+                # Per-quote scan coverage so /logs scan-history rows
+                # show "USDT: 320 total / 12 passing · USDC: 18 total /
+                # 1 passing" instead of just one aggregate count. Lets
+                # the operator confirm USDC perps are reaching the
+                # scanner without hunting through rejected_candidates.
+                pq = getattr(gateway, 'last_scan_per_quote', {}) or {}
+                if pq:
+                    parts = [
+                        f"{q}: {pq.get(q, {}).get('total', 0)} total / {pq.get(q, {}).get('passing', 0)} passing"
+                        for q in ('USDT', 'USDC') if pq.get(q, {}).get('total', 0) > 0
+                    ]
+                    if parts:
+                        scan_note = ' · '.join(parts)
                 top_candidates_payload = [{
                     'perp': c.perp_symbol,
                     'fr': c.funding_rate,
@@ -1114,6 +1184,17 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             log_event(db, f'Drained {amt:.2f} {q} futures→spot (kept {keep:.2f} as margin buffer; {len(open_ps_q)} {q} pos open)', mode=mode, exchange=gateway.venue_id)
                         else:
                             log_event(db, f'futures→spot {q} drain failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
+
+            # Dust sweep — convert any non-stable, non-position asset
+            # back to USDT so the wallet stays clean. Runs every cycle
+            # in live mode. Skips USDT/USDC (already stable), assets
+            # that are the spot leg of an open position on this venue
+            # (selling those would unhedge the arb), assets without a
+            # /USDT spot market, and quantities below the symbol's
+            # min-lot. Logs each successful sweep at INFO; failures
+            # at WARN so the operator sees a stuck dust balance.
+            if mode == MODE_LIVE:
+                _sweep_non_stable_dust(db, gateway, cfg)
 
             # End-of-cycle bookkeeping. Two cadences:
             #   * Capital-flow ingest (deposits / withdrawals / transfers)
