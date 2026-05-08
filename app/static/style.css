@@ -491,6 +491,34 @@ th.sortable.sort-asc::after { content: '▲'; opacity: 1; color: var(--accent); 
 th.sortable.sort-desc::after { content: '▼'; opacity: 1; color: var(--accent); }
 th.sortable:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
 
+/* Per-column filter row injected into <thead>. Compact inputs that
+   sit directly under each header cell. */
+tr.col-filter-row th.col-filter-cell {
+  padding: 4px 6px;
+  background: var(--panel-2);
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: 400;
+}
+tr.col-filter-row .col-filter-input {
+  width: 100%;
+  min-width: 0;
+  padding: 3px 6px;
+  font-size: 11px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: inherit;
+  box-sizing: border-box;
+}
+tr.col-filter-row .col-filter-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+tr.col-filter-row .col-filter-input::placeholder { color: var(--muted); opacity: 0.6; }
+
 .table-search-wrap {
   display: flex;
   justify-content: flex-end;
