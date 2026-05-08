@@ -1152,20 +1152,19 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         perp_leg_free = fut_free_by_q.get(cq, 0.0)
                         free_for_arb = min(spot_leg_free, perp_leg_free)
                         wallet_cap = free_for_arb * 0.97
-                        depth_cap = 0.25 * (c.min_depth_usdt or 0)
-                        volume_cap = 0.005 * (c.quote_volume or 0)
-                        if depth_cap <= 0:
-                            depth_cap = float('inf')
-                        if volume_cap <= 0:
-                            volume_cap = float('inf')
-                        sized_notional = min(wallet_cap, desired_notional, depth_cap, volume_cap)
+                        # Liquidity is gated entirely at execution time
+                        # via the order-book walk (`simulate_fill`).
+                        # Sizing only respects wallet + max-position-pct
+                        # caps now; depth and volume heuristics dropped
+                        # — they were rejecting tradable pairs (e.g.
+                        # SOL/USDC at 119% APY rejected for "depth<1000"
+                        # when the bot was trying to buy a few USD).
+                        sized_notional = min(wallet_cap, desired_notional)
                         if sized_notional < min_notional:
                             quote_label = cq if sq == cq else f'{sq}-spot/{cq}-perp'
                             reason = (f'below min position pct ({sized_notional:.2f} < {min_notional:.2f}; '
                                       f'wallet={wallet_cap:.2f} [{quote_label}] '
-                                      f'max_pct={desired_notional:.2f} '
-                                      f'depth_cap={depth_cap if depth_cap != float("inf") else "—"} '
-                                      f'vol_cap={volume_cap if volume_cap != float("inf") else "—"})')
+                                      f'max_pct={desired_notional:.2f})')
                             db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=reason, funding_rate=c.funding_apr))
                             scan_action = 'below_min_pct'
                             continue
