@@ -1008,9 +1008,6 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                 try:
                     passing, candidates_total, rejected_scan = gateway.scan_funding(
                         cfg.entry_funding_threshold,
-                        cfg.min_24h_quote_volume,
-                        min_depth_usdt=cfg.min_order_book_depth_usdt or 0.0,
-                        depth_band_bps=cfg.depth_band_bps or 10.0,
                     )
                 except Exception as e:
                     passing, candidates_total, rejected_scan = [], 0, []

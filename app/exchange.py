@@ -578,14 +578,12 @@ class VenueGateway:
     def scan_funding(
         self,
         entry_apr_threshold: float,
-        min_quote_volume: float,
-        min_depth_usdt: float = 0.0,
-        depth_band_bps: float = 10.0,
     ) -> tuple[list[Candidate], int, list[tuple[str, str, float]]]:
         """Scan this venue's USDT- AND USDC-perp funding rates. Returns
         ``(passing, total_examined, rejected)`` where:
-        * ``passing`` is the ranked list of :class:`Candidate` rows that survived
-          every filter (APR threshold, quote volume, liquidity).
+        * ``passing`` is the ranked list of :class:`Candidate` rows whose funding
+          APR cleared ``entry_apr_threshold`` and whose base asset has at
+          least one supported-quote spot pair on this venue.
         * ``total_examined`` is the number of perps whose funding rate ccxt
           returned — useful to confirm the API is actually live.
         * ``rejected`` is a list of ``(symbol, reason, apr)`` for the Logs tab.
@@ -717,25 +715,22 @@ class VenueGateway:
             apr = annualize_rate(fr_v, interval_h)
             t = tickers.get(spot_symbol) or {}
             qv = float(t.get('quoteVolume') or 0)
-            if qv < min_quote_volume:
-                rejected.append((symbol, f'volume<{min_quote_volume:.0f}', apr))
-                continue
-            spot_depth = perp_depth = 0.0
-            if min_depth_usdt > 0:
-                spot_depth = self.order_book_depth_usdt(spot_symbol, side='ask', band_bps=depth_band_bps, perp=False)
-                perp_depth = self.order_book_depth_usdt(symbol, side='bid', band_bps=depth_band_bps, perp=True)
-                tight = min(spot_depth, perp_depth)
-                if tight < min_depth_usdt:
-                    rejected.append((symbol, f'depth<{min_depth_usdt:.0f} (spot {spot_depth:.0f} / perp {perp_depth:.0f} @ ±{depth_band_bps:.0f}bps)', apr))
-                    continue
+            # Liquidity gating happens at the per-candidate execution
+            # stage now (book-walk via `simulate_fill` against the
+            # bot's actual sizing). The hard-coded scan-time depth +
+            # volume thresholds rejected pairs the bot would trade
+            # fine at small size — `simulate_fill` is the single
+            # source of truth. ``quote_volume`` is still passed to
+            # the Candidate so the dashboard can display it; the
+            # value is for reporting only, no longer a gate.
             passing.append(Candidate(
                 spot_symbol=spot_symbol,
                 perp_symbol=symbol,
                 funding_rate=fr_v,
                 funding_interval_hours=interval_h,
                 quote_volume=qv,
-                spot_depth_usdt=spot_depth,
-                perp_depth_usdt=perp_depth,
+                spot_depth_usdt=0.0,
+                perp_depth_usdt=0.0,
                 venue_id=self.venue_id,
                 quote_currency=quote,
                 spot_quote_currency=spot_quote,
