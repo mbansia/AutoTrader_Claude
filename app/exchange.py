@@ -1510,18 +1510,26 @@ class BinanceGateway(VenueGateway):
             cm_free = _f(r.get('crossMarginFree'))
             um_balance = _f(r.get('umWalletBalance'))
             cm_balance = _f(r.get('cmWalletBalance'))
-            free = cm_free + um_balance
+            # PM auto-collateral pools cross-margin + UM + CM-futures
+            # buckets — all three are movable to fund any leg. Sum
+            # them so a fresh account that happens to have its USDT
+            # in (say) cmWalletBalance gets correctly counted as
+            # deployable. The first iteration of this fix only summed
+            # cm_free + um_balance, which missed CM-futures USDT.
+            free = cm_free + um_balance + cm_balance
             # Total wallet across PM components per Binance docs:
             # totalWalletBalance = crossMarginFree + crossMarginLocked
             #                      + umWalletBalance + cmWalletBalance.
             total = _f(r.get('totalWalletBalance'))
             if total <= 0:
-                # Fall back to summing the parts if the venue didn't
-                # populate totalWalletBalance.
                 total = cm_free + _f(r.get('crossMarginLocked')) + um_balance + cm_balance
             if total <= 0:
-                # Last-ditch: classic balance shape on a non-PM key.
                 total = _f(r.get('total')) or free
+            # Cap free at total — should already hold by construction,
+            # but defensively prevents any "free > total" anomaly from
+            # quirky API responses.
+            if free > total:
+                free = total
             if asset in SUPPORTED_QUOTES:
                 quote_totals[asset] += total
                 quote_free[asset] += free
