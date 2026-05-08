@@ -301,6 +301,13 @@ class StrategyConfig(Base):
     delisting_check: Mapped[bool] = mapped_column(Boolean, default=True)
     # Live-only: auto-move USDT spot↔futures so the perp leg always has margin.
     auto_transfer_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Auto-swap USDT ↔ USDC pre-trade when a candidate's quote
+    # currency wallet is empty but the OTHER stable has surplus.
+    # Routed through the venue's USDC/USDT spot pair via the bot's
+    # protected limit-IOC path with a ±50 bps de-peg guard. Enables
+    # the bot to take USDC-quoted perp opportunities even when the
+    # account is funded only in USDT (or vice versa).
+    auto_quote_swap_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     # Continuous spot ↔ futures rebalance: keep both wallets' free balances near
     # equal each cycle. Threshold is the minimum imbalance (USDT) before we move.
     auto_rebalance_threshold: Mapped[float] = mapped_column(Float, default=1.0)

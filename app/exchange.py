@@ -976,6 +976,84 @@ class VenueGateway:
     def close_perp_limit_ioc(self, symbol: str, amount: float, limit_price: float, paper_mode: bool, slippage_bps: float, fee_bps: float) -> dict:
         return self._limit_ioc_order('futures', symbol, 'buy', amount, limit_price, paper_mode, slippage_bps, fee_bps)
 
+    # ─── Cross-stable swap (USDT ↔ USDC) ──────────────────────────────────
+    # Used by the bot when a candidate's quote currency wallet is empty
+    # but the OTHER stable has surplus. Routes through the venue's
+    # USDC/USDT spot pair using the same simulate_fill + limit-IOC
+    # plumbing as a normal trade. Defensive: aborts if the pair has
+    # de-pegged outside ±50 bps from $1, so a USDC-depeg flash doesn't
+    # hand us a 5%+ haircut on what should be a 1:1 stable swap.
+
+    QUOTE_SWAP_PAIR = 'USDC/USDT'      # ccxt-normalized; base=USDC, quote=USDT
+    QUOTE_SWAP_DEPEG_FLOOR = 0.995     # 50 bps de-peg guard
+    QUOTE_SWAP_DEPEG_CEILING = 1.005
+
+    def swap_quote(
+        self,
+        from_quote: str,
+        to_quote: str,
+        target_to_quote_amount: float,
+        paper_mode: bool,
+        slippage_bps: float = 5.0,
+    ) -> tuple[float, float, str]:
+        """Convert ``from_quote`` → ``to_quote`` so the bot acquires at
+        least ``target_to_quote_amount`` units of ``to_quote``. Returns
+        ``(filled_to_quote_units, avg_price, error_msg)``. Empty
+        error_msg + filled > 0 = success. Direction is encoded by the
+        side on USDC/USDT:
+
+          USDT → USDC   buy  USDC/USDT (pay USDT, receive USDC)
+          USDC → USDT   sell USDC/USDT (pay USDC, receive USDT)
+
+        Walks the book first via simulate_fill so the limit-IOC at
+        worst-level + tiny tick buffer guarantees the requested size
+        fills cleanly. The de-peg guard refuses to swap if the avg
+        fill price falls outside [0.995, 1.005] — a meaningful
+        de-peg means stables aren't trading at par and the bot
+        should NOT silently trade through it."""
+        pair = self.QUOTE_SWAP_PAIR
+        if pair not in (self.spot.markets or {}):
+            return 0.0, 0.0, f'{pair} not listed on {self.name}'
+        if from_quote == to_quote:
+            return 0.0, 0.0, f'no-op swap requested ({from_quote} → {to_quote})'
+        if from_quote == 'USDT' and to_quote == 'USDC':
+            side = 'buy'
+            order_amount = target_to_quote_amount  # USDC base units
+        elif from_quote == 'USDC' and to_quote == 'USDT':
+            side = 'sell'
+            # We want to RECEIVE target_to_quote_amount USDT; the order
+            # is on USDC base, so amount = target / price ≈ target.
+            order_amount = target_to_quote_amount
+        else:
+            return 0.0, 0.0, f'unsupported swap direction: {from_quote} → {to_quote}'
+        # Walk the book to get realistic avg + worst.
+        sim = self.simulate_fill(pair, order_amount, side=side, perp=False)
+        if not sim.get('ok') or sim.get('filled_qty', 0) <= 0:
+            return 0.0, 0.0, f'insufficient depth on {pair} for {order_amount:.4f} ({sim.get("error", "")})'
+        avg = float(sim['avg_price'] or 0.0)
+        worst = float(sim['worst_price'] or 0.0)
+        if avg < self.QUOTE_SWAP_DEPEG_FLOOR or avg > self.QUOTE_SWAP_DEPEG_CEILING:
+            return 0.0, 0.0, f'{pair} de-pegged: avg={avg:.4f} outside [{self.QUOTE_SWAP_DEPEG_FLOOR}, {self.QUOTE_SWAP_DEPEG_CEILING}] safety bound'
+        # Limit-IOC at worst + 1 bp buffer.
+        if side == 'buy':
+            limit = worst * 1.0001
+        else:
+            limit = worst * 0.9999
+        try:
+            fill = self._limit_ioc_order('spot', pair, side, order_amount, limit,
+                                         paper_mode, slippage_bps=slippage_bps, fee_bps=5.0)
+        except Exception as e:
+            return 0.0, 0.0, f'swap order failed: {str(e)[:120]}'
+        filled_qty = float(fill.get('filled') or 0)
+        fill_avg = float(fill.get('price') or avg or 1.0)
+        if filled_qty <= 0:
+            return 0.0, 0.0, 'limit-IOC zero fill (book moved during round-trip)'
+        # Translate filled into to_quote units.
+        if side == 'buy':
+            return filled_qty, fill_avg, ''  # filled = USDC acquired
+        else:
+            return filled_qty * fill_avg, fill_avg, ''  # USDC sold × price = USDT received
+
     # ─── Margin mode + leverage (ccxt-uniform — both Binance & KuCoin) ────
 
     def configure_perp_for_arb(self, symbol: str) -> tuple[bool, str]:

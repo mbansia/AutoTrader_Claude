@@ -1197,14 +1197,62 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         perp_leg_free = fut_free_by_q.get(cq, 0.0)
                         free_for_arb = min(spot_leg_free, perp_leg_free)
                         wallet_cap = free_for_arb * 0.97
-                        # Liquidity is gated entirely at execution time
-                        # via the order-book walk (`simulate_fill`).
-                        # Sizing only respects wallet + max-position-pct
-                        # caps now; depth and volume heuristics dropped
-                        # — they were rejecting tradable pairs (e.g.
-                        # SOL/USDC at 119% APY rejected for "depth<1000"
-                        # when the bot was trying to buy a few USD).
                         sized_notional = min(wallet_cap, desired_notional)
+                        # Auto-swap USDT ↔ USDC when one quote's wallet
+                        # is empty but the OTHER stable has surplus —
+                        # lets a USDT-funded account take USDC-quoted
+                        # perp opportunities (and vice versa) without
+                        # the operator manually pre-allocating both
+                        # stables. Goes through the gateway's protected
+                        # swap_quote which has a ±50 bps de-peg guard.
+                        if (sized_notional < min_notional
+                                and mode == MODE_LIVE
+                                and getattr(cfg, 'auto_quote_swap_enabled', True)
+                                and sq == cq):  # only attempt when both legs need the same quote
+                            short_q = cq
+                            surplus_q = 'USDT' if short_q == 'USDC' else 'USDC'
+                            surplus_total_free = spot_free_by_q.get(surplus_q, 0.0) + fut_free_by_q.get(surplus_q, 0.0)
+                            target_swap = min_notional * 1.5  # buffer over the floor
+                            # Don't drain more than half the surplus quote — leaves
+                            # room for further trades on the other stable.
+                            if surplus_total_free >= target_swap * 1.05 and surplus_total_free > 1.0:
+                                cap_by_surplus = surplus_total_free * 0.5
+                                target_swap = min(target_swap, cap_by_surplus)
+                                filled, swap_avg, swap_err = gateway.swap_quote(
+                                    surplus_q, short_q, target_swap, paper, slippage_bps=cfg.paper_slippage_bps,
+                                )
+                                if filled > 0:
+                                    log_event(db, f'Auto-swap {surplus_q}→{short_q}: acquired {filled:.4f} {short_q} @ {swap_avg:.4f} for {c.perp_symbol} entry', mode=mode, exchange=gateway.venue_id)
+                                    # Re-read live balances and equalise
+                                    # the new short_q across spot/futures
+                                    # wallets (Classic only — under
+                                    # unified margin the swap is already
+                                    # available to either leg).
+                                    bals_after = gateway.safe_balances(force_refresh=True) or {}
+                                    for q in ('USDT', 'USDC'):
+                                        spot_free_by_q[q] = float((bals_after.get('spot', {}).get(q) or {}).get('free') or 0)
+                                        fut_free_by_q[q] = float((bals_after.get('futures', {}).get(q) or {}).get('free') or 0)
+                                    fut_total_q = float((bals_after.get('futures', {}).get(short_q) or {}).get('total') or 0)
+                                    if fut_total_q > 0.001:
+                                        # Classic — split new short_q half-and-half across wallets.
+                                        sf2 = spot_free_by_q.get(short_q, 0.0)
+                                        ff2 = fut_free_by_q.get(short_q, 0.0)
+                                        midpoint = (sf2 + ff2) / 2.0
+                                        if sf2 > midpoint + 0.10:
+                                            move = sf2 - midpoint
+                                            ok2, err2 = gateway.transfer_spot_to_futures(move, paper, asset=short_q)
+                                            if ok2:
+                                                spot_free_by_q[short_q] = sf2 - move
+                                                fut_free_by_q[short_q] = ff2 + move
+                                                log_event(db, f'Post-swap rebalance: {move:.4f} {short_q} spot→futures (split for arb legs)', mode=mode, exchange=gateway.venue_id)
+                                    # Recompute sizing.
+                                    spot_leg_free = spot_free_by_q.get(sq, 0.0)
+                                    perp_leg_free = fut_free_by_q.get(cq, 0.0)
+                                    free_for_arb = min(spot_leg_free, perp_leg_free)
+                                    wallet_cap = free_for_arb * 0.97
+                                    sized_notional = min(wallet_cap, desired_notional)
+                                else:
+                                    log_event(db, f'Auto-swap {surplus_q}→{short_q} skipped: {swap_err[:120]}', mode=mode, level='WARN', exchange=gateway.venue_id)
                         if sized_notional < min_notional:
                             quote_label = cq if sq == cq else f'{sq}-spot/{cq}-perp'
                             uta_tag = ''
