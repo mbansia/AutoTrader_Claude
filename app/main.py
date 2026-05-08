@@ -984,7 +984,13 @@ def transactions_page(request: Request, view: str | None = None, limit: int = 10
 
 
 @app.get('/logs', response_class=HTMLResponse)
-def logs_page(request: Request, view: str | None = None, view_cookie: str | None = Cookie(default=None, alias='view'), _: None = Depends(auth)):
+def logs_page(
+    request: Request,
+    view: str | None = None,
+    view_cookie: str | None = Cookie(default=None, alias='view'),
+    reject_q: str | None = None,
+    _: None = Depends(auth),
+):
     v = _resolve_view(view, view_cookie)
     with SessionLocal() as db:
         ctx = _shared_ctx(request, v, db)
@@ -1013,8 +1019,26 @@ def logs_page(request: Request, view: str | None = None, view_cookie: str | None
         events = db.scalars(select(BotEvent).where(BotEvent.mode == v).order_by(desc(BotEvent.id)).limit(100)).all()
         events_v = [{'ts': _fmt_ts(e.ts), 'venue': e.exchange, 'level': e.level, 'message': e.message} for e in events]
 
-        rejected = db.scalars(select(RejectedCandidate).where(RejectedCandidate.mode == v).order_by(desc(RejectedCandidate.id)).limit(50)).all()
+        # Rejected candidates: server-side search over the WHOLE table
+        # when ``reject_q`` is set (so the operator can debug why a given
+        # symbol never got opened across the full history). No-query
+        # mode shows the last 50 as the cheap default; query mode caps
+        # at 1000 rows so the page stays renderable on a busy DB.
+        rq = (reject_q or '').strip()
+        rejected_total = db.scalar(select(func.count(RejectedCandidate.id)).where(RejectedCandidate.mode == v)) or 0
+        rejected_stmt = select(RejectedCandidate).where(RejectedCandidate.mode == v)
+        if rq:
+            like = f'%{rq}%'
+            rejected_stmt = rejected_stmt.where(
+                RejectedCandidate.symbol.ilike(like) | RejectedCandidate.reason.ilike(like)
+            )
+            rejected_stmt = rejected_stmt.order_by(desc(RejectedCandidate.id)).limit(1000)
+        else:
+            rejected_stmt = rejected_stmt.order_by(desc(RejectedCandidate.id)).limit(50)
+        rejected = db.scalars(rejected_stmt).all()
         rejected_v = [{'ts': _fmt_ts(r.ts), 'venue': r.exchange, 'symbol': r.symbol, 'reason': r.reason, 'funding_rate': r.funding_rate} for r in rejected]
+        ctx['reject_q'] = rq
+        ctx['rejected_total'] = rejected_total
 
         trades = db.scalars(select(Trade).where(Trade.mode == v).order_by(desc(Trade.id)).limit(30)).all()
         trades_v = [{'ts': _fmt_ts(t.ts), 'symbol': t.symbol, 'exchange': t.exchange, 'leg': t.venue, 'side': t.side, 'quantity': t.quantity, 'price': t.price, 'fee': t.fee} for t in trades]

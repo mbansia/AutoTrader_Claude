@@ -463,6 +463,12 @@ tr.position-stuck:hover > td { background: color-mix(in srgb, var(--bad) 14%, tr
 
 /* ===== Searchable / collapsible tables ============================ */
 
+/* Class selectors set `display: grid` / `display: flex` on rows (e.g.
+   `.log-line`) which would override the browser's UA `[hidden]` rule.
+   Force-hide any element our table helper marks hidden so collapse +
+   search filtering work for non-table containers. */
+[hidden] { display: none !important; }
+
 .table-search-wrap {
   display: flex;
   justify-content: flex-end;
