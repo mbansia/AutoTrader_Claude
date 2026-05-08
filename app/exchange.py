@@ -1414,11 +1414,38 @@ class BinanceGateway(VenueGateway):
         per_asset: dict[str, dict] = {}
         for r in rows:
             asset = r.get('asset') or r.get('currency') or ''
-            try:
-                free = float(r.get('crossMarginFree') or r.get('umWalletBalance') or r.get('free') or 0)
-                total = float(r.get('totalWalletBalance') or r.get('crossMarginAsset') or r.get('total') or free)
-            except (TypeError, ValueError):
-                continue
+            # Binance returns these as STRINGS ("0", "30.5", ...) and
+            # the previous OR-chain `r.get('crossMarginFree') or
+            # r.get('umWalletBalance') or 0` short-circuited on the
+            # first truthy STRING — including "0", which IS truthy
+            # before float-conversion. That meant a PM account with
+            # all the USDT in the UM wallet (umWalletBalance="30")
+            # but zero in cross-margin (crossMarginFree="0") got
+            # parsed as 0 free and the $30 was invisible to sizing.
+            # Fix: float-parse each field independently, then SUM
+            # cross-margin + UM (Binance PM auto-collateral lets
+            # either bucket fund either leg). Locked / borrowed /
+            # interest stay excluded — they're not deployable.
+            def _f(v):
+                try:
+                    return float(v or 0)
+                except (TypeError, ValueError):
+                    return 0.0
+            cm_free = _f(r.get('crossMarginFree'))
+            um_balance = _f(r.get('umWalletBalance'))
+            cm_balance = _f(r.get('cmWalletBalance'))
+            free = cm_free + um_balance
+            # Total wallet across PM components per Binance docs:
+            # totalWalletBalance = crossMarginFree + crossMarginLocked
+            #                      + umWalletBalance + cmWalletBalance.
+            total = _f(r.get('totalWalletBalance'))
+            if total <= 0:
+                # Fall back to summing the parts if the venue didn't
+                # populate totalWalletBalance.
+                total = cm_free + _f(r.get('crossMarginLocked')) + um_balance + cm_balance
+            if total <= 0:
+                # Last-ditch: classic balance shape on a non-PM key.
+                total = _f(r.get('total')) or free
             if asset in SUPPORTED_QUOTES:
                 quote_totals[asset] += total
                 quote_free[asset] += free
