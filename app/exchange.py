@@ -1936,34 +1936,23 @@ class KuCoinGateway(VenueGateway):
         return self._main_wallet_usdt()
 
     # ─── Auto-lend toggle (KuCoin) ────────────────────────────────────────
-    # Calls /api/v1/margin/toggle-auto-lend with sensible defaults:
-    #   isEnable     = True (or False to disable)
-    #   currency     = USDT
-    #   retainSize   = 0    — lend everything; sub-account API keys can
-    #                          revoke per-call as needed
-    #   dailyIntRate = 0    — accept any rate; better than missing fills
-    #                          on tight days and the realised yield will
-    #                          track the venue's clearing rate
-    #   term         = 7    — KuCoin's standard lend term in days
-    # Idempotent: repeated calls with the same isEnable just return the
-    # existing state. The bot calls this once per startup so the setting
-    # converges to whatever ``cfg.kucoin_auto_lend_enabled`` is.
+    # The legacy /api/v1/margin/toggle-auto-lend endpoint is no longer
+    # exposed by ccxt's KuCoin client (KuCoin restructured the lending
+    # API in 2024-2025; the standalone "Margin Lending" market is
+    # mostly subsumed by KuCoin Earn / UTA's auto-lend behaviour
+    # configured via the venue UI). The bot does NOT toggle auto-lend
+    # programmatically — it has to be turned on once per asset in the
+    # KuCoin web UI (Earn → Crypto Lending → Auto-Lend toggle for
+    # USDT, or under UTA: account-level setting).
+    #
+    # We keep this method as a clean status reporter so the dashboard
+    # can show the operator what's configured rather than spamming
+    # WARN logs on every startup.
     def toggle_auto_lend(self, enabled: bool = True, asset: str = 'USDT') -> tuple[bool, str]:
-        fn = (getattr(self.spot, 'privatePostMarginToggleAutoLend', None)
-              or getattr(self.spot, 'private_post_margin_toggle_auto_lend', None))
-        if fn is None:
-            return False, 'privatePostMarginToggleAutoLend not exposed by this ccxt build'
-        try:
-            fn({
-                'currency': asset,
-                'isEnable': bool(enabled),
-                'retainSize': '0',
-                'dailyIntRate': '0',
-                'term': 7,
-            })
-        except Exception as e:
-            return False, str(e)[:200]
-        return True, ''
+        return False, ('KuCoin auto-lend toggle is no longer API-exposed (ccxt build does not have '
+                       'privatePostMarginToggleAutoLend). Enable it manually once: KuCoin UI → Earn → '
+                       'Crypto Lending → Auto-Lend → USDT. Funds in the funding wallet auto-lend '
+                       'continuously after that and stay usable as cross-margin collateral under UTA.')
 
     def earn_subscribe(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
         if paper_mode:

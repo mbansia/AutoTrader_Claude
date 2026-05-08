@@ -1046,18 +1046,18 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     desired_notional = cfg.max_position_pct * total_equity
                     min_notional = cfg.min_position_pct * total_equity
 
-                    # Top up spot from Earn (once per cycle, not per candidate).
-                    if cfg.earn_enabled and spot_free < desired_notional and earn.deployed_usdt > 0.10:
-                        need = min(desired_notional - spot_free, earn.deployed_usdt)
-                        if need >= 0.10:
-                            ok, err = gateway.earn_redeem(need, paper)
-                            if ok:
-                                earn.deployed_usdt -= need
-                                spot_free += need
-                                log_event(db, f'Redeemed {need:.4f} USDT from earn before opening', mode=mode, exchange=gateway.venue_id)
-                            else:
-                                earn.last_error = err
-                                log_event(db, f'Earn redeem USDT (need={need:.4f}) failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                    # NOTE: speculative pre-trade earn-redeem REMOVED. The
+                    # previous code redeemed from earn → spot at the top
+                    # of the open path, before checking whether any
+                    # candidate actually passes basis / depth / sizing
+                    # filters. Result on a venue with no passing
+                    # candidates (e.g. KuCoin where most small-caps lack
+                    # spot markets) — money flowed earn → spot → cycle
+                    # ends → post-cycle sweep moves it back to earn.
+                    # Same loop every 30s, no trades. The redeem now
+                    # lives inside the per-candidate loop below, AFTER
+                    # the basis check passes, so it only fires when an
+                    # entry is actually about to be placed.
 
                     # Transfer spot→futures so the perp leg has margin (once per cycle).
                     if mode == MODE_LIVE and cfg.auto_transfer_enabled and fut_free < desired_notional and spot_free > desired_notional:
@@ -1135,6 +1135,25 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             scan_action = 'basis_too_wide'
                             continue
                         qty = sized_notional / max(0.0001, spot_px)
+                        # Just-in-time earn redeem: this candidate has
+                        # passed every gate above; only NOW pull funds
+                        # from earn for the spot leg's exact need. Avoids
+                        # the previous loop where we redeemed
+                        # speculatively then swept back if no candidate
+                        # actually opened.
+                        if (cfg.earn_enabled and mode == MODE_LIVE
+                                and spot_free < sized_notional and earn.deployed_usdt > 0.10):
+                            need = min(sized_notional - spot_free + 0.05, earn.deployed_usdt)
+                            if need >= 0.10:
+                                ok_r, err_r = gateway.earn_redeem(need, paper)
+                                if ok_r:
+                                    earn.deployed_usdt = max(0.0, earn.deployed_usdt - need)
+                                    spot_free += need
+                                    log_event(db, f'Redeemed {need:.4f} USDT for {c.perp_symbol} entry', mode=mode, exchange=gateway.venue_id)
+                                else:
+                                    earn.last_error = err_r
+                                    db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=f'earn_redeem_failed: {err_r[:80]}', funding_rate=c.funding_apr))
+                                    continue
                         # Place spot buy first. If it fails (insufficient balance, min-notional,
                         # market down), skip the candidate and continue scanning.
                         try:
@@ -1314,13 +1333,16 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         earn.last_error = ''
                         log_event(db, f'Swept {sweep:.2f} USDT idle → earn', mode=mode, exchange=gateway.venue_id)
                     else:
-                        # Always log the failure reason at WARN. The user
-                        # should see *why* an idle balance isn't sweeping
-                        # (cooldown countdown, missing earn product, missing
-                        # API permission, etc.) on /logs without having to
-                        # cross-reference dashboard tooltips.
                         earn.last_error = err
-                        log_event(db, f'Earn sweep blocked: {sweep:.2f} USDT idle in spot — {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                        # Distinguish transient races (112002 "no balance"
+                        # — KuCoin balance API hasn't yet reflected a
+                        # prior transfer) from real failures. Transient
+                        # ones get re-tried next cycle automatically;
+                        # logging them at WARN was just noise.
+                        is_transient = ('112002' in err or 'no balance' in err.lower()
+                                        or 'cooldown active' in err)
+                        if not is_transient:
+                            log_event(db, f'Earn sweep blocked: {sweep:.2f} USDT idle in spot — {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
             # End-of-cycle bookkeeping. Two cadences:
             #   * Capital-flow ingest (deposits / withdrawals / transfers)
@@ -1386,12 +1408,19 @@ def _enforce_venue_yield_settings(gateways: list, db) -> None:
     cfg = get_strategy_config(db)
     for gw in gateways:
         if gw.venue_id == 'kucoin':
+            # toggle_auto_lend now only reports status — KuCoin's legacy
+            # toggle endpoint is no longer ccxt-exposed; the operator
+            # enables auto-lend once via the KuCoin UI. We log INFO
+            # (not WARN) so the operator sees the once-per-startup
+            # reminder without alarming-level noise.
             target_enabled = bool(cfg.kucoin_auto_lend_enabled)
             ok, err = gw.toggle_auto_lend(enabled=target_enabled, asset='USDT')
             if ok:
-                log_event(db, f'KuCoin auto-lend USDT: {"ENABLED" if target_enabled else "DISABLED"} via /margin/toggle-auto-lend', mode=MODE_LIVE, exchange=gw.venue_id)
-            else:
-                log_event(db, f'KuCoin auto-lend toggle failed: {err}', mode=MODE_LIVE, level='WARN', exchange=gw.venue_id)
+                log_event(db, f'KuCoin auto-lend USDT: {"ENABLED" if target_enabled else "DISABLED"}', mode=MODE_LIVE, exchange=gw.venue_id)
+            elif target_enabled:
+                # Only worth logging when the user WANTS auto-lend on;
+                # if they've disabled it, the missing toggle isn't relevant.
+                log_event(db, f'KuCoin auto-lend: programmatic toggle unavailable. {err}', mode=MODE_LIVE, exchange=gw.venue_id)
 
 
 def run_loop() -> None:
