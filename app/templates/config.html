@@ -152,41 +152,17 @@
   </div>
 </div>
 
-{# ============= YIELD ROUTING ============= #}
+{# ============= WALLET ROUTING ============= #}
 <div class="card">
-  <h3>Yield routing</h3>
+  <h3>Wallet routing</h3>
   <div class="body">
     <div class="form-grid">
-      <div class="form-row"><label>Earn enabled</label>
-        <select name="earn_enabled">
-          <option value="1" {{ 'selected' if cfg.earn_enabled }}>yes</option>
-          <option value="0" {{ 'selected' if not cfg.earn_enabled }}>no</option>
-        </select>
-        <span class="hint">When on, idle USDT routes to each venue's yield surface that ALSO counts as cross-margin collateral. <strong>Binance PM:</strong> bot mints BFUSD via Simple Earn flexible (post-Aug-2025 path). <strong>KuCoin:</strong> auto-lend handles routing.</span></div>
-      <div class="form-row"><label>Idle threshold (USDT)</label>
-        <input type="number" step="0.1" name="earn_idle_threshold_usdt" value="{{ cfg.earn_idle_threshold_usdt }}">
-        <span class="hint">Only sweep when idle USDT exceeds this floor.</span></div>
       <div class="form-row"><label>Auto-transfer USDT spot ⇄ futures</label>
         <select name="auto_transfer_enabled">
           <option value="1" {{ 'selected' if cfg.auto_transfer_enabled }}>yes</option>
           <option value="0" {{ 'selected' if not cfg.auto_transfer_enabled }}>no</option>
         </select>
-        <span class="hint">Live only. Pre-trade redeems and tops up the wallet for the leg about to open. Required for the earn-first model.</span></div>
-      <div class="form-row"><label>Max BFUSD share of equity (Binance PM)</label>
-        <input type="number" step="1" min="0" max="100" name="binance_max_bfusd_pct_pct" value="{{ '%.0f' % (cfg.binance_max_bfusd_pct * 100) }}">
-        <span class="hint">Cap on the share of Binance equity converted to BFUSD. <strong>20</strong> keeps 80% as plain USDT for instant deploy. Bump higher once BFUSD redemption behaviour is observed under load.</span></div>
-      <div class="form-row"><label>KuCoin auto-lend (USDT)</label>
-        <select name="kucoin_auto_lend_enabled">
-          <option value="1" {{ 'selected' if cfg.kucoin_auto_lend_enabled }}>enabled</option>
-          <option value="0" {{ 'selected' if not cfg.kucoin_auto_lend_enabled }}>disabled</option>
-        </select>
-        <span class="hint">Bot calls /api/v1/margin/toggle-auto-lend on each startup so idle USDT auto-lends to margin traders (~3-8% APY variable). Under UTA the lent portion still counts as cross-margin collateral.</span></div>
-      <div class="form-row"><label>Subscribe spot leg base assets to Earn</label>
-        <select name="earn_subscribe_spot_assets">
-          <option value="1" {{ 'selected' if cfg.earn_subscribe_spot_assets }}>yes</option>
-          <option value="0" {{ 'selected' if not cfg.earn_subscribe_spot_assets }}>no</option>
-        </select>
-        <span class="hint">Optional. Subscribe the long-leg base asset (SOL, ETH…) to Binance Simple Earn after spot buy; auto-redeem before close. KuCoin: no-op.</span></div>
+        <span class="hint">Live only, Classic accounts only. Pre-close tops up the futures wallet for the buy-back. No-op on PM / UTA where margin is unified. Yield optimisation (BFUSD / KuCoin auto-lend / spot-leg Earn) was removed — see archive/yield/.</span></div>
     </div>
   </div>
 </div>
@@ -215,9 +191,6 @@
         <span class="hint">Adverse price shift modelled on every paper fill.</span></div>
       <div class="form-row"><label>Paper taker fee (bps)</label>
         <input type="number" step="0.1" name="paper_fee_bps" value="{{ cfg.paper_fee_bps }}"></div>
-      <div class="form-row"><label>Paper Earn APR (% per year)</label>
-        <input type="number" step="0.1" name="earn_paper_apr_pct" value="{{ '%.2f' % (cfg.earn_paper_apr * 100) }}">
-        <span class="hint">Simulated yield rate for paper mode. Live mode reads real Earn balances from each venue.</span></div>
     </div>
   </div>
 </div>

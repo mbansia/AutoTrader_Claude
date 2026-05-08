@@ -13,12 +13,17 @@ Class hierarchy
   facade (order-book depth, balances, prices, scanning, market orders,
   hedge configuration). Subclasses must populate ``self.spot`` and
   ``self.futures`` ccxt clients and override venue-specific methods.
-* :class:`BinanceGateway` — Binance spot + USDM-perp + Simple Earn +
-  universal-transfer SAPI + deposit/withdrawal/sub-transfer history.
+* :class:`BinanceGateway` — Binance spot + USDM-perp + universal-transfer
+  SAPI + deposit/withdrawal/sub-transfer history.
 * :class:`KuCoinGateway` — KuCoin spot + futures + ``innerTransfer``
-  SAPI. Earn (Pool-X) and capital-flow history are deferred — earn
-  methods return safe no-ops; ``net_injected_capital_usdt`` returns
-  ``None`` so the dashboard falls back to manual capital flows.
+  SAPI. Capital-flow history is deferred; ``net_injected_capital_usdt``
+  returns ``None`` so the dashboard falls back to manual capital flows.
+
+Yield optimisation (BFUSD subscribe, KuCoin auto-lend, Earn subscribe of
+spot leg base assets) was removed — see ``archive/yield/`` for the
+preserved code and re-enable preconditions. USDT now sits in PM (Binance)
+or UTA (KuCoin) as plain collateral; the bot does not move it into any
+yield surface.
 
 Design invariants
 -----------------
@@ -29,10 +34,6 @@ Design invariants
 * SAPI methods are looked up through a small list of ccxt naming
   conventions (``sapiV1Get…`` / ``sapi_v1_get_…``) so the gateway
   works across the ccxt-version drift between dev and production.
-* Caches (``_earn_product_id_cache``, ``_*_history_cache``,
-  ``_earn_subscribe_cooldown_until``) live on the instance with
-  explicit TTLs. They get cleared by recreating the gateway, e.g. on
-  process restart — that's intentional.
 * Binance error codes the bot reacts to are named constants; the
   string-match-on-exception-text approach is what ccxt's stable
   surface gives us.
@@ -59,14 +60,12 @@ from app.config import settings
 BINANCE_ERR_INVALID_API = '-2015'           # bad key / IP not whitelisted / missing permission
 BINANCE_ERR_INSUFFICIENT_MARGIN = '-2019'   # futures order can't be placed for lack of free margin
 BINANCE_ERR_MALFORMED_AMOUNT = '-1102'      # amount param missing/empty/zero on a SAPI call
-BINANCE_ERR_NO_EARN_POSITION = '-6053'      # trying to redeem from a flexible product with no balance
-BINANCE_ERR_EARN_TOO_MANY_SUBS = '77505'    # subscribed too many times for this token (rate-limit)
 
 
 # ─── Candidate dataclass ────────────────────────────────────────────────────
 # A scan result row: one funding-rate opportunity that passed every filter
 # (entry threshold, volume, liquidity, etc.). The bot ranks candidates by
-# ``combined_apy`` to decide which to open next.
+# ``funding_apr`` (with depth as the tiebreak) to decide which to open next.
 
 @dataclass
 class Candidate:
@@ -77,8 +76,7 @@ class Candidate:
     quote_volume: float
     spot_depth_usdt: float = 0.0
     perp_depth_usdt: float = 0.0
-    spot_earn_apr: float = 0.0  # latest annualized rate on the asset's flexible earn product, if any
-    venue_id: str = 'binance'   # which venue this candidate came from — set by scan_funding
+    venue_id: str = 'binance'
 
     @property
     def funding_apr(self) -> float:
@@ -86,14 +84,7 @@ class Candidate:
 
     @property
     def funding_apy(self) -> float:
-        # Same compounded value as funding_apr — kept for callers that prefer the explicit name.
         return self.funding_apr
-
-    @property
-    def combined_apy(self) -> float:
-        """Funding APY (compounded) + spot Earn APR (Binance's reported flexible rate).
-        This is the headline yield used for ranking — it captures both legs' income."""
-        return self.funding_apr + self.spot_earn_apr
 
     @property
     def min_depth_usdt(self) -> float:
@@ -169,9 +160,8 @@ def _interval_hours(row: dict) -> float:
 # venues. Subclasses must:
 #   * set the class attributes ``venue_id`` and ``name``
 #   * populate ``self.spot`` and ``self.futures`` in ``__init__``
-#   * implement the venue-specific methods at the bottom (transfers, earn,
-#     history). Default implementations are safe no-ops so a venue without
-#     Earn (e.g. KuCoin Phase 1) still has a complete surface.
+#   * implement the venue-specific methods at the bottom (transfers,
+#     history). Default implementations are safe no-ops.
 
 class VenueGateway:
     venue_id: str = ''   # 'binance' | 'kucoin' | 'ibkr'
@@ -206,7 +196,6 @@ class VenueGateway:
         self.spot = None
         self.futures = None
         self.last_balance_error: str = ''
-        self.last_earn_breakdown: dict = {}
         # Per-endpoint error map populated by ``list_capital_flow_records``
         # so /monitoring can show which API endpoint refused (most common
         # cause: missing permission on the API key).
@@ -332,8 +321,8 @@ class VenueGateway:
 
     def invalidate_balance_cache(self) -> None:
         """Drop the in-memory balance cache so the next ``safe_balances``
-        call hits the API. Used right after orders, transfers, and earn
-        operations so downstream code sees the post-action state."""
+        call hits the API. Used right after orders / transfers so
+        downstream code sees the post-action state."""
         self._balance_cache = None
 
     # Per-(symbol, side) ticker cache. Equity composition iterates every
@@ -425,7 +414,6 @@ class VenueGateway:
         min_quote_volume: float,
         min_depth_usdt: float = 0.0,
         depth_band_bps: float = 10.0,
-        include_earn_apr: bool = False,
     ) -> tuple[list[Candidate], int, list[tuple[str, str, float]]]:
         """Scan this venue's USDT-perp funding rates. Returns
         ``(passing, total_examined, rejected)`` where:
@@ -475,7 +463,6 @@ class VenueGateway:
                 if tight < min_depth_usdt:
                     rejected.append((symbol, f'depth<{min_depth_usdt:.0f} (spot {spot_depth:.0f} / perp {perp_depth:.0f} @ ±{depth_band_bps:.0f}bps)', apr))
                     continue
-            earn_apr = self.flexible_earn_apr(base) if include_earn_apr else 0.0
             passing.append(Candidate(
                 spot_symbol=spot_symbol,
                 perp_symbol=symbol,
@@ -484,13 +471,10 @@ class VenueGateway:
                 quote_volume=qv,
                 spot_depth_usdt=spot_depth,
                 perp_depth_usdt=perp_depth,
-                spot_earn_apr=earn_apr,
                 venue_id=self.venue_id,
             ))
-        # Rank by total expected yield (funding APY + spot earn APR). Ties
-        # break by deeper book — deeper markets tend to be high-volume names
-        # with lower friction.
-        passing.sort(key=lambda c: (c.combined_apy, c.min_depth_usdt), reverse=True)
+        # Rank by funding APY first; ties go to the deeper book.
+        passing.sort(key=lambda c: (c.funding_apr, c.min_depth_usdt), reverse=True)
         return passing, total, rejected
 
     # ─── Order placement (ccxt-uniform) ───────────────────────────────────
@@ -566,33 +550,6 @@ class VenueGateway:
     # ─── Default no-op implementations for venue-specific surfaces ────────
     # Subclasses override the methods their venue actually supports.
 
-    def flexible_earn_apr(self, asset: str, ttl_seconds: float = 3600.0) -> float:
-        """Latest annualized rate (decimal) for the venue's flexible Earn product
-        on `asset`. Default: 0.0 (venue has no Earn or it's not yet wired)."""
-        return 0.0
-
-    def earn_balance_usdt(self) -> tuple[float | None, str]:
-        return 0.0, ''
-
-    def earn_balance(self, asset: str = 'USDT') -> tuple[float | None, str]:
-        return 0.0, ''
-
-    def earn_subscribe(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
-        return self.earn_subscribe_asset('USDT', amount_usdt, paper_mode)
-
-    def earn_subscribe_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:
-        if paper_mode:
-            return True, 'paper'
-        return False, f'{asset}: Earn not wired on {self.name}'
-
-    def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
-        return self.earn_redeem_asset('USDT', amount_usdt, paper_mode)
-
-    def earn_redeem_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:
-        if paper_mode:
-            return True, 'paper'
-        return False, f'{asset}: Earn not wired on {self.name}'
-
     def transfer_spot_to_futures(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
         if paper_mode:
             return True, 'paper'
@@ -632,16 +589,9 @@ class VenueGateway:
 
     def equity_buckets(self) -> list[dict]:
         """Return per-bucket equity items for the dashboard donut, with
-        venue-correct labels (e.g. ``Binance · PM USDT`` and
-        ``Binance · BFUSD`` rather than the legacy
-        ``spot / futures / earn`` triple — those don't apply under PM
-        or UTA, where the account is a single unified pool plus
-        optional yield-bearing collateral).
-        Each item: ``{label, value, color, venue}``. ``value`` is in
-        USDT-equivalent. Default implementation falls back to the
-        classic three-bucket breakdown by reading ``safe_balances`` and
-        ``earn_balance_usdt``; venue subclasses with non-classic
-        account types override to use their proper terminology."""
+        venue-correct labels. Default implementation: spot USDT + futures
+        USDT + non-USDT spot assets at USDT-equivalent. Venue subclasses
+        with non-classic account types (e.g. PM, UTA) override."""
         bals = self.safe_balances() or {}
         items: list[dict] = []
         spot_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
@@ -662,45 +612,22 @@ class VenueGateway:
             spot_assets_value += qty * px
         if spot_assets_value > 0:
             items.append({'label': f'{self.name} · Spot assets', 'value': spot_assets_value, 'venue': self.venue_id, 'color': '#818cf8'})
-        try:
-            earn_usdt, _ = self.earn_balance_usdt()
-            earn_usdt = earn_usdt or 0.0
-        except Exception:
-            earn_usdt = 0.0
-        if earn_usdt > 0:
-            items.append({'label': f'{self.name} · Earn', 'value': earn_usdt, 'venue': self.venue_id, 'color': '#4ade80'})
         return items
 
 
 # ─── Binance gateway ────────────────────────────────────────────────────────
-# Implements the full surface — Earn, universal-transfer, deposit /
-# withdrawal / sub-account-transfer history. Uses Binance's USDM-futures
-# client (``ccxt.binanceusdm``) to keep symbol shape identical to the spot
+# Implements the surface — universal-transfer, deposit / withdrawal /
+# sub-account-transfer history. Uses Binance's USDM-futures client
+# (``ccxt.binanceusdm``) to keep symbol shape identical to the spot
 # client (``BTC/USDT:USDT`` for the perp, ``BTC/USDT`` for the spot).
 
 class BinanceGateway(VenueGateway):
     venue_id = 'binance'
     name = 'Binance'
 
-    # Earn-subscribe rate-limit machinery — kept as class state so all
-    # instances share the cooldown (the bot creates fresh gateways
-    # frequently for HTTP routes).
-    _earn_subscribe_cooldown_until: dict[str, float] = {}
-    # Earn subscribe is event-driven, not periodic — the bot only sweeps
-    # when capital comes free (a position closes, a deposit lands, a
-    # transfer settles). Those events are rare on a funding-arb strategy
-    # (a handful per day max), so a default cooldown would just leave
-    # idle USDT stranded. Defense in depth: if Binance actually returns
-    # 77505 ("subscribed too many times"), we install a 24h punishment
-    # cooldown for that asset and back off until the next day.
-    EARN_SUBSCRIBE_DEFAULT_COOLDOWN_S = 0.0           # no proactive cooldown
-    EARN_SUBSCRIBE_RATE_LIMITED_COOLDOWN_S = 86400.0  # 24h after Binance signals 77505
-
     # Caches — instance-scoped so they survive across method calls but die
-    # with the gateway. Each carries an explicit TTL because Earn-product
-    # ids and capital-flow history are stable for many minutes.
-    _flexible_earn_apr_cache: dict[str, tuple[float, float]]
-    _earn_product_id_cache: dict[str, str]
+    # with the gateway. Each carries an explicit TTL because capital-flow
+    # history is stable for many minutes.
     _deposit_history_cache: dict[str, tuple[list[dict], float]]
     _withdrawal_history_cache: dict[str, tuple[list[dict], float]]
     _sub_transfer_history_cache: dict[str, tuple[list[dict], float]]
@@ -717,9 +644,6 @@ class BinanceGateway(VenueGateway):
             'secret': settings.binance_api_secret,
             'enableRateLimit': True,
         })
-        # Per-instance caches so cleared state doesn't leak across processes.
-        self._flexible_earn_apr_cache = {}
-        self._earn_product_id_cache = {}
         self._deposit_history_cache = {}
         self._withdrawal_history_cache = {}
         self._sub_transfer_history_cache = {}
@@ -735,144 +659,6 @@ class BinanceGateway(VenueGateway):
             if callable(fn):
                 return fn(params or {})
         return None
-
-    # ─── Binance Simple Earn (Flexible) ────────────────────────────────────
-
-    def flexible_earn_apr(self, asset: str, ttl_seconds: float = 3600.0) -> float:
-        """Latest annualized rate (decimal) for the flexible Earn product on
-        `asset`, cached for an hour. Returns 0.0 if no product is offered or
-        the API isn't reachable — caller treats that as "no extra spot yield
-        to count toward the candidate's combined APY"."""
-        cached = self._flexible_earn_apr_cache.get(asset)
-        if cached:
-            rate, ts = cached
-            if time.time() - ts < ttl_seconds:
-                return rate
-        try:
-            resp = self._call_sapi((
-                'sapiV1GetSimpleEarnFlexibleList',
-                'sapi_v1_get_simple_earn_flexible_list',
-                'sapiGetSimpleEarnFlexibleList',
-            ), {'asset': asset})
-        except Exception:
-            self._flexible_earn_apr_cache[asset] = (0.0, time.time())
-            return 0.0
-        if not resp:
-            self._flexible_earn_apr_cache[asset] = (0.0, time.time())
-            return 0.0
-        for r in resp.get('rows', []) or resp.get('data', []) or []:
-            if r.get('asset') == asset:
-                try:
-                    rate = float(r.get('latestAnnualPercentageRate') or r.get('annualPercentageRate') or 0)
-                except Exception:
-                    rate = 0.0
-                self._flexible_earn_apr_cache[asset] = (rate, time.time())
-                return rate
-        self._flexible_earn_apr_cache[asset] = (0.0, time.time())
-        return 0.0
-
-    def earn_product_id(self, asset: str) -> str | None:
-        cached = self._earn_product_id_cache.get(asset)
-        if cached:
-            return cached
-        try:
-            resp = self._call_sapi((
-                'sapiV1GetSimpleEarnFlexibleList',
-                'sapi_v1_get_simple_earn_flexible_list',
-                'sapiGetSimpleEarnFlexibleList',
-            ), {'asset': asset})
-        except Exception:
-            return None
-        if not resp:
-            return None
-        rows = resp.get('rows') or resp.get('data') or []
-        for r in rows:
-            if r.get('asset') == asset:
-                pid = r.get('productId') or r.get('id')
-                if pid:
-                    self._earn_product_id_cache[asset] = str(pid)
-                    return str(pid)
-        return None
-
-    def earn_balance(self, asset: str = 'USDT') -> tuple[float | None, str]:
-        try:
-            resp = self._call_sapi((
-                'sapiV1GetSimpleEarnFlexiblePosition',
-                'sapi_v1_get_simple_earn_flexible_position',
-                'sapiGetSimpleEarnFlexiblePosition',
-            ), {'asset': asset})
-        except Exception as e:
-            return None, str(e)
-        if resp is None:
-            return None, 'sapi method not available in ccxt'
-        total = 0.0
-        for r in resp.get('rows', []) or []:
-            total += float(r.get('totalAmount') or 0)
-        return total, ''
-
-    def earn_balance_usdt(self) -> tuple[float | None, str]:
-        return self.earn_balance('USDT')
-
-    def earn_subscribe_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:
-        """Subscribe ``amount`` of ``asset`` to Binance Simple Earn Flexible.
-        Cooldown: each successful subscribe pins a per-asset cooldown so the
-        bot doesn't spam the SAPI on every loop. 77505 from Binance bumps
-        the cooldown to 24h for that asset to keep us safely under the daily
-        rate-limit window."""
-        if paper_mode:
-            return True, 'paper'
-        if amount <= 0:
-            return False, f'{asset}: zero amount'
-        cool_until = self._earn_subscribe_cooldown_until.get(asset, 0.0)
-        now = time.time()
-        if now < cool_until:
-            remaining = int(cool_until - now)
-            return False, f'{asset}: subscribe cooldown active ({remaining}s remaining; avoids Binance 77505 rate-limit)'
-        pid = self.earn_product_id(asset)
-        if not pid:
-            return False, f'no flexible product for {asset}'
-        try:
-            resp = self._call_sapi((
-                'sapiV1PostSimpleEarnFlexibleSubscribe',
-                'sapi_v1_post_simple_earn_flexible_subscribe',
-                'sapiPostSimpleEarnFlexibleSubscribe',
-            ), {'productId': pid, 'amount': f'{amount:.6f}'})
-        except Exception as e:
-            err = str(e)
-            if BINANCE_ERR_EARN_TOO_MANY_SUBS in err:
-                self._earn_subscribe_cooldown_until[asset] = now + self.EARN_SUBSCRIBE_RATE_LIMITED_COOLDOWN_S
-                return False, f'{asset}: Binance rate-limited (77505). Backing off 24h before retrying. {err[:120]}'
-            return False, f'{asset}: {err}'
-        if resp is None:
-            return False, f'{asset}: sapi method not available in ccxt'
-        # Success — install standard cooldown so we don't immediately retry next cycle.
-        self._earn_subscribe_cooldown_until[asset] = now + self.EARN_SUBSCRIBE_DEFAULT_COOLDOWN_S
-        # invalidate_balance_cache dropped — 30s TTL is short enough; eager invalidation triggered KuCoin 429s
-        return bool(resp.get('success', True)), ''
-
-    def earn_redeem_asset(self, asset: str, amount: float, paper_mode: bool) -> tuple[bool, str]:
-        if paper_mode:
-            return True, 'paper'
-        if amount <= 0:
-            return False, f'{asset}: zero amount'
-        # Binance returns -1102 when amount string is "0.00" — skip clearly-tiny calls.
-        if asset == 'USDT' and amount < 0.10:
-            return False, f'amount {amount:.4f} below USDT redeem minimum'
-        pid = self.earn_product_id(asset)
-        if not pid:
-            return False, f'no flexible product for {asset}'
-        try:
-            resp = self._call_sapi((
-                'sapiV1PostSimpleEarnFlexibleRedeem',
-                'sapi_v1_post_simple_earn_flexible_redeem',
-                'sapiPostSimpleEarnFlexibleRedeem',
-            ), {'productId': pid, 'amount': f'{amount:.6f}', 'destAccount': 'SPOT'})
-        except Exception as e:
-            return False, f'{asset}: {e}'
-        if resp is None:
-            return False, f'{asset}: sapi method not available in ccxt'
-        # invalidate_balance_cache dropped — 30s TTL is short enough; eager invalidation triggered KuCoin 429s
-        return bool(resp.get('success', True)), ''
 
     # ─── Binance universal transfer (spot ⇄ USDM-futures) ─────────────────
 
@@ -1142,13 +928,14 @@ class BinanceGateway(VenueGateway):
         return [r for r in rows if r['ts'] is not None and abs(r['amount']) > 1e-9]
 
     # ─── Portfolio Margin overrides (active when account is in PM mode) ────
-    # Binance Portfolio Margin replaces the Classic spot/futures/earn split
-    # with a unified margin pool that holds USDT, BFUSD (yield-bearing
-    # USDT-pegged), USDC, and other margin assets simultaneously. Orders
-    # route through ``/papi/v1/*`` (separate from ``/api/v3/*`` and
-    # ``/fapi/v1/*``); calling Classic endpoints on a PM account returns
-    # -2015. The user has confirmed the sub-account is in PM mode, so we
-    # always go through these paths — no Classic fallback to maintain.
+    # Binance Portfolio Margin replaces the Classic spot/futures split with
+    # a unified margin pool that holds USDT, BFUSD (USDT-pegged collateral
+    # the user may have from prior subscriptions), USDC, and other margin
+    # assets simultaneously. Orders route through ``/papi/v1/*`` (separate
+    # from ``/api/v3/*`` and ``/fapi/v1/*``); calling Classic endpoints on
+    # a PM account returns -2015. The user has confirmed the sub-account
+    # is in PM mode, so we always go through these paths — no Classic
+    # fallback to maintain.
     #
     # Endpoint references (Binance API docs, Sept 2024 revision):
     #   /papi/v1/balance           — unified balance per asset
@@ -1157,14 +944,10 @@ class BinanceGateway(VenueGateway):
     #   /papi/v1/um/leverage       — set leverage on a UM symbol
     #   /papi/v1/margin/order      — cross-margin spot order placement
     #   /papi/v1/um/positionRisk   — open UM positions
-    #   /papi/v1/asset-collection  — collect margin from one PM bucket to another
     #
-    # We don't directly subscribe / redeem BFUSD via API — Binance's
-    # auto-collection feature (toggled in the Binance UI per asset) does
-    # that automatically as USDT lands in the margin pool. The bot reads
-    # the BFUSD balance and surfaces it as the "Earn" bucket on the
-    # dashboard. ``earn_subscribe`` is a no-op under PM with a clear log
-    # line; the user enables auto-collection once and walks away.
+    # BFUSD is read as a balance (it's real margin collateral) but never
+    # subscribed or redeemed — the yield-optimisation subsystem was removed;
+    # see archive/yield/ for the original code and re-enable preconditions.
 
     @staticmethod
     def _papi(client, candidates: tuple[str, ...]):
@@ -1211,40 +994,26 @@ class BinanceGateway(VenueGateway):
         return 'Unknown', 'PM probe rejected, Classic probe returned nothing'
 
     def equity_buckets(self) -> list[dict]:
-        """PM-correct equity buckets for Binance. Replaces the Classic
-        spot/futures/earn triple with the actual PM concepts:
+        """PM equity buckets:
           * ``Binance · PM USDT``        — USDT in the unified margin pool
-          * ``Binance · BFUSD``          — yield-bearing PM collateral
+          * ``Binance · BFUSD``          — USDT-pegged collateral the user
+                                            may hold from before the yield
+                                            subsystem was retired
           * ``Binance · PM collateral``  — non-USDT/BFUSD assets in the
                                             pool (e.g. ETH from a long leg)
-          * ``Binance · Classic Spot``   — legacy spot wallet (separate
-                                            from PM; gets populated by
-                                            Simple Earn redeems and
-                                            external deposits)
-          * ``Binance · Simple Earn``    — legacy Simple Earn flexible
-                                            position (still a real
-                                            balance until the user
-                                            mints BFUSD from it)
-        Buckets with zero balance are omitted so the donut/legend
-        stays tight."""
+        Buckets with zero balance are omitted."""
         bals = self.safe_balances() or {}
         items: list[dict] = []
-        # PM unified pool (synthesised into 'spot' by _fetch_balances_uncached;
-        # 'futures' is the same number under PM). Show as a single PM USDT
-        # bucket — naming the same number twice would be confusing.
         pm_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
         if pm_usdt > 0:
             items.append({'label': f'{self.name} · PM USDT', 'value': pm_usdt, 'venue': self.venue_id, 'color': '#38bdf8'})
-        # BFUSD (the yield-bearing margin asset). _fetch_balances_uncached
-        # surfaces it in 'earn' for compatibility with downstream readers.
-        bfusd = float((bals.get('earn', {}).get('USDT') or {}).get('total') or 0)
+        bfusd = float((bals.get('spot', {}).get('BFUSD') or {}).get('total') or 0)
         if bfusd > 0:
             items.append({'label': f'{self.name} · BFUSD', 'value': bfusd, 'venue': self.venue_id, 'color': '#4ade80'})
-        # Non-USDT collateral (e.g. ETH held as the long spot leg of an arb).
         collateral_value = 0.0
         META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
         for asset, bal in (bals.get('spot') or {}).items():
-            if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+            if asset in META_KEYS or asset in ('USDT', 'BFUSD') or not isinstance(bal, dict):
                 continue
             qty = float(bal.get('total') or 0)
             if qty <= 0:
@@ -1253,52 +1022,33 @@ class BinanceGateway(VenueGateway):
             collateral_value += qty * px
         if collateral_value > 0:
             items.append({'label': f'{self.name} · PM collateral assets', 'value': collateral_value, 'venue': self.venue_id, 'color': '#818cf8'})
-        # Legacy Simple Earn USDT — still a real balance until the user
-        # mints BFUSD from it. earn_balance_usdt() aggregates BFUSD +
-        # Simple Earn; we already counted BFUSD above, so subtract.
-        try:
-            earn_total, _ = self.earn_balance_usdt()
-            simple_earn = max(0.0, (earn_total or 0.0) - bfusd)
-        except Exception:
-            simple_earn = 0.0
-        if simple_earn > 0.01:
-            items.append({'label': f'{self.name} · Simple Earn (legacy)', 'value': simple_earn, 'venue': self.venue_id, 'color': '#facc15'})
         return items
 
     def _fetch_balances_uncached(self) -> dict:
         """Read PM unified balance + classic Spot wallet, then synthesise
-        the bot's three-bucket shape (spot · earn · futures). Two reads
-        because PM and classic Spot are SEPARATE wallets even on a PM
-        account: Simple Earn redeems land in classic Spot, deposits via
-        the spot deposit address land in classic Spot, and only an
-        explicit Wallet→Cross Margin transfer (or Binance's auto-
-        collection) moves them into the PM pool. We read both and sum
-        so neither balance hides from the dashboard.
+        the bot's two-bucket shape (spot · futures). Two reads because PM
+        and classic Spot are SEPARATE wallets even on a PM account:
+        deposits via the spot deposit address land in classic Spot, and
+        only an explicit Wallet→Cross Margin transfer (or Binance's auto-
+        collection) moves them into the PM pool. We read both and sum so
+        neither balance hides from the dashboard.
 
-        Buckets:
-        * ``spot.USDT``    = PM-pool USDT + classic Spot USDT
-        * ``earn.USDT``    = BFUSD balance (yield-bearing PM collateral)
-        * ``futures.USDT`` = mirrors spot (PM unifies; both can fund a perp)
+        BFUSD lands in ``spot['BFUSD']`` as a regular asset row — it's
+        margin collateral, surfaced for visibility but never written.
+
         Per-base-asset spot holdings (long leg of an open arb) are read
         from PM-pool first; classic spot adds on if PM didn't surface it."""
         fn = self._papi(self.spot, ('papiGetBalance', 'papi_get_balance'))
         if fn is None:
-            # Fall back to classic ccxt fetch_balance — bot will still see
-            # SOMETHING, and the dashboard banner will surface the missing
-            # endpoint. Should never happen on a current ccxt build.
             return {'spot': self.spot.fetch_balance(), 'futures': self.futures.fetch_balance()}
         rows = fn({})
         if isinstance(rows, dict):
             rows = rows.get('data') or rows.get('balances') or []
-        usdt_total = usdt_free = bfusd_total = 0.0
+        usdt_total = usdt_free = 0.0
         per_asset: dict[str, dict] = {}
         for r in rows:
             asset = r.get('asset') or r.get('currency') or ''
             try:
-                # ``crossMarginFree`` is the actually-deployable cross-margin
-                # quantity; ``totalWalletBalance`` is total holdings across
-                # margin + UM. Different ccxt builds expose different field
-                # names — try the obvious ones in order.
                 free = float(r.get('crossMarginFree') or r.get('umWalletBalance') or r.get('free') or 0)
                 total = float(r.get('totalWalletBalance') or r.get('crossMarginAsset') or r.get('total') or free)
             except (TypeError, ValueError):
@@ -1306,15 +1056,8 @@ class BinanceGateway(VenueGateway):
             if asset == 'USDT':
                 usdt_total += total
                 usdt_free += free
-            elif asset == 'BFUSD':
-                bfusd_total += total
             elif total > 0:
                 per_asset[asset] = {'free': free, 'used': max(0.0, total - free), 'total': total}
-        # Classic Spot wallet — read separately and merge. This catches the
-        # USDT that lands here after a Simple Earn redeem, an external
-        # deposit, or any other path that doesn't land directly in the PM
-        # pool. Without this read the dashboard would show 0 for $30+ of
-        # cash that's clearly visible in the Binance UI.
         try:
             spot_classic = self.spot.fetch_balance()
             classic_usdt = float((spot_classic.get('USDT') or {}).get('total') or 0)
@@ -1328,131 +1071,24 @@ class BinanceGateway(VenueGateway):
                 qty = float(bal.get('total') or 0)
                 if qty <= 0:
                     continue
-                # Prefer PM-pool record if both have the same asset.
                 if asset not in per_asset:
                     per_asset[asset] = {'free': float(bal.get('free') or 0), 'used': float(bal.get('used') or 0), 'total': qty}
         except Exception:
-            # Classic spot read isn't critical — if it errors (rate limit,
-            # permission), PM-pool numbers are still correct.
             pass
         spot = {'USDT': {'free': usdt_free, 'used': max(0.0, usdt_total - usdt_free), 'total': usdt_total},
                 **per_asset,
                 'free': {'USDT': usdt_free, **{k: v['free'] for k, v in per_asset.items()}},
                 'used': {'USDT': max(0.0, usdt_total - usdt_free), **{k: v['used'] for k, v in per_asset.items()}},
                 'total': {'USDT': usdt_total, **{k: v['total'] for k, v in per_asset.items()}}}
-        # Futures bucket mirrors spot under PM — the bot's downstream code
-        # reads bals['futures']['USDT'] for margin checks; keeping it equal
-        # to spot reflects the unified-margin reality.
-        # Under PM there is no separate futures wallet — the pool funds
-        # both spot-margin and UM-perp legs. We expose ``futures.USDT.free``
-        # as the pool's free amount so the bot's trade-sizing logic
-        # (which reads ``min(spot_free, fut_free)``) still works, but
-        # ``futures.USDT.total`` is 0 so the equity-sum loop
-        # (``spot_total + fut_total + ...``) doesn't double-count the
-        # same pool USDT.
+        # Under PM there is no separate futures wallet. Expose
+        # ``futures.USDT.free`` as the pool's free amount so trade-sizing
+        # logic (``min(spot_free, fut_free)``) works, but
+        # ``futures.USDT.total`` is 0 so the equity sum doesn't double-
+        # count the same pool USDT.
         futures = {'USDT': {'free': usdt_free, 'used': 0.0, 'total': 0.0},
                    'free': {'USDT': usdt_free}, 'used': {'USDT': 0.0},
                    'total': {'USDT': 0.0}}
-        earn = {'USDT': {'free': bfusd_total, 'used': 0.0, 'total': bfusd_total},
-                'free': {'USDT': bfusd_total}, 'used': {'USDT': 0.0}, 'total': {'USDT': bfusd_total}}
-        return {'spot': spot, 'earn': earn, 'futures': futures}
-
-    def earn_balance_usdt(self) -> tuple[float | None, str]:
-        """Aggregate Binance's 'yield-bearing' surfaces.
-        Under PM the canonical earn asset is BFUSD (cross-collateral margin
-        that earns yield). But many users — including ours after the migration
-        — still hold legacy Simple Earn Flexible USDT positions that the bot
-        was managing pre-PM. Both should count toward equity until the user
-        migrates everything via the dashboard's 'Migrate Simple Earn → PM'
-        button (see _migrate_simple_earn_to_pm in main.py).
-
-        Returns the sum: BFUSD (from cached PM balance) + Simple Earn
-        flexible USDT position. Either component may be 0 — that's fine."""
-        bals = self.safe_balances()
-        bfusd_total = 0.0
-        if bals is not None:
-            bfusd_total = float((bals.get('earn', {}).get('USDT') or {}).get('total') or 0)
-        # Simple Earn flexible USDT — works on both Classic AND PM accounts
-        # (it's a separate Simple Earn product, not linked to the trading
-        # account type).
-        simple_earn_total = 0.0
-        try:
-            resp = self._call_sapi((
-                'sapiV1GetSimpleEarnFlexiblePosition',
-                'sapi_v1_get_simple_earn_flexible_position',
-                'sapiGetSimpleEarnFlexiblePosition',
-            ), {'asset': 'USDT'})
-            if resp:
-                rows = resp.get('rows') or resp.get('data') or []
-                for r in rows:
-                    if r.get('asset') == 'USDT':
-                        try:
-                            simple_earn_total += float(r.get('totalAmount') or r.get('amount') or 0)
-                        except (TypeError, ValueError):
-                            pass
-        except Exception:
-            pass  # Simple Earn endpoint may be 4xx on some PM accounts;
-                  # that's fine, balance falls back to BFUSD-only.
-        total = bfusd_total + simple_earn_total
-        # Surface the breakdown via last_earn_breakdown so the dashboard
-        # can show "BFUSD X.XX + Simple Earn Y.YY" without a second call.
-        self.last_earn_breakdown = {'bfusd': bfusd_total, 'simple_earn_flexible_usdt': simple_earn_total}
-        return total, ''
-
-    def earn_balance(self, asset: str = 'USDT') -> tuple[float | None, str]:
-        if asset != 'USDT':
-            return 0.0, ''  # only BFUSD (USDT-pegged) is wired
-        return self.earn_balance_usdt()
-
-    def earn_subscribe(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
-        """Subscribe USDT into BFUSD (yield-bearing PM collateral) via the
-        Simple Earn flexible-product surface.
-
-        Path: ``POST /sapi/v1/simple-earn/flexible/subscribe`` with the
-        BFUSD productId (discovered via ``earn_product_id('BFUSD')`` →
-        flexible-list lookup). Replaces the deprecated
-        ``/sapi/v1/portfolio/mint`` (-21015) — Binance migrated BFUSD
-        from Portfolio Margin to Simple Earn in Aug 2025. The Simple
-        Earn endpoint accepts ``sourceAccount`` (added 2025) so funds
-        can come from the PM pool / spot wallet directly.
-
-        Yield: 12-35% base APY with daily accrual, 15-47% boosted when
-        used as collateral in Multi-Asset Mode (rates vary; see Binance
-        UI for the live tier). BFUSD continues to count as cross-
-        collateral for futures positions while earning."""
-        if paper_mode:
-            return True, 'paper'
-        if amount_usdt <= 0:
-            return True, 'noop'
-        # Reuse the existing asset-level subscribe helper. earn_product_id
-        # caches the BFUSD productId via the flexible-list endpoint; if
-        # the product isn't surfaced for this sub-account (sometimes
-        # requires explicit enrollment via the Binance UI Earn page),
-        # surface a clear error rather than silently retrying.
-        pid = self.earn_product_id('BFUSD')
-        if not pid:
-            return False, ('BFUSD product not found on this account. Visit Binance UI → Earn → BFUSD '
-                           'page once on this sub-account to enrol the product, then retry. After '
-                           'enrolment the productId becomes visible to the API.')
-        return self.earn_subscribe_asset('BFUSD', amount_usdt, paper_mode)
-
-    def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
-        """Redeem BFUSD back to USDT via Simple Earn flexible redeem.
-        Same migration story as ``earn_subscribe`` — the old portfolio
-        redeem endpoint is gone; the path now is
-        ``/sapi/v1/simple-earn/flexible/redeem`` on the BFUSD product.
-
-        Triggered pre-trade by ``provision_margin`` only when raw USDT
-        is needed beyond what's in the PM pool — most futures-leg
-        margin needs are satisfied directly by BFUSD as cross-
-        collateral, so an automatic redeem is rarely required."""
-        if paper_mode:
-            return True, 'paper'
-        if amount_usdt <= 0:
-            return True, 'noop'
-        # Reuses earn_redeem_asset, which calls Simple Earn flexible
-        # redeem with the BFUSD productId.
-        return self.earn_redeem_asset('BFUSD', amount_usdt, paper_mode)
+        return {'spot': spot, 'futures': futures}
 
     def transfer_spot_to_futures(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
         # PM unifies margin; there's nothing to transfer.
@@ -1583,27 +1219,15 @@ class BinanceGateway(VenueGateway):
 # ─── KuCoin gateway ─────────────────────────────────────────────────────────
 # Implements the venue-specific overrides; everything else inherits from
 # :class:`VenueGateway`. Notable differences vs Binance:
-#   * No Portfolio-Margin equivalent. KuCoin offers Cross-Margin Spot and a
-#     Unified Trading Account (UTA) but neither cross-collateralises spot,
-#     futures, and earn the way Binance PM does for our funding-arb shape.
-#     UTA does pool spot+futures collateral but its API surface diverges
-#     significantly (different order endpoints, different liquidation
-#     model) and KuCoin's yield-bearing collateral assets are limited. We
-#     therefore stay on KuCoin's classic isolated wallets:
-#       trade   = spot trading wallet (Trading Account in UI)
-#       contract = USDM-perp futures wallet
-#       main     = funding wallet — what KuCoin's auto-lend draws from,
-#                  so the bot models it as the "Earn" surface.
-#     Future cross-venue trade types (binance ↔ kucoin) are orchestrated
-#     externally and don't need PM-style cross collateral on KuCoin.
+#   * Two account modes: Classic (isolated trade / contract / main wallets)
+#     and Unified Trading Account (UTA, pooled cross-margin). The gateway
+#     auto-detects via ``is_uta_enabled()`` and reads either path.
 #   * Spot ↔ futures transfers use ccxt's unified ``transfer()`` so the
-#     v3 universal-transfer endpoint is invoked for trade ↔ contract;
-#     inner-transfer is only used for spot-side wallet moves.
+#     v3 universal-transfer endpoint is invoked for trade ↔ contract.
 #   * Capital-flow history reads ``privateGetTransferList`` (v1 audit log)
 #     plus deposit/withdrawal history. fetch_transfers fills any gaps.
 #   * Symbol shape: ccxt normalises both KuCoin's perp suffix
-#     (``XBTUSDTM`` → ``BTC/USDT:USDT``) and Binance's, so the bot's symbol
-#     handling is unchanged across venues.
+#     (``XBTUSDTM`` → ``BTC/USDT:USDT``) and Binance's.
 
 class KuCoinGateway(VenueGateway):
     venue_id = 'kucoin'
@@ -1711,32 +1335,20 @@ class KuCoinGateway(VenueGateway):
 
     # KuCoin separates cash across three wallet types:
     #   * ``trade``    — Trading Account (UI label); spot orders execute here.
-    #   * ``main``     — Funding Account (UI label); deposits land here, and
-    #                    KuCoin's auto-lend pulls idle USDT from here. We
-    #                    treat this wallet as the yield-bearing surface
-    #                    on Classic accounts. (Simple Earn / Pool-X are
-    #                    SEPARATE products that don't count as cross-
-    #                    margin collateral under UTA — we don't touch
-    #                    them; auto-lend is the only collateral-yield
-    #                    path on KuCoin that we use.)
+    #   * ``main``     — Funding Account (UI label); deposits land here.
     #   * ``contract`` — Futures wallet; perp orders consume margin here.
     #
-    # ccxt's default ``fetch_balance()`` only returns ``trade``. To match
-    # the dashboard's three-bucket model (spot · earn · futures) we expose
+    # ccxt's default ``fetch_balance()`` only returns ``trade``. We expose
     # ``trade`` as ``bals['spot']`` and the contract balance as
-    # ``bals['futures']``. The funding-wallet balance is surfaced via
-    # :meth:`earn_balance_usdt` so the equity total = spot + earn + futures
-    # without double-counting.
+    # ``bals['futures']``.
     def _fetch_balances_uncached(self) -> dict:
         # Two paths depending on account mode:
         #   UTA — single ``/api/v3/uta/account/balance`` call returns a
         #         unified pool of every collateral asset. We synthesise
-        #         spot/earn/futures buckets so downstream code (which
-        #         was written against Classic shape) keeps working: the
-        #         unified-pool USDT lands in 'spot', 0 in 'futures' (UTA
-        #         doesn't separate), auto-lent USDT in 'earn'.
-        #   Classic — three separate fetch_balance calls (trade / main /
-        #         contract); same as before.
+        #         spot/futures buckets so downstream code keeps working:
+        #         the unified-pool USDT lands in 'spot', 0 in 'futures'
+        #         (UTA doesn't separate).
+        #   Classic — separate fetch_balance calls (trade / contract).
         if self._is_uta:
             fn = self._uta(self.spot, ('utaPrivateGetAccountBalance', 'utaprivateGetAccountBalance'))
             if fn is not None:
@@ -1747,20 +1359,18 @@ class KuCoinGateway(VenueGateway):
                         rows = rows.get('list') or rows.get('balances') or []
                     elif not isinstance(rows, list):
                         rows = []
-                    usdt_total = usdt_free = lent_total = 0.0
+                    usdt_total = usdt_free = 0.0
                     per_asset: dict[str, dict] = {}
                     for r in rows or []:
                         asset = r.get('coin') or r.get('asset') or r.get('currency') or ''
                         try:
                             free = float(r.get('availableBalance') or r.get('free') or 0)
                             total = float(r.get('walletBalance') or r.get('total') or free)
-                            lent = float(r.get('autoLendQuantity') or r.get('lentBalance') or 0)
                         except (TypeError, ValueError):
                             continue
                         if asset == 'USDT':
                             usdt_total += total
                             usdt_free += free
-                            lent_total += lent
                         elif total > 0:
                             per_asset[asset] = {'free': free, 'used': max(0.0, total - free), 'total': total}
                     spot = {'USDT': {'free': usdt_free, 'used': max(0.0, usdt_total - usdt_free), 'total': usdt_total},
@@ -1768,24 +1378,17 @@ class KuCoinGateway(VenueGateway):
                             'free': {'USDT': usdt_free, **{k: v['free'] for k, v in per_asset.items()}},
                             'used': {'USDT': max(0.0, usdt_total - usdt_free), **{k: v['used'] for k, v in per_asset.items()}},
                             'total': {'USDT': usdt_total, **{k: v['total'] for k, v in per_asset.items()}}}
-                    # UTA unifies spot + futures into one pool; mirror the
-                    # PM convention — fut.free reflects pool capacity for
-                    # the bot's trade-sizing min(), but fut.total is 0 so
-                    # the equity-sum loop doesn't double-count the pool.
+                    # UTA unifies spot + futures into one pool. fut.free
+                    # mirrors pool capacity for trade-sizing min(); fut.total
+                    # is 0 so the equity sum doesn't double-count.
                     futures = {'USDT': {'free': usdt_free, 'used': 0.0, 'total': 0.0},
                                'free': {'USDT': usdt_free}, 'used': {'USDT': 0.0},
                                'total': {'USDT': 0.0}}
-                    earn = {'USDT': {'free': lent_total, 'used': 0.0, 'total': lent_total},
-                            'free': {'USDT': lent_total}, 'used': {'USDT': 0.0}, 'total': {'USDT': lent_total}}
-                    return {'spot': spot, 'earn': earn, 'futures': futures}
+                    return {'spot': spot, 'futures': futures}
                 except Exception:
-                    # UTA balance probe failed — fall through to classic
-                    # path. last_balance_error gets populated by the parent.
                     pass
-        # Classic fall-through.
         return {
             'spot': self.spot.fetch_balance({'type': 'trade'}),
-            'earn': self.spot.fetch_balance({'type': 'main'}),
             'futures': self.futures.fetch_balance(),
         }
 
@@ -1816,54 +1419,30 @@ class KuCoinGateway(VenueGateway):
         return 'Classic', 'isolated trade / contract / main wallets'
 
     def equity_buckets(self) -> list[dict]:
-        """KuCoin-correct equity buckets. Two shapes depending on
-        account mode:
+        """KuCoin equity buckets. Two shapes depending on account mode:
 
-        UTA — single unified-margin pool plus optional auto-lent USDT
-        (yield-bearing). Buckets:
-          * ``KuCoin · UTA USDT``           — unified-pool USDT
-          * ``KuCoin · UTA auto-lent USDT`` — auto-lent portion (yield)
-          * ``KuCoin · UTA collateral``     — non-USDT assets in the pool
+        UTA — single unified-margin pool:
+          * ``KuCoin · UTA USDT``       — unified-pool USDT
+          * ``KuCoin · UTA collateral`` — non-USDT assets in the pool
 
-        Classic — three isolated wallets (Trade, Contract, Main):
-          * ``KuCoin · Trade USDT``         — spot trading wallet
-          * ``KuCoin · Contract USDT``      — futures wallet
-          * ``KuCoin · Main USDT (auto-lend)`` — funding wallet (the
-            yield surface; auto-lend draws from here when toggled in
-            the KuCoin UI)
-          * ``KuCoin · Trade collateral``   — non-USDT spot assets
+        Classic — isolated Trade + Contract wallets:
+          * ``KuCoin · Trade USDT``       — spot trading wallet
+          * ``KuCoin · Contract USDT``    — futures wallet
+          * ``KuCoin · Trade collateral`` — non-USDT spot assets
 
-        Buckets with zero balance are omitted so the donut/legend
-        stays tight."""
+        Buckets with zero balance are omitted."""
         bals = self.safe_balances() or {}
         items: list[dict] = []
         spot_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
         fut_usdt = float((bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
-        earn_usdt = float((bals.get('earn', {}).get('USDT') or {}).get('total') or 0)
         if self._is_uta:
             if spot_usdt > 0:
                 items.append({'label': f'{self.name} · UTA USDT', 'value': spot_usdt, 'venue': self.venue_id, 'color': '#38bdf8'})
-            if earn_usdt > 0:
-                items.append({'label': f'{self.name} · UTA auto-lent USDT', 'value': earn_usdt, 'venue': self.venue_id, 'color': '#4ade80'})
         else:
             if spot_usdt > 0:
                 items.append({'label': f'{self.name} · Trade USDT', 'value': spot_usdt, 'venue': self.venue_id, 'color': '#38bdf8'})
             if fut_usdt > 0:
                 items.append({'label': f'{self.name} · Contract USDT', 'value': fut_usdt, 'venue': self.venue_id, 'color': '#fbbf24'})
-            if earn_usdt > 0:
-                # Split funding-wallet USDT into actually-lent (earning
-                # interest) and idle (sitting in main, not yet lent).
-                # The split is honest about whether yield is happening.
-                lent = self.lent_usdt_active()
-                # Cap at earn_usdt so a stale lend record doesn't
-                # exceed the wallet total.
-                lent = min(lent, earn_usdt)
-                idle_in_main = max(0.0, earn_usdt - lent)
-                if lent > 0.01:
-                    items.append({'label': f'{self.name} · USDT (auto-lent, earning)', 'value': lent, 'venue': self.venue_id, 'color': '#4ade80'})
-                if idle_in_main > 0.01:
-                    items.append({'label': f'{self.name} · USDT (funding wallet, idle)', 'value': idle_in_main, 'venue': self.venue_id, 'color': '#94a3b8'})
-        # Non-USDT collateral assets (spot leg of an open arb, etc.).
         collateral_value = 0.0
         META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
         for asset, bal in (bals.get('spot') or {}).items():
@@ -1878,102 +1457,6 @@ class KuCoinGateway(VenueGateway):
             label = f'{self.name} · UTA collateral' if self._is_uta else f'{self.name} · Trade collateral'
             items.append({'label': label, 'value': collateral_value, 'venue': self.venue_id, 'color': '#818cf8'})
         return items
-
-    def _main_wallet_usdt(self) -> tuple[float | None, str]:
-        """Read the USDT balance of the ``main`` (Funding) wallet from the
-        cached balance dict. Used by :meth:`earn_balance_usdt` since KuCoin's
-        auto-lend operates on funding-wallet cash."""
-        bals = self.safe_balances()
-        if bals is None:
-            return None, self.last_balance_error
-        return float((bals.get('earn', {}).get('USDT') or {}).get('total') or 0), ''
-
-    # ─── Yield-bearing collateral on KuCoin: auto-lend only ─────────────
-    # KuCoin's only cross-margin-compatible yield surface is auto-lend
-    # (calls ``POST /api/v1/margin/toggle-auto-lend`` once per startup
-    # via _enforce_venue_yield_settings). KuCoin Simple Earn / Pool-X
-    # are SEPARATE products: subscribing to them moves USDT out of the
-    # margin pool, so the funds stop counting as cross-collateral. We
-    # deliberately don't touch those — they'd reduce collateral and
-    # add operational complexity for marginal incremental yield.
-    #
-    # Under UTA: auto-lent USDT in the unified pool earns interest AND
-    # remains usable as cross-margin collateral. This is the only
-    # "yield + collateral" combo we use.
-    # Under Classic (legacy fallback): the bot moves idle cash to the
-    # ``main`` wallet which is the auto-lend source. earn_subscribe /
-    # earn_redeem are inner-transfers between trade ↔ main; the
-    # displayed "Earn balance" is the main wallet's USDT total.
-    def earn_balance_usdt(self) -> tuple[float | None, str]:
-        """Total funding-wallet USDT (idle + lent). Used by the
-        equity-summing code which only cares about the aggregate."""
-        return self._main_wallet_usdt()
-
-    def lent_usdt_active(self) -> float:
-        """USDT currently sitting in active lend orders (i.e. actually
-        earning interest, not just idle in the funding wallet). Returns
-        0.0 on any error so callers can degrade gracefully."""
-        fn = (getattr(self.spot, 'privateGetMarginLendActive', None)
-              or getattr(self.spot, 'private_get_margin_lend_active', None))
-        if fn is None:
-            return 0.0
-        try:
-            resp = fn({'currency': 'USDT'})
-        except Exception:
-            return 0.0
-        items = ((resp or {}).get('data') or {}).get('items') or []
-        total = 0.0
-        for r in items:
-            try:
-                total += float(r.get('size') or r.get('amount') or 0)
-            except (TypeError, ValueError):
-                continue
-        return total
-
-    def earn_balance(self, asset: str = 'USDT') -> tuple[float | None, str]:
-        if asset != 'USDT':
-            return 0.0, ''  # only USDT auto-lend is wired
-        return self._main_wallet_usdt()
-
-    # ─── Auto-lend toggle (KuCoin) ────────────────────────────────────────
-    # The legacy /api/v1/margin/toggle-auto-lend endpoint is no longer
-    # exposed by ccxt's KuCoin client (KuCoin restructured the lending
-    # API in 2024-2025; the standalone "Margin Lending" market is
-    # mostly subsumed by KuCoin Earn / UTA's auto-lend behaviour
-    # configured via the venue UI). The bot does NOT toggle auto-lend
-    # programmatically — it has to be turned on once per asset in the
-    # KuCoin web UI (Earn → Crypto Lending → Auto-Lend toggle for
-    # USDT, or under UTA: account-level setting).
-    #
-    # We keep this method as a clean status reporter so the dashboard
-    # can show the operator what's configured rather than spamming
-    # WARN logs on every startup.
-    def toggle_auto_lend(self, enabled: bool = True, asset: str = 'USDT') -> tuple[bool, str]:
-        return False, ('KuCoin auto-lend toggle is no longer API-exposed (ccxt build does not have '
-                       'privatePostMarginToggleAutoLend). Enable it manually once: KuCoin UI → Earn → '
-                       'Crypto Lending → Auto-Lend → USDT. Funds in the funding wallet auto-lend '
-                       'continuously after that and stay usable as cross-margin collateral under UTA.')
-
-    def earn_subscribe(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
-        if paper_mode:
-            return True, 'paper'
-        if amount_usdt <= 0:
-            return True, 'noop'
-        if self._is_uta:
-            # Under UTA, idle USDT auto-lends if the user enables auto-lend
-            # in the KuCoin UI. The bot doesn't issue explicit subscribe
-            # calls — that races with KuCoin's auto-routing.
-            return True, 'UTA mode: auto-lend handles USDT yield (toggle in KuCoin UI per asset)'
-        return self._transfer('trade', 'main', amount_usdt)
-
-    def earn_redeem(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
-        if paper_mode:
-            return True, 'paper'
-        if amount_usdt <= 0:
-            return True, 'noop'
-        if self._is_uta:
-            return True, 'UTA mode: auto-lend redeems automatically when margin is needed'
-        return self._transfer('main', 'trade', amount_usdt)
 
     # ─── Spot ↔ futures transfer (KuCoin) ────────────────────────────────
     # KuCoin splits transfers across two endpoints:
@@ -1997,11 +1480,9 @@ class KuCoinGateway(VenueGateway):
         return True, ''
 
     # KuCoin's spot orders execute against the ``trade`` wallet (UI label
-    # "Trading Account"); ``main`` is the funding wallet (deposits land here).
-    # ``contract`` is the futures wallet. Spot↔futures transfers therefore
-    # move trade↔contract; idle cash is parked in main (so Pool-X / earn
-    # subscribe sees it). The bot calls ``stage_for_spot()`` before placing a
-    # spot order to guarantee the trade wallet is funded.
+    # "Trading Account"); ``contract`` is the futures wallet. Spot↔futures
+    # transfers move trade↔contract under Classic; under UTA the unified
+    # pool removes the need for these transfers entirely.
     def transfer_spot_to_futures(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
         if paper_mode:
             return True, 'paper'

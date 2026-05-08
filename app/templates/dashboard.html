@@ -102,37 +102,6 @@
     <div class="value">{{ open_count }} / {{ cfg.max_open_positions }}</div>
     <div class="sub">{{ trades_today }} trade(s) today / {{ cfg.max_trades_per_day }} cap</div>
   </div>
-  {# Earn — merged card: deployed + coverage % + cumulative income. #}
-  {% if earn.enabled or earn.deployed > 0 %}
-  {% set idle_pct = (earn.deployed / current_equity * 100) if current_equity > 0 else 0 %}
-  <div class="kpi">
-    <div class="label">Yielding collateral</div>
-    <div class="value">{{ '%.2f' % earn.deployed }} <span class="muted" style="font-size:14px;">USDT</span></div>
-    <div class="sub" style="display:flex;flex-direction:column;gap:3px;">
-      <span>{{ '%.0f%%' % idle_pct }} of equity earning yield</span>
-      <span class="muted" style="font-size:11px;">income till date: <em>not yet measured</em> — wired once interest-history endpoints are read directly from venues</span>
-      {% if earn.per_venue %}
-      <details class="kpi-details" style="margin-top:2px;">
-        <summary>by source</summary>
-        <ul class="kpi-breakdown">
-          {% for vid, pv in earn.per_venue.items() %}{% if pv.deployed > 0 %}
-          <li><span class="muted">{{ pv.source }} <span style="font-size:9px;">({{ vid }})</span></span><span class="mono">{{ '%.2f' % pv.deployed }}</span></li>
-          {% endif %}{% endfor %}
-        </ul>
-      </details>
-      {% endif %}
-      {% if earn.last_error %}
-      <details class="kpi-details" style="margin-top:2px;">
-        <summary class="bad" style="font-size:11px;">⚠ {{ earn.last_error|truncate(80) }}</summary>
-        <pre style="background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:8px;margin-top:4px;overflow-x:auto;font-size:10px;line-height:1.4;white-space:pre-wrap;word-break:break-all;">{{ earn.last_error }}</pre>
-        {% if '-21015' in earn.last_error or 'deprecated' in earn.last_error %}
-        <span class="muted" style="font-size:10px;">Binance retired the API endpoint the bot was using to mint BFUSD from USDT (sapiPostPortfolioMint). No replacement is currently wrapped by ccxt. <strong>Subscribe BFUSD manually:</strong> Binance UI → Wallet → Portfolio Margin → BFUSD → Subscribe. The bot will read whatever you hold and continue to surface it as yielding collateral; only the auto-mint path is unavailable.</span>
-        {% endif %}
-      </details>
-      {% endif %}
-    </div>
-  </div>
-  {% endif %}
   {# Fees paid (taker + funding) across every trade — total + avg fee per
      txn as % of notional. Drop-down breaks out by venue + leg type. #}
   <div class="kpi">
@@ -157,11 +126,11 @@
       {% endif %}
     </div>
   </div>
-  {# Free deployable: idle USDT (and BFUSD / auto-lent) the bot can
-     route into a new trade. Excludes spot collateral assets (e.g. ETH
-     from a long leg) — those are already committed. Sum of
-     ``free_deployable_breakdown`` from main.py — one source of truth,
-     so this card and the per-venue lines below it always reconcile. #}
+  {# Free deployable: idle USDT the bot can route into a new trade.
+     Excludes spot collateral assets (e.g. ETH from a long leg) — those
+     are already committed. Sum of ``free_deployable_breakdown`` from
+     main.py — one source of truth, so this card and the per-venue
+     lines below always reconcile. #}
   {% if view == 'live' and free_deployable_breakdown %}
     {% set free_deployable = free_deployable_breakdown|sum(attribute='value') %}
   {% else %}
@@ -484,8 +453,6 @@
       <thead><tr>
         <th>Symbol</th>
         <th class="num">Funding APY (%)</th>
-        <th class="num">+ Earn APR (%)</th>
-        <th class="num">Combined (%)</th>
         <th class="num">Effective (%)</th>
         <th class="num">Depth min (USD)</th>
         <th class="num">Interval (h)</th>
@@ -497,8 +464,6 @@
         <tr>
           <td class="mono">{{ c.perp }}</td>
           <td class="num good">{{ '%.2f' % (c.apr * 100) }}</td>
-          <td class="num">{{ '%.2f' % ((c.spot_earn_apr or 0) * 100) }}</td>
-          <td class="num good">{{ '%.2f' % ((c.combined_apy or c.apr) * 100) }}</td>
           <td class="num good">{{ '%.2f' % ((c.effective_apy or c.apr/2) * 100) }}</td>
           <td class="num">{{ '{:,.0f}'.format(depth_min) if depth_min else '—' }}</td>
           <td class="num muted">{{ '%d' % (c.interval_h or 8) }}</td>
