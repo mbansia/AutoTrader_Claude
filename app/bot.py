@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 
 from sqlalchemy import func, select
@@ -1184,8 +1185,17 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         # forever on a depth-starved name.
                         spot_sim = perp_sim = None
                         for _attempt in range(3):
-                            spot_sim = gateway.simulate_fill(c.spot_symbol, target_qty, side='buy', perp=False)
-                            perp_sim = gateway.simulate_fill(c.perp_symbol, target_qty, side='sell', perp=True)
+                            # Walk both order books concurrently — ccxt
+                            # is thread-safe for read-only requests, so
+                            # 2 parallel fetch_order_book calls cut
+                            # Tier 2 wallclock roughly in half. The
+                            # ThreadPoolExecutor context manager
+                            # blocks until both futures resolve.
+                            with ThreadPoolExecutor(max_workers=2) as ex:
+                                spot_future = ex.submit(gateway.simulate_fill, c.spot_symbol, target_qty, side='buy', perp=False)
+                                perp_future = ex.submit(gateway.simulate_fill, c.perp_symbol, target_qty, side='sell', perp=True)
+                                spot_sim = spot_future.result()
+                                perp_sim = perp_future.result()
                             spot_filled = spot_sim['filled_qty']
                             perp_filled = perp_sim['filled_qty']
                             min_filled = min(spot_filled, perp_filled)
@@ -1484,6 +1494,22 @@ def run_loop() -> None:
         except Exception as e:
             with SessionLocal() as db:
                 log_event(db, f'{gw.name} load_markets failed: {e}', mode=MODE_PAPER, level='ERROR', exchange=gw.venue_id)
+                db.commit()
+        # Eager-warm the per-symbol taker-fee cache via ccxt's
+        # `fetch_trading_fees()` batch endpoint (one HTTP call per
+        # client, vs. lazy per-symbol fetches on first miss). This
+        # makes Tier 1's approx-profit pre-filter and Tier 3's
+        # exact profit gate both work from cycle 1 instead of
+        # warming up over the first hour. Silent failure falls
+        # back to per-symbol lazy fetch on first cache miss.
+        try:
+            spot_n, fut_n = gw.prefetch_trading_fees()
+            with SessionLocal() as db:
+                log_event(db, f'{gw.name} pre-fetched taker fees: {spot_n} spot + {fut_n} futures symbols', mode=MODE_PAPER, exchange=gw.venue_id)
+                db.commit()
+        except Exception as e:
+            with SessionLocal() as db:
+                log_event(db, f'{gw.name} prefetch_trading_fees failed (will fall back to lazy): {str(e)[:120]}', mode=MODE_PAPER, level='WARN', exchange=gw.venue_id)
                 db.commit()
     for gw in gateways:
         reconcile_positions(gw)
