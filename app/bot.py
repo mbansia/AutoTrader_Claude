@@ -1099,23 +1099,49 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     desired_notional = cfg.max_position_pct * total_equity
                     min_notional = cfg.min_position_pct * total_equity
 
-                    # Transfer spot→futures so the perp leg has margin
-                    # (once per cycle, per-quote). For PM/UTA accounts
-                    # the transfer is a no-op since margin is unified.
+                    # Pre-trade wallet rebalance (Classic accounts only).
+                    # KuCoin Classic and Binance Classic split USDT
+                    # across separate spot + contract wallets — if all
+                    # the cash sits in one bucket, the OTHER leg is
+                    # under-funded and our `min(spot_free, fut_free)`
+                    # sizing reads the small side. Equalize each
+                    # cycle so both legs can fund their share. Under
+                    # unified margin (Binance PM, KuCoin UTA) the
+                    # synthesised futures.<asset>.total is 0 by
+                    # convention — we skip in that case since the
+                    # buckets aren't actually separate wallets.
                     if mode == MODE_LIVE and cfg.auto_transfer_enabled:
+                        bals_for_rebal = gateway.safe_balances() or {}
                         for q in ('USDT', 'USDC'):
-                            sf = spot_free_by_q[q]
-                            ff = fut_free_by_q[q]
-                            if ff < desired_notional and sf > desired_notional:
-                                transfer = min(desired_notional - ff, sf - desired_notional)
-                                if transfer > 0.5:
-                                    ok, err = gateway.transfer_spot_to_futures(transfer, paper, asset=q)
-                                    if ok:
-                                        spot_free_by_q[q] -= transfer
-                                        fut_free_by_q[q] += transfer
-                                        log_event(db, f'Auto-transferred {transfer:.2f} {q} spot→futures for perp margin', mode=mode, exchange=gateway.venue_id)
-                                    else:
-                                        log_event(db, f'spot→futures {q} transfer failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                            fut_total_native = float((bals_for_rebal.get('futures', {}).get(q) or {}).get('total') or 0)
+                            if fut_total_native <= 0.001:
+                                continue  # unified margin
+                            sf = spot_free_by_q.get(q, 0.0)
+                            ff = fut_free_by_q.get(q, 0.0)
+                            imbalance = abs(sf - ff)
+                            # Don't bother for tiny gaps (transfer fees +
+                            # noise dominate). 20 cents threshold.
+                            if imbalance < 0.20:
+                                continue
+                            midpoint = (sf + ff) / 2.0
+                            if sf < midpoint:
+                                move = midpoint - sf
+                                ok, err = gateway.transfer_futures_to_spot(move, paper, asset=q)
+                                if ok:
+                                    spot_free_by_q[q] = sf + move
+                                    fut_free_by_q[q] = ff - move
+                                    log_event(db, f'Pre-trade rebalance: {move:.2f} {q} futures→spot (equalize wallets so both legs can fund)', mode=mode, exchange=gateway.venue_id)
+                                else:
+                                    log_event(db, f'Pre-trade futures→spot {q} rebalance failed: {err[:120]}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                            else:
+                                move = sf - midpoint
+                                ok, err = gateway.transfer_spot_to_futures(move, paper, asset=q)
+                                if ok:
+                                    spot_free_by_q[q] = sf - move
+                                    fut_free_by_q[q] = ff + move
+                                    log_event(db, f'Pre-trade rebalance: {move:.2f} {q} spot→futures (equalize wallets so both legs can fund)', mode=mode, exchange=gateway.venue_id)
+                                else:
+                                    log_event(db, f'Pre-trade spot→futures {q} rebalance failed: {err[:120]}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
                     # Diversity: skip any candidate whose base asset we already hold open
                     # in this mode. Avoids piling more capital into the same name even
