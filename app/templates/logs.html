@@ -8,7 +8,7 @@
 <div class="card">
   <h3>Scan history (last 50)</h3>
   {% if scans %}
-  <table>
+  <table data-searchable data-collapse-after="5">
     <thead><tr>
       <th>Time</th>
       <th>Venue</th>
@@ -40,7 +40,7 @@
 <div class="card">
   <h3>Bot events (last 100)</h3>
   {% if events %}
-  <div class="log-list">
+  <div class="log-list" data-searchable data-collapse-after="5">
     {% for e in events %}
       <div class="log-line">
         <span class="log-ts">{{ e.ts }}</span>
@@ -58,7 +58,7 @@
 <div class="card">
   <h3>Rejected candidates (last 50)</h3>
   {% if rejected %}
-  <table>
+  <table data-searchable data-collapse-after="5">
     <thead><tr>
       <th>Time</th>
       <th>Venue</th>
@@ -86,7 +86,7 @@
 <div class="card">
   <h3>Recent trades (last 30)</h3>
   {% if trades %}
-  <table>
+  <table data-searchable data-collapse-after="5">
     <thead><tr>
       <th>Time</th>
       <th>Symbol</th>

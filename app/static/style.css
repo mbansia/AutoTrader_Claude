@@ -461,6 +461,46 @@ tr.position-stuck:hover > td { background: color-mix(in srgb, var(--bad) 14%, tr
   .equity-donut { margin: 0 auto; }
 }
 
+/* ===== Searchable / collapsible tables ============================ */
+
+.table-search-wrap {
+  display: flex;
+  justify-content: flex-end;
+  margin: 0 0 8px;
+}
+.table-search {
+  width: 240px;
+  max-width: 100%;
+  padding: 6px 10px;
+  font-size: 12.5px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: inherit;
+}
+.table-search:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent);
+}
+.table-collapse-toggle {
+  display: inline-block;
+  margin: 8px 0 0;
+  padding: 5px 12px;
+  font-size: 12px;
+  background: transparent;
+  color: var(--accent);
+  border: 1px dashed var(--border-strong);
+  border-radius: 6px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.table-collapse-toggle:hover {
+  background: var(--panel-2);
+  border-style: solid;
+}
+
 /* ===== Responsive ================================================= */
 
 @media (max-width: 900px) {
