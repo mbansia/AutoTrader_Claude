@@ -268,22 +268,22 @@ def _accrue_paper_funding(db, gateway, mode: str) -> None:
 def _refresh_live_earn_balance(gateway: VenueGateway, earn: EarnState) -> None:
     bal, err = gateway.earn_balance_usdt()
     if bal is not None:
-        # Yield = balance increase between refreshes. Two cases we explicitly
-        # do NOT credit as yield:
-        #   1. Bootstrap — first refresh after a fresh install or a venue
-        #      that didn't have earn wired before. ``earn.deployed_usdt`` is
-        #      0 but the wallet may already hold cash (e.g. user deposited
-        #      to KuCoin's funding wallet directly). Crediting ``+bal`` as
-        #      yield would skew cumulative_yield by the deposit size.
-        #   2. Direct deposit into the funding wallet between refreshes —
-        #      detected as a delta larger than what plausibly compounds in
-        #      one cycle. We cap the credited delta at 1% of the prior
-        #      balance per cycle, which on a flexible product paying 5%
-        #      APR is ~50× the realistic per-cycle accrual.
-        delta = bal - earn.deployed_usdt
-        if earn.deployed_usdt > 0 and delta > 0:
-            credit = min(delta, max(0.05, earn.deployed_usdt * 0.01))
-            earn.cumulative_yield_usdt += credit
+        # We deliberately do NOT synthesize cumulative_yield from balance
+        # deltas anymore. The previous design — credit ``min(delta, 1%
+        # × deployed)`` per cycle when the balance went up — was supposed
+        # to approximate accrual but in practice picked up every internal
+        # transfer the bot did (sweep trade→main on KuCoin, mint USDT→
+        # BFUSD on Binance). With cycles every 30s, the cumulative figure
+        # drifted to absurd values (~$6 on $10 deployed in a few hours,
+        # i.e. ~50,000× the realistic Simple Earn rate).
+        #
+        # Real interest accrual lives in dedicated endpoints — KuCoin's
+        # utaPrivateGetAccountInterestHistory and Binance's
+        # /sapi/v1/simple-earn/flexible/history/rewardsRecord. Wiring
+        # those is the right way; until then cumulative_yield stays at
+        # whatever it was (the migration zeros it on each deploy that
+        # touches earn_state schema). The dashboard now renders 'not yet
+        # measured' for the income line.
         earn.deployed_usdt = bal
         earn.last_error = ''
     elif err:
@@ -1295,7 +1295,20 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                 spot_free_now = float((bals_for_sweep.get('spot', {}).get('USDT') or {}).get('free') or 0)
                 if spot_free_now > cfg.earn_idle_threshold_usdt:
                     sweep = max(0.0, spot_free_now - 0.10)  # 0.10 USDT dust buffer
-                    ok, err = gateway.earn_subscribe(sweep, paper)
+                    # Binance-only safety throttle: cap BFUSD share of total
+                    # equity at cfg.binance_max_bfusd_pct. Keeps a portion in
+                    # plain USDT for instant deploy without the BFUSD redeem
+                    # queue. Wire is no-op on KuCoin since auto-lent USDT
+                    # stays liquid as cross-collateral anyway.
+                    if gateway.venue_id == 'binance' and cfg.binance_max_bfusd_pct < 1.0:
+                        total_eq, _ = _compute_equity_and_free(db, gateway, mode, cfg, earn)
+                        cap = max(0.0, total_eq * float(cfg.binance_max_bfusd_pct or 0.20) - earn.deployed_usdt)
+                        if sweep > cap:
+                            sweep = cap
+                    if sweep <= 0.10:
+                        # After cap, nothing meaningful to sweep this cycle.
+                        sweep = 0.0
+                    ok, err = (True, 'capped') if sweep <= 0 else gateway.earn_subscribe(sweep, paper)
                     if ok:
                         earn.deployed_usdt += sweep
                         earn.last_error = ''

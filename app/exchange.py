@@ -1851,7 +1851,18 @@ class KuCoinGateway(VenueGateway):
             if fut_usdt > 0:
                 items.append({'label': f'{self.name} · Contract USDT', 'value': fut_usdt, 'venue': self.venue_id, 'color': '#fbbf24'})
             if earn_usdt > 0:
-                items.append({'label': f'{self.name} · Main USDT (auto-lend surface)', 'value': earn_usdt, 'venue': self.venue_id, 'color': '#4ade80'})
+                # Split funding-wallet USDT into actually-lent (earning
+                # interest) and idle (sitting in main, not yet lent).
+                # The split is honest about whether yield is happening.
+                lent = self.lent_usdt_active()
+                # Cap at earn_usdt so a stale lend record doesn't
+                # exceed the wallet total.
+                lent = min(lent, earn_usdt)
+                idle_in_main = max(0.0, earn_usdt - lent)
+                if lent > 0.01:
+                    items.append({'label': f'{self.name} · USDT (auto-lent, earning)', 'value': lent, 'venue': self.venue_id, 'color': '#4ade80'})
+                if idle_in_main > 0.01:
+                    items.append({'label': f'{self.name} · USDT (funding wallet, idle)', 'value': idle_in_main, 'venue': self.venue_id, 'color': '#94a3b8'})
         # Non-USDT collateral assets (spot leg of an open arb, etc.).
         collateral_value = 0.0
         META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
@@ -1894,7 +1905,30 @@ class KuCoinGateway(VenueGateway):
     # earn_redeem are inner-transfers between trade ↔ main; the
     # displayed "Earn balance" is the main wallet's USDT total.
     def earn_balance_usdt(self) -> tuple[float | None, str]:
+        """Total funding-wallet USDT (idle + lent). Used by the
+        equity-summing code which only cares about the aggregate."""
         return self._main_wallet_usdt()
+
+    def lent_usdt_active(self) -> float:
+        """USDT currently sitting in active lend orders (i.e. actually
+        earning interest, not just idle in the funding wallet). Returns
+        0.0 on any error so callers can degrade gracefully."""
+        fn = (getattr(self.spot, 'privateGetMarginLendActive', None)
+              or getattr(self.spot, 'private_get_margin_lend_active', None))
+        if fn is None:
+            return 0.0
+        try:
+            resp = fn({'currency': 'USDT'})
+        except Exception:
+            return 0.0
+        items = ((resp or {}).get('data') or {}).get('items') or []
+        total = 0.0
+        for r in items:
+            try:
+                total += float(r.get('size') or r.get('amount') or 0)
+            except (TypeError, ValueError):
+                continue
+        return total
 
     def earn_balance(self, asset: str = 'USDT') -> tuple[float | None, str]:
         if asset != 'USDT':

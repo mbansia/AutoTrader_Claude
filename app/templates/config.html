@@ -17,6 +17,8 @@
       trade-type on the next cycle and disables entries until you click resume. Use the per-mode controls
       to keep paper running while live is locked down (or vice versa). Strategies marked
       <em>(not yet wired)</em> will surface here for live control once their orchestrators land.
+      When every strategy that touches a venue is stopped, the bot stops calling that venue's API entirely
+      until you re-enable one.
     </div>
     <table>
       <thead><tr>
@@ -75,31 +77,36 @@
 </div>
 
 <form action="/config" method="post">
+
+{# ============= STRATEGY THRESHOLDS ============= #}
 <div class="card">
   <h3>Strategy thresholds</h3>
   <div class="body">
     <div class="form-grid">
-      <div class="form-row"><label>Entry funding threshold (APY, decimal)</label>
-        <input type="number" step="0.001" name="entry_funding_threshold" value="{{ '%.4f' % cfg.entry_funding_threshold }}">
-        <span class="hint">compounded annualized yield (assuming reinvestment). 0.20 = 20% APY. The bot computes APY = (1 + period_rate) ^ periods_per_year − 1 using each candidate's own funding interval.</span></div>
-      <div class="form-row"><label>Exit funding threshold (APY, decimal)</label>
-        <input type="number" step="0.001" name="exit_funding_threshold" value="{{ '%.4f' % cfg.exit_funding_threshold }}">
-        <span class="hint">close when current funding APY falls below this. 0.05 = 5% APY.</span></div>
+      <div class="form-row"><label>Entry funding threshold (% APY)</label>
+        <input type="number" step="0.01" name="entry_funding_threshold_pct" value="{{ '%.2f' % (cfg.entry_funding_threshold * 100) }}">
+        <span class="hint">Compounded annualized yield. <strong>20</strong> = 20% APY. Bot computes APY = (1 + period_rate) ^ periods_per_year − 1 using each candidate's own funding interval.</span></div>
+      <div class="form-row"><label>Exit funding threshold (% APY)</label>
+        <input type="number" step="0.01" name="exit_funding_threshold_pct" value="{{ '%.2f' % (cfg.exit_funding_threshold * 100) }}">
+        <span class="hint">Close when current funding APY falls below this.</span></div>
+      <div class="form-row"><label>Stop-loss (% of entry notional, negative)</label>
+        <input type="number" step="0.01" name="stop_loss_pct_pct" value="{{ '%.2f' % (cfg.stop_loss_pct * 100) }}">
+        <span class="hint">Close when MTM PnL ÷ notional ≤ this. <strong>-2</strong> = -2%. Set 0 to disable.</span></div>
+      <div class="form-row"><label>Max hold (hours)</label>
+        <input type="number" step="1" name="max_hold_hours" value="{{ cfg.max_hold_hours }}"></div>
       <div class="form-row"><label>Min 24h quote volume (USDT)</label>
         <input type="number" step="1" name="min_24h_quote_volume" value="{{ cfg.min_24h_quote_volume }}"></div>
       <div class="form-row"><label>Min order-book depth (USDT)</label>
         <input type="number" step="1" name="min_order_book_depth_usdt" value="{{ cfg.min_order_book_depth_usdt }}">
-        <span class="hint">Reject candidates where the smaller of (spot ask depth, perp bid depth) within the band below is less than this. 0 disables.</span></div>
+        <span class="hint">Reject candidates where the smaller of (spot ask depth, perp bid depth) within the band is below this.</span></div>
       <div class="form-row"><label>Depth band (± bps from mid)</label>
         <input type="number" step="0.5" name="depth_band_bps" value="{{ cfg.depth_band_bps }}">
-        <span class="hint">How far from mid we sum depth. 10 bps captures the price range a market order would actually traverse for typical position sizes.</span></div>
-      <div class="form-row"><label>Stop-loss (decimal, negative)</label>
-        <input type="number" step="0.001" name="stop_loss_pct" value="{{ '%.4f' % cfg.stop_loss_pct }}">
-        <span class="hint">close when MTM PnL/notional ≤ this. Set 0 to disable.</span></div>
+        <span class="hint">How far from mid we sum depth.</span></div>
     </div>
   </div>
 </div>
 
+{# ============= SIZING & LIMITS ============= #}
 <div class="card">
   <h3>Sizing &amp; limits</h3>
   <div class="body">
@@ -108,49 +115,46 @@
         <input type="number" step="1" name="max_open_positions" value="{{ cfg.max_open_positions }}"></div>
       <div class="form-row"><label>Max trades per day</label>
         <input type="number" step="1" name="max_trades_per_day" value="{{ cfg.max_trades_per_day }}"></div>
-      <div class="form-row"><label>Min position size (% of equity, decimal)</label>
-        <input type="number" step="0.001" name="min_position_pct" value="{{ '%.4f' % cfg.min_position_pct }}">
-        <span class="hint">skip candidates whose available size is below this fraction of total portfolio. 0.005 = 0.5%.</span></div>
-      <div class="form-row"><label>Max position size (% of equity, decimal)</label>
-        <input type="number" step="0.001" name="max_position_pct" value="{{ '%.4f' % cfg.max_position_pct }}">
-        <span class="hint">cap a single open position at this fraction of total portfolio. 0.10 = 10%.</span></div>
-      <div class="form-row"><label>Max hold (hours)</label>
-        <input type="number" step="1" name="max_hold_hours" value="{{ cfg.max_hold_hours }}"></div>
+      <div class="form-row"><label>Min position size (% of equity)</label>
+        <input type="number" step="0.01" name="min_position_pct_pct" value="{{ '%.2f' % (cfg.min_position_pct * 100) }}">
+        <span class="hint">Skip candidates whose available size is below this fraction of total portfolio.</span></div>
+      <div class="form-row"><label>Max position size (% of equity)</label>
+        <input type="number" step="0.1" name="max_position_pct_pct" value="{{ '%.2f' % (cfg.max_position_pct * 100) }}">
+        <span class="hint">Cap a single open position at this fraction of total portfolio.</span></div>
     </div>
   </div>
 </div>
 
+{# ============= RISK / HEDGE ============= #}
 <div class="card">
-  <h3>Wallet routing &amp; liquidation buffer</h3>
+  <h3>Risk &amp; hedge safety</h3>
   <div class="body">
     <div class="form-grid">
-      <div class="form-row"><label>Auto-transfer USDT spot ⇄ futures</label>
-        <select name="auto_transfer_enabled">
-          <option value="1" {{ 'selected' if cfg.auto_transfer_enabled }}>yes</option>
-          <option value="0" {{ 'selected' if not cfg.auto_transfer_enabled }}>no</option>
-        </select>
-        <span class="hint">Live only. Pre-trade redeems from earn and tops up the right wallet (spot or futures) for the leg about to open; post-trade drains futures back and sweeps idle into earn. Requires "Permits Universal Transfer" on each venue's API key.</span></div>
+      <div class="form-row"><label>Max entry basis (bps, ±)</label>
+        <input type="number" step="0.5" name="max_entry_basis_bps" value="{{ cfg.max_entry_basis_bps }}">
+        <span class="hint">Refuse to open if |perp − spot| / spot exceeds this. 20 bps = 0.20%.</span></div>
+      <div class="form-row"><label>Max exit basis (bps)</label>
+        <input type="number" step="0.5" name="max_exit_basis_bps" value="{{ cfg.max_exit_basis_bps }}">
+        <span class="hint">Defer voluntary exits (funding decay, max hold) until basis ≤ this. Stop-loss, naked-leg, delisting bypass this.</span></div>
       <div class="form-row"><label>Max perp leverage</label>
         <input type="number" step="1" min="1" max="125" name="max_perp_leverage" value="{{ cfg.max_perp_leverage }}">
-        <span class="hint">Bot calls /papi/v1/um/leverage with this value on every perp before opening. <strong>1 is the only safe choice for a delta-neutral arb hedge</strong> — keeps perp margin == spot notional. Bump only if you understand maintenance-margin math.</span></div>
+        <span class="hint"><strong>1 is the only safe choice for a delta-neutral arb hedge.</strong></span></div>
       <div class="form-row"><label>Futures liquidation buffer (% of notional)</label>
-        <input type="number" step="0.01" min="0.05" max="1.0" name="futures_buffer_pct" value="{{ '%.2f' % cfg.futures_buffer_pct }}">
-        <span class="hint">Free margin kept above maintenance requirement on each perp. <strong>0.20 (default)</strong> covers ~20% adverse mark-price move on a 1x short. Bump to 0.30+ for memes / low-liquidity tokens. Under Binance Portfolio Margin, BFUSD held as collateral counts toward this buffer too.</span></div>
-      <div class="form-row"><label>Max BFUSD share of equity (Binance PM only)</label>
-        <input type="number" step="0.01" min="0.0" max="1.0" name="binance_max_bfusd_pct" value="{{ '%.2f' % cfg.binance_max_bfusd_pct }}">
-        <span class="hint">Cap on the share of total Binance equity auto-converted to BFUSD (yield-bearing margin asset). <strong>0.20 (default)</strong> keeps 80% as plain USDT for instant deploy; bump higher once BFUSD redemption behaviour has been observed under your trading load. Bot mints/redeems BFUSD via /sapi/v1/portfolio/mint and /redeem.</span></div>
-      <div class="form-row"><label>KuCoin auto-lend (USDT)</label>
-        <select name="kucoin_auto_lend_enabled">
-          <option value="1" {{ 'selected' if cfg.kucoin_auto_lend_enabled }}>enabled</option>
-          <option value="0" {{ 'selected' if not cfg.kucoin_auto_lend_enabled }}>disabled</option>
-        </select>
-        <span class="hint">Bot calls /api/v1/margin/toggle-auto-lend on each startup (USDT, retainSize=0, dailyIntRate=0, term=7d) so idle USDT auto-lends to margin traders for variable yield (~3–8% APY typical). Under UTA the lent portion still counts as cross-margin collateral; under Classic margin lent funds lock for the term so trades may need to wait for them to return. Useful when your sub-account can't access Hold-to-Earn UI toggles directly.</span></div>
+        <input type="number" step="0.5" min="5" max="100" name="futures_buffer_pct_pct" value="{{ '%.0f' % (cfg.futures_buffer_pct * 100) }}">
+        <span class="hint">Free margin kept above maintenance requirement. <strong>20</strong> covers ~20% adverse move on a 1× short.</span></div>
+      <div class="form-row"><label>Hedge check each loop</label>
+        <select name="enforce_hedge_check"><option value="1" {{ 'selected' if cfg.enforce_hedge_check }}>yes</option><option value="0" {{ 'selected' if not cfg.enforce_hedge_check }}>no</option></select>
+        <span class="hint">Verify both legs exist on the exchange every cycle; flatten any naked leg.</span></div>
+      <div class="form-row"><label>Delisting / market-status check</label>
+        <select name="delisting_check"><option value="1" {{ 'selected' if cfg.delisting_check }}>yes</option><option value="0" {{ 'selected' if not cfg.delisting_check }}>no</option></select>
+        <span class="hint">Force close if either leg's market is no longer in TRADING status.</span></div>
     </div>
   </div>
 </div>
 
+{# ============= YIELD ROUTING ============= #}
 <div class="card">
-  <h3>Earn (idle USDT sweep)</h3>
+  <h3>Yield routing</h3>
   <div class="body">
     <div class="form-grid">
       <div class="form-row"><label>Earn enabled</label>
@@ -158,63 +162,72 @@
           <option value="1" {{ 'selected' if cfg.earn_enabled }}>yes</option>
           <option value="0" {{ 'selected' if not cfg.earn_enabled }}>no</option>
         </select>
-        <span class="hint">When on, idle USDT routes into the venue's yield surface. <strong>Binance PM:</strong> bot calls /sapi/v1/portfolio/mint (USDT→BFUSD) and /sapi/v1/portfolio/redeem (BFUSD→USDT). BFUSD is PM cross-collateral so it stays usable as margin while earning yield. <strong>KuCoin UTA:</strong> auto-lend handles routing — toggle it per asset in KuCoin UI → Margin → Lending → Auto-Lend. Auto-lent USDT continues to count as cross-margin collateral; the bot only reads the balance and surfaces it on the dashboard. <strong>KuCoin Classic:</strong> bot moves idle USDT to the funding (main) wallet which is the auto-lend source; same UI toggle applies. Disabling leaves idle USDT in the trading wallet earning nothing.</span></div>
+        <span class="hint">When on, idle USDT routes to each venue's yield surface that ALSO counts as cross-margin collateral. <strong>Binance PM:</strong> bot mints BFUSD via Simple Earn flexible (post-Aug-2025 path). <strong>KuCoin:</strong> auto-lend handles routing.</span></div>
       <div class="form-row"><label>Idle threshold (USDT)</label>
         <input type="number" step="0.1" name="earn_idle_threshold_usdt" value="{{ cfg.earn_idle_threshold_usdt }}">
-        <span class="hint">only sweep when idle USDT exceeds this floor. Avoids sweeping dust.</span></div>
-      <div class="form-row"><label>Paper APR (decimal)</label>
-        <input type="number" step="0.001" name="earn_paper_apr" value="{{ '%.4f' % cfg.earn_paper_apr }}">
-        <span class="hint">simulated yield rate for paper mode. 0.05 = 5% APR. Live mode reads the real Earn balance from the configured venue.</span></div>
-      <div class="form-row"><label>Subscribe spot leg to Earn</label>
+        <span class="hint">Only sweep when idle USDT exceeds this floor.</span></div>
+      <div class="form-row"><label>Auto-transfer USDT spot ⇄ futures</label>
+        <select name="auto_transfer_enabled">
+          <option value="1" {{ 'selected' if cfg.auto_transfer_enabled }}>yes</option>
+          <option value="0" {{ 'selected' if not cfg.auto_transfer_enabled }}>no</option>
+        </select>
+        <span class="hint">Live only. Pre-trade redeems and tops up the wallet for the leg about to open. Required for the earn-first model.</span></div>
+      <div class="form-row"><label>Max BFUSD share of equity (Binance PM)</label>
+        <input type="number" step="1" min="0" max="100" name="binance_max_bfusd_pct_pct" value="{{ '%.0f' % (cfg.binance_max_bfusd_pct * 100) }}">
+        <span class="hint">Cap on the share of Binance equity converted to BFUSD. <strong>20</strong> keeps 80% as plain USDT for instant deploy. Bump higher once BFUSD redemption behaviour is observed under load.</span></div>
+      <div class="form-row"><label>KuCoin auto-lend (USDT)</label>
+        <select name="kucoin_auto_lend_enabled">
+          <option value="1" {{ 'selected' if cfg.kucoin_auto_lend_enabled }}>enabled</option>
+          <option value="0" {{ 'selected' if not cfg.kucoin_auto_lend_enabled }}>disabled</option>
+        </select>
+        <span class="hint">Bot calls /api/v1/margin/toggle-auto-lend on each startup so idle USDT auto-lends to margin traders (~3-8% APY variable). Under UTA the lent portion still counts as cross-margin collateral.</span></div>
+      <div class="form-row"><label>Subscribe spot leg base assets to Earn</label>
         <select name="earn_subscribe_spot_assets">
           <option value="1" {{ 'selected' if cfg.earn_subscribe_spot_assets }}>yes</option>
           <option value="0" {{ 'selected' if not cfg.earn_subscribe_spot_assets }}>no</option>
         </select>
-        <span class="hint">Opt-in. On Binance under Portfolio Margin the base asset (SOL, ETH…) automatically counts as cross-margin collateral and accrues lending interest if a flexible Earn product exists for it. KuCoin: the base asset sits in the trade wallet during the open position (no separate yield surface). Skips silently if the asset has no Earn product available.</span></div>
+        <span class="hint">Optional. Subscribe the long-leg base asset (SOL, ETH…) to Binance Simple Earn after spot buy; auto-redeem before close. KuCoin: no-op.</span></div>
     </div>
   </div>
 </div>
 
+{# ============= SYSTEM ============= #}
 <div class="card">
-  <h3>Loop &amp; paper-mode tuning</h3>
+  <h3>System</h3>
   <div class="body">
     <div class="form-grid">
       <div class="form-row"><label>Loop interval (seconds, min 5)</label>
-        <input type="number" step="1" name="loop_seconds" value="{{ cfg.loop_seconds }}"></div>
-      <div class="form-row"><label>Paper slippage (bps)</label>
-        <input type="number" step="0.1" name="paper_slippage_bps" value="{{ cfg.paper_slippage_bps }}"></div>
-      <div class="form-row"><label>Paper taker fee (bps)</label>
-        <input type="number" step="0.1" name="paper_fee_bps" value="{{ cfg.paper_fee_bps }}"></div>
-      <div class="form-row"><label>Paper starting equity (USDT)</label>
-        <input type="number" step="1" name="paper_starting_equity" value="{{ cfg.paper_starting_equity }}"></div>
+        <input type="number" step="1" min="5" name="loop_seconds" value="{{ cfg.loop_seconds }}">
+        <span class="hint">Frequency of the scan / exit / safety / snapshot cycle.</span></div>
     </div>
   </div>
 </div>
 
+{# ============= PAPER MODE ONLY ============= #}
 <div class="card">
-  <h3>Basis &amp; hedge safety</h3>
+  <h3>Paper mode <span class="muted" style="font-size:13px;font-weight:400;">— simulation-only settings, ignored in live</span></h3>
   <div class="body">
     <div class="form-grid">
-      <div class="form-row"><label>Max entry basis (bps, ±)</label>
-        <input type="number" step="0.5" name="max_entry_basis_bps" value="{{ cfg.max_entry_basis_bps }}">
-        <span class="hint">refuse to open if |perp − spot| / spot exceeds this. 20 bps = 0.20%.</span></div>
-      <div class="form-row"><label>Max exit basis (bps)</label>
-        <input type="number" step="0.5" name="max_exit_basis_bps" value="{{ cfg.max_exit_basis_bps }}">
-        <span class="hint">defer voluntary exits (funding decay, max hold) until basis ≤ this. Stop-loss, naked-leg and delisting bypass this gate.</span></div>
-      <div class="form-row"><label>Hedge check each loop</label>
-        <select name="enforce_hedge_check"><option value="1" {{ 'selected' if cfg.enforce_hedge_check }}>yes</option><option value="0" {{ 'selected' if not cfg.enforce_hedge_check }}>no</option></select>
-        <span class="hint">verify both legs exist on the position's venue every cycle; flatten any naked leg immediately. Live mode only.</span></div>
-      <div class="form-row"><label>Delisting / market-status check</label>
-        <select name="delisting_check"><option value="1" {{ 'selected' if cfg.delisting_check }}>yes</option><option value="0" {{ 'selected' if not cfg.delisting_check }}>no</option></select>
-        <span class="hint">force close if either leg's market is no longer in TRADING status (delisting, halt, settlement).</span></div>
+      <div class="form-row"><label>Paper starting equity (USDT)</label>
+        <input type="number" step="1" name="paper_starting_equity" value="{{ cfg.paper_starting_equity }}"></div>
+      <div class="form-row"><label>Paper slippage (bps)</label>
+        <input type="number" step="0.1" name="paper_slippage_bps" value="{{ cfg.paper_slippage_bps }}">
+        <span class="hint">Adverse price shift modelled on every paper fill.</span></div>
+      <div class="form-row"><label>Paper taker fee (bps)</label>
+        <input type="number" step="0.1" name="paper_fee_bps" value="{{ cfg.paper_fee_bps }}"></div>
+      <div class="form-row"><label>Paper Earn APR (% per year)</label>
+        <input type="number" step="0.1" name="earn_paper_apr_pct" value="{{ '%.2f' % (cfg.earn_paper_apr * 100) }}">
+        <span class="hint">Simulated yield rate for paper mode. Live mode reads real Earn balances from each venue.</span></div>
     </div>
   </div>
 </div>
 
+{# ============= KILL SWITCHES (info card) ============= #}
 <div class="card">
-  <h3>Per-mode kill switches</h3>
+  <h3>Per-mode master kill switches</h3>
   <div class="body muted" style="font-size:13px;">
-    Use the <strong>STOP</strong> and <strong>EXIT ALL &amp; STOP</strong> buttons in the header (above) to toggle entries and force-close per mode. They persist on the per-mode state row, independent of strategy parameters.
+    Use the <strong>STOP</strong> and <strong>EXIT ALL &amp; STOP</strong> buttons in the page header (above) to toggle entries
+    and force-close per mode. They override the per-strategy controls and persist on the per-mode state row.
   </div>
 </div>
 

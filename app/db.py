@@ -127,6 +127,16 @@ def run_schema_migrations() -> None:
         if 'exchange' not in cols:
             with engine.begin() as conn:
                 conn.execute(text('DROP TABLE earn_state'))
+        else:
+            # One-shot reset of cumulative_yield_usdt: the previous code
+            # synthesised yield from balance deltas, which over-counted
+            # whenever the bot moved funds in/out of the earn wallet
+            # (every sweep registered as "yield"). Real interest accrual
+            # is now read from venue interest-history endpoints (when
+            # wired); until then the column stays at 0 rather than
+            # showing fictional totals.
+            with engine.begin() as conn:
+                conn.execute(text('UPDATE earn_state SET cumulative_yield_usdt = 0'))
 
     # One-shot cleanup: the *old* auto-detect heuristic created CapitalFlow
     # rows whenever the live wallet drifted from the previous snapshot —

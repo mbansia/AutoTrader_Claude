@@ -764,21 +764,33 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         if v == MODE_LIVE:
             spot_free_total = 0.0
             fut_free_total = 0.0
+            free_breakdown: list[dict] = []
             for g in gateways:
                 bals_for_display = g.safe_balances() or {}
                 gw_spot_free = float((bals_for_display.get('spot', {}).get('USDT') or {}).get('free') or 0)
                 gw_fut_free = float((bals_for_display.get('futures', {}).get('USDT') or {}).get('free') or 0)
                 gw_fut_total = float((bals_for_display.get('futures', {}).get('USDT') or {}).get('total') or 0)
+                gw_earn = earn_deployed_by_venue.get(g.venue_id, 0.0)
                 spot_free_total += gw_spot_free
                 # Only credit the futures wallet's free amount when it's
                 # genuinely a separate pool (Classic) — under unified
                 # margin spot already covers it.
                 if gw_fut_total > 0.001:
                     fut_free_total += gw_fut_free
+                    free_breakdown.append({'label': f'{g.name} · USDT (spot)', 'value': gw_spot_free})
+                    free_breakdown.append({'label': f'{g.name} · USDT (futures)', 'value': gw_fut_free})
+                else:
+                    # Unified margin — single line, not split.
+                    free_breakdown.append({'label': f'{g.name} · USDT (unified pool)', 'value': gw_spot_free})
+                if gw_earn > 0:
+                    earn_label = 'BFUSD' if g.venue_id == 'binance' else ('USDT (auto-lent)' if g.venue_id == 'kucoin' else 'earn')
+                    free_breakdown.append({'label': f'{g.name} · {earn_label}', 'value': gw_earn})
             ctx['live_spot_free'] = spot_free_total
             ctx['live_fut_free'] = fut_free_total
+            ctx['free_deployable_breakdown'] = free_breakdown
         else:
             ctx['live_spot_free'] = ctx['live_fut_free'] = None
+            ctx['free_deployable_breakdown'] = []
 
         # Open positions rows + leg detail (formerly /positions).
         open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == v)).all()
@@ -1150,14 +1162,21 @@ def config_page(request: Request, saved: int = 0, view: str | None = None, view_
 
 @app.post('/config')
 def save_config(
-    entry_funding_threshold: float = Form(...),
-    exit_funding_threshold: float = Form(...),
+    # ``*_pct`` form fields are user-typed in PERCENT units (e.g. 20 for
+    # 20%) and we convert to decimal here. Underlying schema fields stay
+    # in decimal so legacy callers + comparisons elsewhere don't break.
+    entry_funding_threshold_pct: float = Form(...),
+    exit_funding_threshold_pct: float = Form(...),
+    stop_loss_pct_pct: float = Form(...),
+    min_position_pct_pct: float = Form(...),
+    max_position_pct_pct: float = Form(...),
+    futures_buffer_pct_pct: float = Form(...),
+    binance_max_bfusd_pct_pct: float = Form(...),
+    earn_paper_apr_pct: float = Form(...),
+    # Plain integer / decimal fields below.
     min_24h_quote_volume: float = Form(...),
-    stop_loss_pct: float = Form(...),
     max_open_positions: int = Form(...),
     max_trades_per_day: int = Form(...),
-    min_position_pct: float = Form(...),
-    max_position_pct: float = Form(...),
     max_hold_hours: int = Form(...),
     loop_seconds: int = Form(...),
     paper_slippage_bps: float = Form(...),
@@ -1169,16 +1188,9 @@ def save_config(
     delisting_check: int = Form(...),
     earn_enabled: int = Form(...),
     earn_idle_threshold_usdt: float = Form(...),
-    earn_paper_apr: float = Form(...),
     auto_transfer_enabled: int = Form(...),
-    # auto_rebalance_threshold removed — continuous rebalance was retired
-    # in favour of the earn-first model. Field kept on the model for
-    # back-compat but not surfaced in the form.
     earn_subscribe_spot_assets: int = Form(0),
-    perp_leverage: int = Form(1),         # legacy field — kept for back-compat
-    max_perp_leverage: int = Form(1),     # current name; surfaced on /config
-    futures_buffer_pct: float = Form(0.20),
-    binance_max_bfusd_pct: float = Form(0.20),
+    max_perp_leverage: int = Form(1),
     kucoin_auto_lend_enabled: int = Form(1),
     min_order_book_depth_usdt: float = Form(500.0),
     depth_band_bps: float = Form(10.0),
@@ -1186,14 +1198,19 @@ def save_config(
 ):
     with SessionLocal() as db:
         cfg = get_strategy_config(db)
-        cfg.entry_funding_threshold = entry_funding_threshold
-        cfg.exit_funding_threshold = exit_funding_threshold
+        # Percent → decimal conversions.
+        cfg.entry_funding_threshold = entry_funding_threshold_pct / 100.0
+        cfg.exit_funding_threshold = exit_funding_threshold_pct / 100.0
+        cfg.stop_loss_pct = stop_loss_pct_pct / 100.0
+        cfg.min_position_pct = min_position_pct_pct / 100.0
+        cfg.max_position_pct = max_position_pct_pct / 100.0
+        cfg.futures_buffer_pct = max(0.05, min(1.0, futures_buffer_pct_pct / 100.0))
+        cfg.binance_max_bfusd_pct = max(0.0, min(1.0, binance_max_bfusd_pct_pct / 100.0))
+        cfg.earn_paper_apr = earn_paper_apr_pct / 100.0
+        # Plain values.
         cfg.min_24h_quote_volume = min_24h_quote_volume
-        cfg.stop_loss_pct = stop_loss_pct
         cfg.max_open_positions = max_open_positions
         cfg.max_trades_per_day = max_trades_per_day
-        cfg.min_position_pct = min_position_pct
-        cfg.max_position_pct = max_position_pct
         cfg.max_hold_hours = max_hold_hours
         cfg.loop_seconds = max(5, loop_seconds)
         cfg.paper_slippage_bps = paper_slippage_bps
@@ -1205,16 +1222,11 @@ def save_config(
         cfg.delisting_check = bool(delisting_check)
         cfg.earn_enabled = bool(earn_enabled)
         cfg.earn_idle_threshold_usdt = earn_idle_threshold_usdt
-        cfg.earn_paper_apr = earn_paper_apr
         cfg.auto_transfer_enabled = bool(auto_transfer_enabled)
         cfg.earn_subscribe_spot_assets = bool(earn_subscribe_spot_assets)
-        # Take ``max_perp_leverage`` (the current form field) preferentially;
-        # ``perp_leverage`` is a legacy field kept for older form submissions.
-        new_lev = max(1, max_perp_leverage or perp_leverage or 1)
+        new_lev = max(1, max_perp_leverage or 1)
         cfg.max_perp_leverage = new_lev
-        cfg.perp_leverage = new_lev  # keep mirrored so any legacy reader sees the same value
-        cfg.futures_buffer_pct = max(0.05, min(1.0, futures_buffer_pct))
-        cfg.binance_max_bfusd_pct = max(0.0, min(1.0, binance_max_bfusd_pct))
+        cfg.perp_leverage = new_lev  # legacy mirror
         cfg.kucoin_auto_lend_enabled = bool(kucoin_auto_lend_enabled)
         cfg.min_order_book_depth_usdt = max(0.0, min_order_book_depth_usdt)
         cfg.depth_band_bps = max(1.0, depth_band_bps)
