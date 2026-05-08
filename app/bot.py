@@ -602,6 +602,28 @@ _CAPITAL_INGEST_INTERVAL_S = 3600.0
 _LAST_CAPITAL_INGEST_AT: dict[tuple[str, str], float] = {}
 
 
+# Rejected-candidate retention. The /logs search uses `RejectedCandidate`
+# rows to debug why a symbol never opened — search needs to span enough
+# history to be useful, but keeping the table forever bloats the DB
+# (each cycle adds up to 20 rejection rows per venue per mode). 7 days
+# is the ceiling; 1 day is the contractual floor.
+_REJECTED_RETENTION_DAYS = 7
+_REJECTED_PRUNE_INTERVAL_S = 3600.0
+_LAST_REJECTED_PRUNE_AT: list[float] = [0.0]
+
+
+def _maybe_prune_rejected_candidates(db) -> None:
+    """Once per hour, delete rejected_candidates older than the retention
+    floor. Cheap query (a single DELETE WHERE ts < cutoff)."""
+    from sqlalchemy import delete
+    now = time.time()
+    if (now - _LAST_REJECTED_PRUNE_AT[0]) < _REJECTED_PRUNE_INTERVAL_S:
+        return
+    cutoff = datetime.utcnow() - timedelta(days=_REJECTED_RETENTION_DAYS)
+    db.execute(delete(RejectedCandidate).where(RejectedCandidate.ts < cutoff))
+    _LAST_REJECTED_PRUNE_AT[0] = now
+
+
 def _maybe_ingest_capital_flows(db, gateway: VenueGateway, mode: str) -> int:
     key = (mode, gateway.venue_id)
     now = time.time()
@@ -1105,6 +1127,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
             #     these are cheap (cached safe_balances) and feed the
             #     real-time total-account-value indicator.
             _maybe_ingest_capital_flows(db, gateway, mode)
+            _maybe_prune_rejected_candidates(db)
             snap = _take_balance_snapshot(db, gateway, mode, cfg)
             db.add(EquityCurve(mode=mode, exchange=gateway.venue_id, equity_usdt=snap.total_usdt))
             db.commit()
