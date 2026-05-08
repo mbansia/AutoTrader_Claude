@@ -399,6 +399,44 @@ class VenueGateway:
             'error': '' if filled >= target_qty - 1e-9 else f'insufficient_depth (only {filled:.6f} fillable, asked {target_qty:.6f})',
         }
 
+    # Per-symbol taker-fee cache. ccxt's `fetch_trading_fee(symbol)`
+    # reads the venue's actual fee tier for the API key — VIP discounts,
+    # BNB-fee discounts, and per-symbol overrides all land here. Cache
+    # for an hour: fees rarely change and one /sapi/v1/asset/tradeFee
+    # call per symbol per hour costs nothing on the rate-limit budget.
+    TAKER_FEE_CACHE_TTL_S = 3600.0
+
+    def taker_fee_bps(self, symbol: str, perp: bool = False) -> float:
+        """Return the API-reported taker fee for ``symbol`` in bps.
+        Falls back to a venue-typical 5 bps if ccxt or the venue
+        refuses to surface the fee. Cached for
+        ``TAKER_FEE_CACHE_TTL_S`` seconds. The bot calls this for
+        every leg of every projected entry, so caching is essential."""
+        if not hasattr(self, '_taker_fee_cache'):
+            self._taker_fee_cache: dict = {}
+        key = (symbol, perp)
+        cached = self._taker_fee_cache.get(key)
+        if cached and (time.time() - cached[1]) < self.TAKER_FEE_CACHE_TTL_S:
+            return cached[0]
+        bps = self._fetch_taker_fee_bps(symbol, perp=perp)
+        self._taker_fee_cache[key] = (bps, time.time())
+        return bps
+
+    def _fetch_taker_fee_bps(self, symbol: str, perp: bool = False) -> float:
+        """Network read of the taker fee. Default: ccxt's
+        `fetch_trading_fee(symbol)`. Subclasses with PM / UTA /
+        special-key behaviour override. Never raises; failures
+        return the conservative 5 bps fallback."""
+        ex = self.futures if perp else self.spot
+        try:
+            fee = ex.fetch_trading_fee(symbol)
+            taker = float((fee or {}).get('taker') or 0)
+            if taker > 0:
+                return taker * 10000.0
+        except Exception:
+            pass
+        return 5.0
+
     def safe_balances(self, *, force_refresh: bool = False) -> dict | None:
         """Return ``{'spot': {...}, 'futures': {...}}`` from ccxt, or ``None`` on
         error (with the failure message pinned to ``self.last_balance_error``).

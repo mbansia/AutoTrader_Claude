@@ -1167,9 +1167,7 @@ def save_config(
     paper_starting_equity: float = Form(...),
     max_entry_basis_bps: float = Form(...),
     max_exit_basis_bps: float = Form(...),
-    taker_fee_bps: float = Form(5.0),
     exit_basis_buffer_multiple: float = Form(3.0),
-    min_window_profit_bps: float = Form(0.0),
     enforce_hedge_check: int = Form(...),
     delisting_check: int = Form(...),
     auto_transfer_enabled: int = Form(...),
@@ -1198,9 +1196,7 @@ def save_config(
         cfg.paper_starting_equity = paper_starting_equity
         cfg.max_entry_basis_bps = max_entry_basis_bps
         cfg.max_exit_basis_bps = max_exit_basis_bps
-        cfg.taker_fee_bps = max(0.0, taker_fee_bps)
         cfg.exit_basis_buffer_multiple = max(0.0, exit_basis_buffer_multiple)
-        cfg.min_window_profit_bps = min_window_profit_bps
         cfg.enforce_hedge_check = bool(enforce_hedge_check)
         cfg.delisting_check = bool(delisting_check)
         cfg.auto_transfer_enabled = bool(auto_transfer_enabled)

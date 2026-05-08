@@ -273,29 +273,20 @@ class StrategyConfig(Base):
     paper_starting_equity: Mapped[float] = mapped_column(Float, default=1000.0)
     entry_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     exit_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    # ─── Profitability gate (replaces hard-coded basis filter) ────────
-    # Round-trip taker fee per leg in bps. The bot pays this on entry
-    # spot + entry perp + exit spot + exit perp = 4× this number per
-    # complete round trip. Defaults to 5 bps which is roughly the
-    # taker-fee tier on Binance USDM and KuCoin futures with no VIP
-    # discount. Set lower if you have a fee tier; the bot conservatively
-    # uses the configured value as the actual paid fee.
-    taker_fee_bps: Mapped[float] = mapped_column(Float, default=5.0)
-    # Exit basis buffer multiple: assume worst-case exit basis is this
-    # multiple of the entry basis when projecting profitability. 3×
-    # default — i.e. if we entered with 5 bps of cross-leg basis cost,
-    # we conservatively assume exit costs 15 bps. The full round-trip
-    # basis cost the profitability gate uses is therefore
-    # ``|entry_basis_bps| × (1 + multiple)``.
+    # ─── Profitability gate ───────────────────────────────────────────
+    # Worst-case exit basis projection: assume the exit basis is this
+    # multiple of the entry/live basis. Round-trip basis cost
+    # subtracted from the funding window = |basis| × (1 + multiple).
+    # 3× default. The taker-fee component of the gate is fetched
+    # live per symbol from each venue's API (no config knob — the
+    # bot uses the actual VIP / per-symbol fee tier that applies).
     exit_basis_buffer_multiple: Mapped[float] = mapped_column(Float, default=3.0)
-    # Minimum profit per single funding window (in bps of position
-    # notional) for the trade to be eligible. Computed at execution
-    # time using the actual ``simulate_fill`` prices:
-    #   net_bps = funding_window_bps − |entry_basis_bps| × (1 + buffer) − 4 × taker_fee_bps
-    # If net_bps < this threshold, the candidate is rejected with a
-    # detailed `insufficient_profit (...)` reason. 0 = accept any
-    # positive expected profit; raise to require a margin of safety.
-    min_window_profit_bps: Mapped[float] = mapped_column(Float, default=0.0)
+    # NOTE: legacy `taker_fee_bps` and `min_window_profit_bps` columns
+    # may exist in pre-existing DBs from earlier deploys. They're no
+    # longer mapped here — the gate is parameterised entirely via
+    # entry/exit `_funding_threshold` (now "annualized net profit
+    # threshold") + `exit_basis_buffer_multiple` + the API-reported
+    # per-symbol taker fee.
     max_entry_basis_bps: Mapped[float] = mapped_column(Float, default=20.0)
     max_exit_basis_bps: Mapped[float] = mapped_column(Float, default=5.0)
     # Limit-IOC tick buffer for the protected execution path. The bot
