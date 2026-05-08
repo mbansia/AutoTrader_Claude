@@ -1451,10 +1451,21 @@ class KuCoinGateway(VenueGateway):
 
     # ccxt's kucoinfutures.fetch_funding_rates() raises NotSupported, so the
     # base-class scan would silently return zero candidates. KuCoin does
-    # surface ``fundingFeeRate`` + ``nextFundingRateTime`` on every active
-    # contract via ``/api/v1/contracts/active`` (which is what load_markets()
-    # already calls). We rebuild the ccxt-shaped funding-rate dict from the
-    # cached market info — no extra HTTP per scan.
+    # surface ``predictedFundingFeeRate`` + ``nextFundingRateTime`` on every
+    # active contract via ``/api/v1/contracts/active`` (which is what
+    # load_markets() already calls). We rebuild the ccxt-shaped funding-
+    # rate dict from the cached market info — no extra HTTP per scan.
+    #
+    # IMPORTANT: ``predictedFundingFeeRate`` is the rate the upcoming
+    # settlement WILL pay (what KuCoin's web UI shows as "Funding Rate
+    # / Countdown" — and what an arb bot actually cares about), while
+    # plain ``fundingFeeRate`` is the rate from the LAST settlement
+    # (often near zero between cycles after the rate snaps back to
+    # equilibrium). The earlier code used fundingFeeRate, which made
+    # rejected_candidates report wildly understated APYs (e.g. 11.57%
+    # for a perp the operator could see at 0.525% / 8h ≈ 575% APY in
+    # the venue UI). Prefer predicted; fall back to last-applied if
+    # the predicted field is missing or null.
     def funding_rates_dict(self) -> dict:
         if not self.futures.markets:
             self.futures.load_markets()
@@ -1463,7 +1474,9 @@ class KuCoinGateway(VenueGateway):
             if market.get('type') != 'swap' or market.get('quote') not in SUPPORTED_QUOTES:
                 continue
             info = market.get('info') or {}
-            fr = info.get('fundingFeeRate')
+            fr = info.get('predictedFundingFeeRate')
+            if fr is None:
+                fr = info.get('fundingFeeRate')
             if fr is None:
                 continue
             try:
