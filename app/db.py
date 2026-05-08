@@ -96,6 +96,7 @@ def run_schema_migrations() -> None:
     # Per-position quote currency — 'USDT' or 'USDC'. Default USDT on
     # every existing row preserves the historical assumption.
     _add_column_if_missing('positions', 'quote_currency', "VARCHAR(8) NOT NULL DEFAULT 'USDT'")
+    _add_column_if_missing('positions', 'spot_quote_currency', "VARCHAR(8) NOT NULL DEFAULT 'USDT'")
     # Cross-venue tag — every per-row table carries an ``exchange`` column so
     # the dashboard, logs, scans, and exports can break down state by venue
     # without ambiguity. Default 'binance' on every existing row guarantees

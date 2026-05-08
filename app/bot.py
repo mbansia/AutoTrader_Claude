@@ -1064,10 +1064,18 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         base = c.spot_symbol.split('/')[0]
                         if base in held_bases:
                             continue
-                        # Per-quote sizing: USDT trade reads USDT free,
-                        # USDC trade reads USDC free. Never cross-funded.
+                        # Per-quote sizing. Spot leg consumes the spot
+                        # quote's free balance; perp leg consumes the
+                        # perp quote's free balance. For same-stable arbs
+                        # both are equal (USDT or USDC); for cross-stable
+                        # arbs (e.g. DOGE/USDT spot + DOGEUSDC perp) they
+                        # differ. The wallet cap is the smaller of the
+                        # two so we never open a leg we can't fund.
                         cq = c.quote_currency
-                        free_for_arb = min(spot_free_by_q.get(cq, 0.0), fut_free_by_q.get(cq, 0.0))
+                        sq = getattr(c, 'spot_quote_currency', cq)
+                        spot_leg_free = spot_free_by_q.get(sq, 0.0)
+                        perp_leg_free = fut_free_by_q.get(cq, 0.0)
+                        free_for_arb = min(spot_leg_free, perp_leg_free)
                         wallet_cap = free_for_arb * 0.97
                         depth_cap = 0.25 * (c.min_depth_usdt or 0)
                         volume_cap = 0.005 * (c.quote_volume or 0)
@@ -1077,8 +1085,10 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             volume_cap = float('inf')
                         sized_notional = min(wallet_cap, desired_notional, depth_cap, volume_cap)
                         if sized_notional < min_notional:
-                            reason = (f'below min position pct ({sized_notional:.2f} < {min_notional:.2f} {cq}; '
-                                      f'wallet={wallet_cap:.2f} max_pct={desired_notional:.2f} '
+                            quote_label = cq if sq == cq else f'{sq}-spot/{cq}-perp'
+                            reason = (f'below min position pct ({sized_notional:.2f} < {min_notional:.2f}; '
+                                      f'wallet={wallet_cap:.2f} [{quote_label}] '
+                                      f'max_pct={desired_notional:.2f} '
                                       f'depth_cap={depth_cap if depth_cap != float("inf") else "—"} '
                                       f'vol_cap={volume_cap if volume_cap != float("inf") else "—"})')
                             db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=reason, funding_rate=c.funding_apr))
@@ -1113,6 +1123,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             spot_symbol=c.spot_symbol,
                             perp_symbol=c.perp_symbol,
                             quote_currency=cq,
+                            spot_quote_currency=sq,
                             quantity=qty,
                             entry_funding_rate=c.funding_rate,
                             last_funding_rate=c.funding_rate,
@@ -1154,7 +1165,8 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         record_trade(db, pos.id, mode, c.perp_symbol, 'futures', 'sell', qty, f, exchange=gateway.venue_id)
                         held_bases.add(base)
                         scan_action = f'opened {c.perp_symbol}'
-                        log_event(db, f'Opened {c.perp_symbol} qty={qty:.6f} funding_apy={c.funding_apr:.2%} depth=${c.min_depth_usdt:.0f}', mode=mode, exchange=gateway.venue_id)
+                        cross_stable_tag = '' if sq == cq else f' [cross-stable {sq}-spot / {cq}-perp]'
+                        log_event(db, f'Opened {c.perp_symbol} qty={qty:.6f} funding_apy={c.funding_apr:.2%} depth=${c.min_depth_usdt:.0f}{cross_stable_tag}', mode=mode, exchange=gateway.venue_id)
                         bus.emit('position_opened',
                                  position_id=pos.id, mode=mode, exchange=gateway.venue_id,
                                  symbol=c.spot_symbol, quantity=qty,

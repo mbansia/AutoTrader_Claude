@@ -115,10 +115,15 @@ class Position(Base):
     symbol: Mapped[str] = mapped_column(String(32), index=True)
     spot_symbol: Mapped[str] = mapped_column(String(32))
     perp_symbol: Mapped[str] = mapped_column(String(32))
-    # Quote currency the position trades against — 'USDT' or 'USDC'.
-    # Tracked separately because the bot never cross-funds: a USDC
-    # entry only consumes USDC free balance, exits return to USDC, etc.
+    # Perp-leg quote currency — drives futures-wallet routing and
+    # margin sizing. Spot-leg quote may differ when this is a cross-
+    # stable arb (e.g. perp on USDC + spot on USDT, hedged delta-
+    # neutral via the USDC↔USDT peg). See ``spot_quote_currency``.
     quote_currency: Mapped[str] = mapped_column(String(8), default='USDT', index=True)
+    # Spot-leg quote currency. Defaults to the same as
+    # ``quote_currency`` for legacy single-stable arbs; differs only
+    # for cross-stable arbs.
+    spot_quote_currency: Mapped[str] = mapped_column(String(8), default='USDT', index=True)
     quantity: Mapped[float] = mapped_column(Float)
     opened_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     status: Mapped[str] = mapped_column(String(16), default='open', index=True)
