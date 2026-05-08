@@ -235,6 +235,31 @@ def record_trade(db, position_id: int | None, mode: str, symbol: str, venue: str
     ))
 
 
+def _rollback_spot(db, gateway: VenueGateway, pos: Position, c, qty: float, paper: bool, cfg: StrategyConfig) -> None:
+    """When the perp leg fails after spot bought, sell the spot back via
+    a limit-IOC at bid − tick buffer. If THAT fails, log critical and
+    leave the position open with naked-long exposure for the next-cycle
+    hedge check to repair. Mirrors the close path's protected-exec
+    convention so we never use a bare market order in live."""
+    try:
+        sim = gateway.simulate_fill(c.spot_symbol, qty, side='sell', perp=False)
+        tick_bps = float(cfg.entry_tick_buffer_bps or 1.0)
+        limit = sim['worst_price'] * (1 - tick_bps / 10000.0) if sim['worst_price'] > 0 else 0
+        if limit <= 0:
+            # Book empty / unreachable — fall back to a market sell so we
+            # at least try to flatten. Worse slippage but avoids carrying
+            # naked long exposure into the next cycle.
+            rev = gateway.close_spot(c.spot_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+        else:
+            rev = gateway.close_spot_limit_ioc(c.spot_symbol, qty, limit, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+        record_trade(db, pos.id, pos.mode, c.spot_symbol, 'spot', 'sell', qty, rev, exchange=gateway.venue_id)
+        pos.status = 'closed'
+        pos.closed_at = datetime.utcnow()
+        log_event(db, f'Rolled back spot leg of {c.perp_symbol} after perp failure; loss ≈ entry+exit fees + slippage', mode=pos.mode, exchange=gateway.venue_id)
+    except Exception as e:
+        log_event(db, f'CRITICAL: spot rollback failed: {str(e)[:140]}. {c.spot_symbol} is naked-long; hedge check will retry next cycle.', mode=pos.mode, level='ERROR', exchange=gateway.venue_id)
+
+
 def _log_close_error(db, p: Position, leg: str, err: str) -> None:
     """Record a close-leg error, but only if it's different from the last one we
     logged for this (position, leg). Stops the same 'Margin is insufficient'
@@ -980,6 +1005,18 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     ]
                     if parts:
                         scan_note = ' · '.join(parts)
+                    # Also log to bot_events so the operator can confirm
+                    # per-venue scan coverage by searching /logs for the
+                    # venue name (e.g. "kucoin"). The scan_results table
+                    # has the same data but isn't searchable from the
+                    # current /logs UI.
+                    summary_bits = []
+                    for q in ('USDT', 'USDC'):
+                        s = pq.get(q, {}) or {}
+                        if s.get('total', 0):
+                            summary_bits.append(f"{q}: {s['total']}t/{s.get('passing', 0)}p/{s.get('below_threshold', 0)}<thr")
+                    if summary_bits:
+                        log_event(db, f'Scan summary: {" · ".join(summary_bits)}', mode=mode, exchange=gateway.venue_id)
                 top_candidates_payload = [{
                     'perp': c.perp_symbol,
                     'fr': c.funding_rate,
@@ -1094,27 +1131,91 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=reason, funding_rate=c.funding_apr))
                             scan_action = 'below_min_pct'
                             continue
-                        spot_px = gateway.safe_price(c.spot_symbol) or 0
-                        perp_px = gateway.safe_price(c.perp_symbol, perp=True) or 0
-                        if spot_px <= 0 or perp_px <= 0:
+                        # Protected-execution path: walk both order books
+                        # to confirm the desired qty can fill at acceptable
+                        # cross-leg basis BEFORE placing any order. The
+                        # limit-IOC limit price comes from the deepest
+                        # level we'd consume + a 1-tick buffer, so the
+                        # order either fills the whole walk or cancels —
+                        # never leaves a resting limit on the book.
+                        spot_px_quick = gateway.safe_price(c.spot_symbol) or 0
+                        if spot_px_quick <= 0:
                             continue
-                        ok, entry_bps = is_basis_entry_acceptable(spot_px, perp_px, cfg.max_entry_basis_bps)
-                        if not ok:
-                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=f'basis_too_wide ({entry_bps:+.1f}bps > ±{cfg.max_entry_basis_bps:.1f})', funding_rate=c.funding_apr))
-                            scan_action = 'basis_too_wide'
+                        target_qty = sized_notional / spot_px_quick
+                        # Iteratively shrink to whatever the book actually
+                        # supports — at most 3 attempts so we don't loop
+                        # forever on a depth-starved name.
+                        spot_sim = perp_sim = None
+                        for _attempt in range(3):
+                            spot_sim = gateway.simulate_fill(c.spot_symbol, target_qty, side='buy', perp=False)
+                            perp_sim = gateway.simulate_fill(c.perp_symbol, target_qty, side='sell', perp=True)
+                            spot_filled = spot_sim['filled_qty']
+                            perp_filled = perp_sim['filled_qty']
+                            min_filled = min(spot_filled, perp_filled)
+                            if min_filled >= target_qty - 1e-9:
+                                break  # both legs can fill the requested size
+                            if min_filled <= 0:
+                                target_qty = 0
+                                break
+                            # Shrink to the smaller-fillable side and retry.
+                            target_qty = min_filled
+                        if target_qty <= 0 or spot_sim is None:
+                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol,
+                                reason=f'no_book_depth (spot_filled={spot_sim["filled_qty"] if spot_sim else 0:.6f}, perp_filled={perp_sim["filled_qty"] if perp_sim else 0:.6f})',
+                                funding_rate=c.funding_apr))
+                            scan_action = 'no_book_depth'
                             continue
-                        qty = sized_notional / max(0.0001, spot_px)
+                        # Re-check the per-position-pct floor against the
+                        # final qty (book-walk may have shrunk us below it).
+                        sim_notional = target_qty * spot_sim['avg_price']
+                        if sim_notional < min_notional:
+                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol,
+                                reason=f'below_min_pct_after_book_walk ({sim_notional:.2f} < {min_notional:.2f})',
+                                funding_rate=c.funding_apr))
+                            scan_action = 'below_min_pct'
+                            continue
+                        # Synthetic basis at fill prices — the REAL entry
+                        # cost vs. the mid-price approximation we used to
+                        # check. (perp_avg − spot_avg) / spot_avg × 1e4.
+                        spot_avg = spot_sim['avg_price']
+                        perp_avg = perp_sim['avg_price']
+                        if spot_avg <= 0 or perp_avg <= 0:
+                            continue
+                        fill_basis_bps = (perp_avg - spot_avg) / spot_avg * 10000.0
+                        if abs(fill_basis_bps) > cfg.max_entry_basis_bps:
+                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol,
+                                reason=f'fill_basis_too_wide ({fill_basis_bps:+.1f}bps > ±{cfg.max_entry_basis_bps:.1f}bps at fill prices spot={spot_avg:.6f} perp={perp_avg:.6f})',
+                                funding_rate=c.funding_apr))
+                            scan_action = 'fill_basis_too_wide'
+                            continue
+                        # Limit prices at the worst-level + tick buffer.
+                        # Buy: pay UP TO this. Sell: accept DOWN TO this.
+                        tick_bps = float(cfg.entry_tick_buffer_bps or 1.0)
+                        spot_limit = spot_sim['worst_price'] * (1 + tick_bps / 10000.0)
+                        perp_limit = perp_sim['worst_price'] * (1 - tick_bps / 10000.0)
+                        # Configure perp cross + leverage idempotently.
+                        if not paper:
+                            cfg_ok, cfg_err = gateway.configure_perp_for_arb(c.perp_symbol)
+                            if not cfg_ok:
+                                log_event(db, f'configure_perp_for_arb({c.perp_symbol}) warned: {cfg_err[:120]}', mode=mode, level='WARN', exchange=gateway.venue_id)
+
+                        # Place spot limit-IOC.
                         try:
-                            s = gateway.create_spot_buy(c.spot_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+                            s = gateway.create_spot_buy_limit_ioc(c.spot_symbol, target_qty, spot_limit, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
                         except Exception as e:
                             err = str(e)[:140]
-                            log_event(db, f'Spot buy failed for {c.spot_symbol}: {err}', mode=mode, level='ERROR', exchange=gateway.venue_id)
+                            log_event(db, f'Spot limit-IOC buy failed for {c.spot_symbol}: {err}', mode=mode, level='ERROR', exchange=gateway.venue_id)
                             db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=f'spot_buy_error: {err[:80]}', funding_rate=c.funding_apr))
                             scan_action = 'spot_buy_error'
                             continue
-
-                        # Spot succeeded. Persist the half-built position immediately so the
-                        # rollback path (or next-cycle hedge check) has a row to attach to.
+                        spot_filled_qty = float(s.get('filled') or s.get('amount') or 0)
+                        if spot_filled_qty <= 0:
+                            log_event(db, f'Spot limit-IOC for {c.spot_symbol} got zero fill at limit {spot_limit:.6f} (book moved); skipping', mode=mode, level='WARN', exchange=gateway.venue_id)
+                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason='spot_ioc_zero_fill (book moved during round-trip)', funding_rate=c.funding_apr))
+                            scan_action = 'spot_ioc_zero_fill'
+                            continue
+                        # Persist half-built position so any failure path
+                        # has a row to attach trades / errors to.
                         pos = Position(
                             mode=mode,
                             exchange=gateway.venue_id,
@@ -1124,7 +1225,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             perp_symbol=c.perp_symbol,
                             quote_currency=cq,
                             spot_quote_currency=sq,
-                            quantity=qty,
+                            quantity=spot_filled_qty,  # finalised after perp leg
                             entry_funding_rate=c.funding_rate,
                             last_funding_rate=c.funding_rate,
                             funding_interval_hours=c.funding_interval_hours,
@@ -1134,43 +1235,51 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         )
                         db.add(pos)
                         db.flush()
-                        record_trade(db, pos.id, mode, c.spot_symbol, 'spot', 'buy', qty, s, exchange=gateway.venue_id)
+                        record_trade(db, pos.id, mode, c.spot_symbol, 'spot', 'buy', spot_filled_qty, s, exchange=gateway.venue_id)
 
-                        # Now the perp short. Configure CROSS margin + 1x leverage on the
-                        # symbol first — keeps the perp's used margin == its notional and
-                        # avoids "Margin is insufficient" surprises later. Idempotent.
-                        if not paper:
-                            cfg_ok, cfg_err = gateway.configure_perp_for_arb(c.perp_symbol)
-                            if not cfg_ok:
-                                log_event(db, f'configure_perp_for_arb({c.perp_symbol}) warned: {cfg_err[:120]}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                        # Place perp limit-IOC for the EXACT spot-filled qty.
                         try:
-                            f = gateway.create_perp_short(c.perp_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+                            f = gateway.create_perp_short_limit_ioc(c.perp_symbol, spot_filled_qty, perp_limit, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
                         except Exception as e:
                             err = str(e)[:140]
-                            log_event(db, f'Perp short failed for {c.perp_symbol} after spot bought: {err} — rolling back spot leg', mode=mode, level='ERROR', exchange=gateway.venue_id)
-                            try:
-                                rev = gateway.close_spot(c.spot_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
-                                record_trade(db, pos.id, mode, c.spot_symbol, 'spot', 'sell', qty, rev, exchange=gateway.venue_id)
-                                pos.status = 'closed'
-                                pos.closed_at = datetime.utcnow()
-                                log_event(db, f'Rolled back spot leg of {c.perp_symbol}; loss ≈ entry+exit fees + slippage', mode=mode, exchange=gateway.venue_id)
-                            except Exception as e2:
-                                log_event(db, f'CRITICAL: spot rollback failed: {str(e2)[:140]}. {c.spot_symbol} is naked-long; hedge check will retry next cycle.', mode=mode, level='ERROR', exchange=gateway.venue_id)
+                            log_event(db, f'Perp limit-IOC short failed for {c.perp_symbol} after spot filled: {err} — rolling back spot leg', mode=mode, level='ERROR', exchange=gateway.venue_id)
+                            _rollback_spot(db, gateway, pos, c, spot_filled_qty, paper, cfg)
                             db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=f'perp_short_error: {err[:80]}', funding_rate=c.funding_apr))
                             scan_action = 'perp_short_error'
                             continue
-
-                        # Both legs filled — finalize.
+                        perp_filled_qty = float(f.get('filled') or 0)
+                        # Reconcile leg sizes.
+                        if perp_filled_qty <= 0:
+                            log_event(db, f'Perp limit-IOC for {c.perp_symbol} got zero fill — full spot rollback', mode=mode, level='ERROR', exchange=gateway.venue_id)
+                            _rollback_spot(db, gateway, pos, c, spot_filled_qty, paper, cfg)
+                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason='perp_ioc_zero_fill (book moved during round-trip)', funding_rate=c.funding_apr))
+                            scan_action = 'perp_ioc_zero_fill'
+                            continue
+                        if perp_filled_qty + 1e-9 < spot_filled_qty:
+                            # Trim spot back to perp-filled size.
+                            trim_qty = spot_filled_qty - perp_filled_qty
+                            log_event(db, f'Leg-mismatch reconcile: trimming {trim_qty:.6f} {base} (spot {spot_filled_qty:.6f} > perp {perp_filled_qty:.6f})', mode=mode, level='WARN', exchange=gateway.venue_id)
+                            try:
+                                trim_sim = gateway.simulate_fill(c.spot_symbol, trim_qty, side='sell', perp=False)
+                                trim_limit = trim_sim['worst_price'] * (1 - tick_bps / 10000.0) if trim_sim['worst_price'] > 0 else spot_avg * 0.999
+                                rev = gateway.close_spot_limit_ioc(c.spot_symbol, trim_qty, trim_limit, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
+                                trimmed = float(rev.get('filled') or 0)
+                                if trimmed > 0:
+                                    record_trade(db, pos.id, mode, c.spot_symbol, 'spot', 'sell', trimmed, rev, exchange=gateway.venue_id)
+                            except Exception as e2:
+                                log_event(db, f'Trim-spot reconcile failed: {str(e2)[:120]}. Hedge check will repair next cycle.', mode=mode, level='ERROR', exchange=gateway.venue_id)
+                            pos.quantity = perp_filled_qty
+                        # Both legs filled (possibly post-trim) — finalize.
                         pos.perp_entry_price = float(f.get('price') or 0)
-                        record_trade(db, pos.id, mode, c.perp_symbol, 'futures', 'sell', qty, f, exchange=gateway.venue_id)
+                        record_trade(db, pos.id, mode, c.perp_symbol, 'futures', 'sell', perp_filled_qty, f, exchange=gateway.venue_id)
                         held_bases.add(base)
                         scan_action = f'opened {c.perp_symbol}'
                         cross_stable_tag = '' if sq == cq else f' [cross-stable {sq}-spot / {cq}-perp]'
-                        log_event(db, f'Opened {c.perp_symbol} qty={qty:.6f} funding_apy={c.funding_apr:.2%} depth=${c.min_depth_usdt:.0f}{cross_stable_tag}', mode=mode, exchange=gateway.venue_id)
+                        log_event(db, f'Opened {c.perp_symbol} qty={pos.quantity:.6f} funding_apy={c.funding_apr:.2%} fill_basis={fill_basis_bps:+.1f}bps spot@{spot_avg:.6f} perp@{perp_avg:.6f}{cross_stable_tag}', mode=mode, exchange=gateway.venue_id)
                         bus.emit('position_opened',
                                  position_id=pos.id, mode=mode, exchange=gateway.venue_id,
-                                 symbol=c.spot_symbol, quantity=qty,
-                                 notional=qty * pos.spot_entry_price)
+                                 symbol=c.spot_symbol, quantity=pos.quantity,
+                                 notional=pos.quantity * pos.spot_entry_price)
                         break
             else:
                 if not mstate.entry_enabled:

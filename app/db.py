@@ -97,6 +97,9 @@ def run_schema_migrations() -> None:
     # every existing row preserves the historical assumption.
     _add_column_if_missing('positions', 'quote_currency', "VARCHAR(8) NOT NULL DEFAULT 'USDT'")
     _add_column_if_missing('positions', 'spot_quote_currency', "VARCHAR(8) NOT NULL DEFAULT 'USDT'")
+    # Limit-IOC tick buffers for protected execution.
+    _add_column_if_missing('strategy_config', 'entry_tick_buffer_bps', 'FLOAT NOT NULL DEFAULT 1.0')
+    _add_column_if_missing('strategy_config', 'exit_tick_buffer_bps', 'FLOAT NOT NULL DEFAULT 2.0')
     # Cross-venue tag — every per-row table carries an ``exchange`` column so
     # the dashboard, logs, scans, and exports can break down state by venue
     # without ambiguity. Default 'binance' on every existing row guarantees

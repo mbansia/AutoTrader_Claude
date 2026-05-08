@@ -326,6 +326,79 @@ class VenueGateway:
             total += p * q
         return total
 
+    def simulate_fill(
+        self,
+        symbol: str,
+        target_qty: float,
+        side: str,
+        perp: bool = False,
+        max_levels: int = 50,
+    ) -> dict:
+        """Walk the order book to simulate filling ``target_qty`` of base
+        asset. Returns ``{ok, filled_qty, avg_price, worst_price, levels,
+        notional, error}`` — the foundation for the protected-execution
+        path. ``side`` is 'buy' (we hit asks) or 'sell' (we hit bids).
+
+        Pre-trade: tells the bot the realistic fill price and depth
+        BEFORE placing any order, so sizing can shrink to what the
+        book actually supports and the cross-leg basis check uses
+        synthetic fill prices (not last-trade mid).
+
+        Post-walk:
+        * ``ok`` is True iff the book has enough depth across visible
+          levels to fill ``target_qty`` at any price.
+        * ``avg_price`` is the volume-weighted average fill price
+          across the consumed levels. Use this for basis math.
+        * ``worst_price`` is the deepest level we'd cross — the price
+          a limit-IOC order has to clear (with a tiny tick buffer)
+          to actually consume every level we walked. If you set the
+          limit at avg_price, the bottom half of the levels won't
+          trigger and you'll get a ~50% partial fill.
+        * ``levels`` is the count of book levels consumed (debugging).
+        """
+        ex = self.futures if perp else self.spot
+        try:
+            ob = ex.fetch_order_book(symbol, limit=max_levels)
+        except Exception as e:
+            return {'ok': False, 'filled_qty': 0.0, 'avg_price': 0.0,
+                    'worst_price': 0.0, 'levels': 0, 'notional': 0.0,
+                    'error': f'fetch_order_book: {str(e)[:120]}'}
+        levels_side = (ob.get('asks') if side == 'buy' else ob.get('bids')) or []
+        if not levels_side:
+            return {'ok': False, 'filled_qty': 0.0, 'avg_price': 0.0,
+                    'worst_price': 0.0, 'levels': 0, 'notional': 0.0,
+                    'error': 'empty book side'}
+        filled = 0.0
+        cost = 0.0
+        worst = 0.0
+        n_levels = 0
+        for lvl in levels_side:
+            try:
+                px, qty = float(lvl[0]), float(lvl[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if px <= 0 or qty <= 0:
+                continue
+            take = min(qty, max(0.0, target_qty - filled))
+            if take <= 0:
+                break
+            cost += px * take
+            filled += take
+            worst = px
+            n_levels += 1
+            if filled >= target_qty - 1e-12:
+                break
+        avg = cost / filled if filled > 0 else 0.0
+        return {
+            'ok': filled >= target_qty - 1e-9,
+            'filled_qty': filled,
+            'avg_price': avg,
+            'worst_price': worst,
+            'levels': n_levels,
+            'notional': cost,
+            'error': '' if filled >= target_qty - 1e-9 else f'insufficient_depth (only {filled:.6f} fillable, asked {target_qty:.6f})',
+        }
+
     def safe_balances(self, *, force_refresh: bool = False) -> dict | None:
         """Return ``{'spot': {...}, 'futures': {...}}`` from ccxt, or ``None`` on
         error (with the failure message pinned to ``self.last_balance_error``).
@@ -698,6 +771,101 @@ class VenueGateway:
 
     def close_perp(self, symbol: str, amount: float, paper_mode: bool, slippage_bps: float, fee_bps: float) -> dict:
         return self._market_order('futures', symbol, 'buy', amount, paper_mode, slippage_bps, fee_bps)
+
+    # ─── Protected execution: limit + IOC at book-walked price ───────────
+    # The bot's preferred entry path. Caller has already simulated the
+    # book walk (``simulate_fill``) and computed the worst-level price;
+    # we place a limit-IOC at that price (typically with 1-tick buffer
+    # to absorb a single venue tick of movement during round-trip).
+    # IOC = "fill what you can at this price-or-better RIGHT NOW, then
+    # cancel any unfilled remainder". So we either get a clean fill or
+    # zero — never a resting order on the book that could be picked off
+    # later.
+    #
+    # The fill dict returned mirrors the market-order shape so
+    # downstream code (record_trade, position update) doesn't change.
+    # Critically we surface ``filled_qty`` so the bot can reconcile
+    # leg sizes if one IOC gets a smaller fill than the other.
+
+    def _limit_ioc_order(
+        self,
+        leg: str,
+        symbol: str,
+        side: str,
+        amount: float,
+        limit_price: float,
+        paper_mode: bool,
+        slippage_bps: float,
+        fee_bps: float,
+    ) -> dict:
+        """Place a limit-IOC. ``limit_price`` is the worst price the
+        order may cross — at-the-touch + 1 tick buffer is the typical
+        caller-supplied value. Returns a fill dict with at minimum
+        ``price`` (avg fill), ``amount`` (requested), ``filled``
+        (actually filled), ``fee.cost``, and ``status`` ('closed' iff
+        fully filled, 'canceled' iff zero, 'partial' otherwise).
+        Paper mode synthesises a fill at the limit price (assuming
+        the book accepts the full size, which is what the upstream
+        simulate_fill already validated)."""
+        if paper_mode:
+            slip = slippage_bps / 10000.0
+            # In paper, limit price already encodes the worst-level
+            # slippage; charge an extra modeled slip on top so paper
+            # is conservatively pessimistic relative to live IOC.
+            fill_price = limit_price * (1 + slip) if side == 'buy' else limit_price * (1 - slip)
+            fee_cost = fill_price * amount * (fee_bps / 10000.0)
+            return {
+                'id': 'paper-ioc', 'symbol': symbol, 'side': side,
+                'amount': amount, 'filled': amount,
+                'venue': leg, 'status': 'closed',
+                'price': fill_price, 'fee': {'cost': fee_cost},
+            }
+        ex = self.spot if leg == 'spot' else self.futures
+        fill = ex.create_order(symbol, 'limit', side, amount, limit_price,
+                               params={'timeInForce': 'IOC'})
+        # Normalise the response so downstream code can read ``filled``
+        # and ``price`` reliably without reaching into ccxt-specific
+        # response shapes.
+        try:
+            filled = float(fill.get('filled') or 0)
+        except (TypeError, ValueError):
+            filled = 0.0
+        try:
+            avg = float(fill.get('average') or fill.get('price') or 0)
+        except (TypeError, ValueError):
+            avg = 0.0
+        if avg > 0 and 'price' not in fill:
+            fill['price'] = avg
+        if 'filled' not in fill:
+            fill['filled'] = filled
+        # Fee may be dict or list of dicts depending on venue.
+        fee = fill.get('fee')
+        if isinstance(fee, list) and fee:
+            fee = fee[0]
+        if isinstance(fee, dict):
+            fill['fee'] = fee
+        else:
+            fill['fee'] = {'cost': 0.0}
+        # Status normalisation.
+        if filled <= 0:
+            fill.setdefault('status', 'canceled')
+        elif filled + 1e-9 < amount:
+            fill['status'] = 'partial'
+        else:
+            fill.setdefault('status', 'closed')
+        return fill
+
+    def create_spot_buy_limit_ioc(self, symbol: str, amount: float, limit_price: float, paper_mode: bool, slippage_bps: float, fee_bps: float) -> dict:
+        return self._limit_ioc_order('spot', symbol, 'buy', amount, limit_price, paper_mode, slippage_bps, fee_bps)
+
+    def create_perp_short_limit_ioc(self, symbol: str, amount: float, limit_price: float, paper_mode: bool, slippage_bps: float, fee_bps: float) -> dict:
+        return self._limit_ioc_order('futures', symbol, 'sell', amount, limit_price, paper_mode, slippage_bps, fee_bps)
+
+    def close_spot_limit_ioc(self, symbol: str, amount: float, limit_price: float, paper_mode: bool, slippage_bps: float, fee_bps: float) -> dict:
+        return self._limit_ioc_order('spot', symbol, 'sell', amount, limit_price, paper_mode, slippage_bps, fee_bps)
+
+    def close_perp_limit_ioc(self, symbol: str, amount: float, limit_price: float, paper_mode: bool, slippage_bps: float, fee_bps: float) -> dict:
+        return self._limit_ioc_order('futures', symbol, 'buy', amount, limit_price, paper_mode, slippage_bps, fee_bps)
 
     # ─── Margin mode + leverage (ccxt-uniform — both Binance & KuCoin) ────
 
@@ -1372,14 +1540,97 @@ class BinanceGateway(VenueGateway):
                 fee_cost += float(f.get('commission') or 0)
             except (TypeError, ValueError):
                 pass
-        # invalidate_balance_cache dropped — 30s TTL is short enough; eager invalidation triggered KuCoin 429s
         return {
             'id': str(resp.get('orderId') or ''),
             'symbol': symbol,
             'side': side,
             'amount': executed_qty,
+            'filled': executed_qty,
             'venue': leg,
             'status': 'closed',
+            'price': fill_price,
+            'fee': {'cost': fee_cost},
+            'info': resp,
+        }
+
+    def _limit_ioc_order(
+        self,
+        leg: str,
+        symbol: str,
+        side: str,
+        amount: float,
+        limit_price: float,
+        paper_mode: bool,
+        slippage_bps: float,
+        fee_bps: float,
+    ) -> dict:
+        """PM-routed limit-IOC. Same routing as the market path:
+        spot legs through ``papiPostMarginOrder`` (margin-spot under
+        PM), futures legs through ``papiPostUmOrder``. Both endpoints
+        accept ``timeInForce=IOC`` per Binance's REST docs. Paper
+        mode uses the parent class's synthesized fill (avg = limit
+        price, applies the configured paper slippage/fee on top so
+        paper is conservatively pessimistic vs live IOC)."""
+        if paper_mode:
+            return super()._limit_ioc_order(leg, symbol, side, amount, limit_price, paper_mode, slippage_bps, fee_bps)
+        ex_symbol = symbol.split(':')[0].replace('/', '') if '/' in symbol else symbol
+        if leg == 'futures':
+            fn = self._papi(self.spot, ('papiPostUmOrder', 'papi_post_um_order'))
+            if fn is None:
+                raise RuntimeError('papiPostUmOrder not exposed by this ccxt build')
+            price_str = self.futures.price_to_precision(symbol, limit_price)
+            qty_str = self.futures.amount_to_precision(symbol, amount)
+            params = {
+                'symbol': ex_symbol,
+                'side': side.upper(),
+                'type': 'LIMIT',
+                'quantity': qty_str,
+                'price': price_str,
+                'timeInForce': 'IOC',
+            }
+        else:
+            fn = self._papi(self.spot, ('papiPostMarginOrder', 'papi_post_margin_order'))
+            if fn is None:
+                raise RuntimeError('papiPostMarginOrder not exposed by this ccxt build')
+            price_str = self.spot.price_to_precision(symbol, limit_price)
+            qty_str = self.spot.amount_to_precision(symbol, amount)
+            params = {
+                'symbol': ex_symbol,
+                'side': side.upper(),
+                'type': 'LIMIT',
+                'quantity': qty_str,
+                'price': price_str,
+                'timeInForce': 'IOC',
+            }
+        resp = fn(params)
+        try:
+            fill_price = float(resp.get('avgPrice') or resp.get('price') or 0)
+        except (TypeError, ValueError):
+            fill_price = 0.0
+        try:
+            executed_qty = float(resp.get('executedQty') or resp.get('cumQty') or 0)
+        except (TypeError, ValueError):
+            executed_qty = 0.0
+        fee_cost = 0.0
+        for f in resp.get('fills') or []:
+            try:
+                fee_cost += float(f.get('commission') or 0)
+            except (TypeError, ValueError):
+                pass
+        if executed_qty <= 0:
+            status = 'canceled'
+        elif executed_qty + 1e-9 < amount:
+            status = 'partial'
+        else:
+            status = 'closed'
+        return {
+            'id': str(resp.get('orderId') or ''),
+            'symbol': symbol,
+            'side': side,
+            'amount': amount,
+            'filled': executed_qty,
+            'venue': leg,
+            'status': status,
             'price': fill_price,
             'fee': {'cost': fee_cost},
             'info': resp,
