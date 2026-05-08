@@ -215,19 +215,29 @@ def _current_equity(db, mode: str, gateways=None) -> tuple[float, str, bool]:
         venues_seen: list[str] = []
         for gw in gateways:
             bals = gw.safe_balances() or {}
-            spot_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
-            fut_usdt = float((bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
+            # USDT counts at face value; USDC priced at live USDC/USDT
+            # mid (1.0 fallback if the ticker isn't reachable).
+            try:
+                usdc_rate = gw.safe_price('USDC/USDT') or 1.0
+                if not (0.5 < usdc_rate < 2.0):
+                    usdc_rate = 1.0
+            except Exception:
+                usdc_rate = 1.0
+            usdt_total = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0) \
+                       + float((bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
+            usdc_total = float((bals.get('spot', {}).get('USDC') or {}).get('total') or 0) \
+                       + float((bals.get('futures', {}).get('USDC') or {}).get('total') or 0)
             spot_assets = 0.0
             META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
             for asset, bal in (bals.get('spot') or {}).items():
-                if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+                if asset in META_KEYS or asset in ('USDT', 'USDC') or not isinstance(bal, dict):
                     continue
                 qty = float(bal.get('total') or 0)
                 if qty <= 0:
                     continue
                 px = gw.safe_price(f'{asset}/USDT') or 0
                 spot_assets += qty * px
-            total += spot_usdt + fut_usdt + spot_assets
+            total += usdt_total + (usdc_total * usdc_rate) + spot_assets
             venues_seen.append(gw.venue_id)
         return total, f'live aggregate across {", ".join(venues_seen)}', False
     snap = db.scalar(select(BalanceSnapshot).where(BalanceSnapshot.source == mode).order_by(desc(BalanceSnapshot.id)).limit(1))
@@ -681,19 +691,36 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             free_breakdown: list[dict] = []
             for g in gateways:
                 bals_for_display = g.safe_balances() or {}
-                gw_spot_free = float((bals_for_display.get('spot', {}).get('USDT') or {}).get('free') or 0)
-                gw_fut_free = float((bals_for_display.get('futures', {}).get('USDT') or {}).get('free') or 0)
-                gw_fut_total = float((bals_for_display.get('futures', {}).get('USDT') or {}).get('total') or 0)
-                spot_free_total += gw_spot_free
-                # Only credit the futures wallet's free amount when it's
-                # genuinely a separate pool (Classic) — under unified
-                # margin spot already covers it.
-                if gw_fut_total > 0.001:
-                    fut_free_total += gw_fut_free
-                    free_breakdown.append({'label': f'{g.name} · USDT (spot)', 'value': gw_spot_free})
-                    free_breakdown.append({'label': f'{g.name} · USDT (futures)', 'value': gw_fut_free})
-                else:
-                    free_breakdown.append({'label': f'{g.name} · USDT (unified pool)', 'value': gw_spot_free})
+                # USDC priced at the live USDC/USDT mid (1.0 fallback).
+                # The bot never cross-funds USDT ↔ USDC for sizing — the
+                # rate is only used here to express both as USDT for the
+                # headline equity/free figure.
+                try:
+                    rate = g.safe_price('USDC/USDT') or 1.0
+                    if not (0.5 < rate < 2.0):
+                        rate = 1.0
+                except Exception:
+                    rate = 1.0
+                for q in ('USDT', 'USDC'):
+                    spot_free_native = float((bals_for_display.get('spot', {}).get(q) or {}).get('free') or 0)
+                    fut_free_native = float((bals_for_display.get('futures', {}).get(q) or {}).get('free') or 0)
+                    fut_total_native = float((bals_for_display.get('futures', {}).get(q) or {}).get('total') or 0)
+                    if spot_free_native <= 0.001 and fut_free_native <= 0.001:
+                        continue
+                    rate_q = rate if q == 'USDC' else 1.0
+                    rate_note = '' if q == 'USDT' else f' × {rate_q:.4f}'
+                    if fut_total_native > 0.001:
+                        # Classic — separate spot + futures wallets.
+                        fut_free_total += fut_free_native * rate_q
+                        spot_free_total += spot_free_native * rate_q
+                        if spot_free_native > 0.001:
+                            free_breakdown.append({'label': f'{g.name} · {q} (spot)', 'value': spot_free_native * rate_q, 'native': spot_free_native, 'asset': q, 'note': rate_note})
+                        if fut_free_native > 0.001:
+                            free_breakdown.append({'label': f'{g.name} · {q} (futures)', 'value': fut_free_native * rate_q, 'native': fut_free_native, 'asset': q, 'note': rate_note})
+                    else:
+                        # Unified margin — single line.
+                        spot_free_total += spot_free_native * rate_q
+                        free_breakdown.append({'label': f'{g.name} · {q} (unified pool)', 'value': spot_free_native * rate_q, 'native': spot_free_native, 'asset': q, 'note': rate_note})
             ctx['live_spot_free'] = spot_free_total
             ctx['live_fut_free'] = fut_free_total
             ctx['free_deployable_breakdown'] = free_breakdown

@@ -62,6 +62,15 @@ BINANCE_ERR_INSUFFICIENT_MARGIN = '-2019'   # futures order can't be placed for 
 BINANCE_ERR_MALFORMED_AMOUNT = '-1102'      # amount param missing/empty/zero on a SAPI call
 
 
+# ─── Quote currencies the bot trades ─────────────────────────────────────
+# Each is a separate book: USDT trades use USDT balance, USDC trades use
+# USDC balance. The bot never cross-funds (a USDT shortfall is NOT
+# covered by USDC and vice versa). For headline equity we price USDC at
+# the live USDC/USDT mid, but the per-quote balances are tracked
+# independently end-to-end.
+SUPPORTED_QUOTES = ('USDT', 'USDC')
+
+
 # ─── Candidate dataclass ────────────────────────────────────────────────────
 # A scan result row: one funding-rate opportunity that passed every filter
 # (entry threshold, volume, liquidity, etc.). The bot ranks candidates by
@@ -77,6 +86,8 @@ class Candidate:
     spot_depth_usdt: float = 0.0
     perp_depth_usdt: float = 0.0
     venue_id: str = 'binance'
+    quote_currency: str = 'USDT'  # 'USDT' or 'USDC'; sizing/balance reads
+                                  # use this asset on the venue's wallet.
 
     @property
     def funding_apr(self) -> float:
@@ -415,7 +426,7 @@ class VenueGateway:
         min_depth_usdt: float = 0.0,
         depth_band_bps: float = 10.0,
     ) -> tuple[list[Candidate], int, list[tuple[str, str, float]]]:
-        """Scan this venue's USDT-perp funding rates. Returns
+        """Scan this venue's USDT- AND USDC-perp funding rates. Returns
         ``(passing, total_examined, rejected)`` where:
         * ``passing`` is the ranked list of :class:`Candidate` rows that survived
           every filter (APR threshold, quote volume, liquidity).
@@ -423,8 +434,9 @@ class VenueGateway:
           returned — useful to confirm the API is actually live.
         * ``rejected`` is a list of ``(symbol, reason, apr)`` for the Logs tab.
 
-        Each :class:`Candidate` carries ``venue_id`` so when multiple venues'
-        results get pooled in the bot loop, the destination is unambiguous."""
+        Each :class:`Candidate` carries ``venue_id`` and ``quote_currency``
+        so the bot can route the entry to the matching wallet's free
+        balance and never cross-fund USDT ↔ USDC."""
         try:
             rates = self.funding_rates_dict()
         except Exception:
@@ -434,7 +446,15 @@ class VenueGateway:
         total = 0
         for symbol, row in rates.items():
             fr = row.get('fundingRate')
-            if fr is None or not symbol.endswith(':USDT'):
+            if fr is None:
+                continue
+            # Only USDT and USDC quote perps; ignore coin-margined and exotics.
+            quote = None
+            for q in SUPPORTED_QUOTES:
+                if symbol.endswith(f':{q}'):
+                    quote = q
+                    break
+            if quote is None:
                 continue
             total += 1
             interval_h = _interval_hours(row)
@@ -442,9 +462,9 @@ class VenueGateway:
             if apr < entry_apr_threshold:
                 continue
             base = symbol.split('/')[0]
-            spot_symbol = f'{base}/USDT'
+            spot_symbol = f'{base}/{quote}'
             if spot_symbol not in self.spot.markets:
-                rejected.append((symbol, 'no_spot_market', apr))
+                rejected.append((symbol, f'no_spot_market ({quote})', apr))
                 continue
             try:
                 t = self.spot.fetch_ticker(spot_symbol)
@@ -472,6 +492,7 @@ class VenueGateway:
                 spot_depth_usdt=spot_depth,
                 perp_depth_usdt=perp_depth,
                 venue_id=self.venue_id,
+                quote_currency=quote,
             ))
         # Rank by funding APY first; ties go to the deeper book.
         passing.sort(key=lambda c: (c.funding_apr, c.min_depth_usdt), reverse=True)
@@ -550,15 +571,15 @@ class VenueGateway:
     # ─── Default no-op implementations for venue-specific surfaces ────────
     # Subclasses override the methods their venue actually supports.
 
-    def transfer_spot_to_futures(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+    def transfer_spot_to_futures(self, amount: float, paper_mode: bool, asset: str = 'USDT') -> tuple[bool, str]:
         if paper_mode:
             return True, 'paper'
-        return False, f'spot→futures transfer not wired on {self.name}'
+        return False, f'{asset} spot→futures transfer not wired on {self.name}'
 
-    def transfer_futures_to_spot(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+    def transfer_futures_to_spot(self, amount: float, paper_mode: bool, asset: str = 'USDT') -> tuple[bool, str]:
         if paper_mode:
             return True, 'paper'
-        return False, f'futures→spot transfer not wired on {self.name}'
+        return False, f'{asset} futures→spot transfer not wired on {self.name}'
 
     def net_injected_capital_usdt(self, lookback_days: int = 30) -> tuple[float | None, dict]:
         """Returns ``(net, meta)`` where ``net`` is in USDT and ``meta`` carries
@@ -589,21 +610,28 @@ class VenueGateway:
 
     def equity_buckets(self) -> list[dict]:
         """Return per-bucket equity items for the dashboard donut, with
-        venue-correct labels. Default implementation: spot USDT + futures
-        USDT + non-USDT spot assets at USDT-equivalent. Venue subclasses
-        with non-classic account types (e.g. PM, UTA) override."""
+        venue-correct labels. Surfaces both USDT and USDC as separate
+        buckets — they are tracked as independent books. Default impl
+        used by Classic accounts; PM/UTA subclasses override.
+
+        Bucket ``value`` is in the asset's native unit. The dashboard
+        prices USDC at the live USDC/USDT mid for headline equity but
+        keeps the breakdown honest about the per-asset split."""
         bals = self.safe_balances() or {}
         items: list[dict] = []
-        spot_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
-        fut_usdt = float((bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
-        if spot_usdt > 0:
-            items.append({'label': f'{self.name} · Spot USDT', 'value': spot_usdt, 'venue': self.venue_id, 'color': '#38bdf8'})
-        if fut_usdt > 0:
-            items.append({'label': f'{self.name} · Futures USDT', 'value': fut_usdt, 'venue': self.venue_id, 'color': '#fbbf24'})
+        QUOTE_COLORS = {'USDT': '#38bdf8', 'USDC': '#22d3ee'}
+        FUT_COLORS = {'USDT': '#fbbf24', 'USDC': '#f97316'}
+        for q in SUPPORTED_QUOTES:
+            spot_amt = float((bals.get('spot', {}).get(q) or {}).get('total') or 0)
+            fut_amt = float((bals.get('futures', {}).get(q) or {}).get('total') or 0)
+            if spot_amt > 0:
+                items.append({'label': f'{self.name} · Spot {q}', 'value': spot_amt, 'asset': q, 'venue': self.venue_id, 'color': QUOTE_COLORS[q]})
+            if fut_amt > 0:
+                items.append({'label': f'{self.name} · Futures {q}', 'value': fut_amt, 'asset': q, 'venue': self.venue_id, 'color': FUT_COLORS[q]})
         spot_assets_value = 0.0
         META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
         for asset, bal in (bals.get('spot') or {}).items():
-            if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+            if asset in META_KEYS or asset in SUPPORTED_QUOTES or not isinstance(bal, dict):
                 continue
             qty = float(bal.get('total') or 0)
             if qty <= 0:
@@ -662,31 +690,30 @@ class BinanceGateway(VenueGateway):
 
     # ─── Binance universal transfer (spot ⇄ USDM-futures) ─────────────────
 
-    def _universal_transfer(self, transfer_type: str, amount_usdt: float) -> tuple[bool, str]:
+    def _universal_transfer(self, transfer_type: str, amount: float, asset: str = 'USDT') -> tuple[bool, str]:
         for name in ('sapiPostAssetTransfer', 'sapi_post_asset_transfer'):
             fn = getattr(self.spot, name, None)
             if callable(fn):
                 try:
-                    fn({'type': transfer_type, 'asset': 'USDT', 'amount': f'{amount_usdt:.2f}'})
+                    fn({'type': transfer_type, 'asset': asset, 'amount': f'{amount:.2f}'})
                 except Exception as e:
                     return False, str(e)
-                # invalidate_balance_cache dropped — see VenueGateway.safe_balances comment
                 return True, ''
         return False, 'sapiPostAssetTransfer not available in this ccxt build'
 
-    def transfer_spot_to_futures(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+    def transfer_spot_to_futures(self, amount: float, paper_mode: bool, asset: str = 'USDT') -> tuple[bool, str]:
         if paper_mode:
             return True, 'paper'
-        if amount_usdt <= 0:
+        if amount <= 0:
             return True, 'noop'
-        return self._universal_transfer('MAIN_UMFUTURE', amount_usdt)
+        return self._universal_transfer('MAIN_UMFUTURE', amount, asset=asset)
 
-    def transfer_futures_to_spot(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+    def transfer_futures_to_spot(self, amount: float, paper_mode: bool, asset: str = 'USDT') -> tuple[bool, str]:
         if paper_mode:
             return True, 'paper'
-        if amount_usdt <= 0:
+        if amount <= 0:
             return True, 'noop'
-        return self._universal_transfer('UMFUTURE_MAIN', amount_usdt)
+        return self._universal_transfer('UMFUTURE_MAIN', amount, asset=asset)
 
     # ─── Deposit / withdrawal / sub-transfer history ──────────────────────
     # Binance returns up to 90 days per call on deposit/withdrawal endpoints
@@ -996,24 +1023,30 @@ class BinanceGateway(VenueGateway):
     def equity_buckets(self) -> list[dict]:
         """PM equity buckets:
           * ``Binance · PM USDT``        — USDT in the unified margin pool
+          * ``Binance · PM USDC``        — USDC in the unified margin pool
           * ``Binance · BFUSD``          — USDT-pegged collateral the user
                                             may hold from before the yield
                                             subsystem was retired
-          * ``Binance · PM collateral``  — non-USDT/BFUSD assets in the
+          * ``Binance · PM collateral``  — non-stablecoin assets in the
                                             pool (e.g. ETH from a long leg)
-        Buckets with zero balance are omitted."""
+        Buckets with zero balance are omitted. USDT and USDC are
+        tracked as separate books — the dashboard prices USDC at the
+        live USDC/USDT mid for headline equity but keeps the per-asset
+        split visible here."""
         bals = self.safe_balances() or {}
         items: list[dict] = []
-        pm_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
-        if pm_usdt > 0:
-            items.append({'label': f'{self.name} · PM USDT', 'value': pm_usdt, 'venue': self.venue_id, 'color': '#38bdf8'})
+        QUOTE_COLORS = {'USDT': '#38bdf8', 'USDC': '#22d3ee'}
+        for q in SUPPORTED_QUOTES:
+            amt = float((bals.get('spot', {}).get(q) or {}).get('total') or 0)
+            if amt > 0:
+                items.append({'label': f'{self.name} · PM {q}', 'value': amt, 'asset': q, 'venue': self.venue_id, 'color': QUOTE_COLORS[q]})
         bfusd = float((bals.get('spot', {}).get('BFUSD') or {}).get('total') or 0)
         if bfusd > 0:
-            items.append({'label': f'{self.name} · BFUSD', 'value': bfusd, 'venue': self.venue_id, 'color': '#4ade80'})
+            items.append({'label': f'{self.name} · BFUSD', 'value': bfusd, 'asset': 'BFUSD', 'venue': self.venue_id, 'color': '#4ade80'})
         collateral_value = 0.0
         META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
         for asset, bal in (bals.get('spot') or {}).items():
-            if asset in META_KEYS or asset in ('USDT', 'BFUSD') or not isinstance(bal, dict):
+            if asset in META_KEYS or asset in SUPPORTED_QUOTES or asset == 'BFUSD' or not isinstance(bal, dict):
                 continue
             qty = float(bal.get('total') or 0)
             if qty <= 0:
@@ -1021,30 +1054,28 @@ class BinanceGateway(VenueGateway):
             px = self.safe_price(f'{asset}/USDT') or 0
             collateral_value += qty * px
         if collateral_value > 0:
-            items.append({'label': f'{self.name} · PM collateral assets', 'value': collateral_value, 'venue': self.venue_id, 'color': '#818cf8'})
+            # collateral_value is already USDT-priced via safe_price.
+            items.append({'label': f'{self.name} · PM collateral assets', 'value': collateral_value, 'asset': 'USDT', 'venue': self.venue_id, 'color': '#818cf8'})
         return items
 
     def _fetch_balances_uncached(self) -> dict:
         """Read PM unified balance + classic Spot wallet, then synthesise
-        the bot's two-bucket shape (spot · futures). Two reads because PM
-        and classic Spot are SEPARATE wallets even on a PM account:
-        deposits via the spot deposit address land in classic Spot, and
-        only an explicit Wallet→Cross Margin transfer (or Binance's auto-
-        collection) moves them into the PM pool. We read both and sum so
-        neither balance hides from the dashboard.
+        the bot's two-bucket shape (spot · futures). Both quote currencies
+        the bot trades — USDT and USDC — are surfaced as top-level keys
+        in spot/futures so per-quote sizing stays self-contained.
 
-        BFUSD lands in ``spot['BFUSD']`` as a regular asset row — it's
-        margin collateral, surfaced for visibility but never written.
-
-        Per-base-asset spot holdings (long leg of an open arb) are read
-        from PM-pool first; classic spot adds on if PM didn't surface it."""
+        BFUSD lands in ``spot['BFUSD']`` as a regular asset row — margin
+        collateral surfaced for visibility but never written by this bot."""
         fn = self._papi(self.spot, ('papiGetBalance', 'papi_get_balance'))
         if fn is None:
             return {'spot': self.spot.fetch_balance(), 'futures': self.futures.fetch_balance()}
         rows = fn({})
         if isinstance(rows, dict):
             rows = rows.get('data') or rows.get('balances') or []
-        usdt_total = usdt_free = 0.0
+        # Track USDT and USDC separately end-to-end. The bot never
+        # cross-funds: a USDC entry only consumes USDC free balance, etc.
+        quote_totals = {q: 0.0 for q in SUPPORTED_QUOTES}
+        quote_free = {q: 0.0 for q in SUPPORTED_QUOTES}
         per_asset: dict[str, dict] = {}
         for r in rows:
             asset = r.get('asset') or r.get('currency') or ''
@@ -1053,20 +1084,20 @@ class BinanceGateway(VenueGateway):
                 total = float(r.get('totalWalletBalance') or r.get('crossMarginAsset') or r.get('total') or free)
             except (TypeError, ValueError):
                 continue
-            if asset == 'USDT':
-                usdt_total += total
-                usdt_free += free
+            if asset in SUPPORTED_QUOTES:
+                quote_totals[asset] += total
+                quote_free[asset] += free
             elif total > 0:
                 per_asset[asset] = {'free': free, 'used': max(0.0, total - free), 'total': total}
         try:
             spot_classic = self.spot.fetch_balance()
-            classic_usdt = float((spot_classic.get('USDT') or {}).get('total') or 0)
-            classic_usdt_free = float((spot_classic.get('USDT') or {}).get('free') or 0)
-            usdt_total += classic_usdt
-            usdt_free += classic_usdt_free
+            for q in SUPPORTED_QUOTES:
+                bal = spot_classic.get(q) or {}
+                quote_totals[q] += float(bal.get('total') or 0)
+                quote_free[q] += float(bal.get('free') or 0)
             META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
             for asset, bal in spot_classic.items():
-                if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+                if asset in META_KEYS or asset in SUPPORTED_QUOTES or not isinstance(bal, dict):
                     continue
                 qty = float(bal.get('total') or 0)
                 if qty <= 0:
@@ -1075,26 +1106,31 @@ class BinanceGateway(VenueGateway):
                     per_asset[asset] = {'free': float(bal.get('free') or 0), 'used': float(bal.get('used') or 0), 'total': qty}
         except Exception:
             pass
-        spot = {'USDT': {'free': usdt_free, 'used': max(0.0, usdt_total - usdt_free), 'total': usdt_total},
-                **per_asset,
-                'free': {'USDT': usdt_free, **{k: v['free'] for k, v in per_asset.items()}},
-                'used': {'USDT': max(0.0, usdt_total - usdt_free), **{k: v['used'] for k, v in per_asset.items()}},
-                'total': {'USDT': usdt_total, **{k: v['total'] for k, v in per_asset.items()}}}
-        # Under PM there is no separate futures wallet. Expose
-        # ``futures.USDT.free`` as the pool's free amount so trade-sizing
-        # logic (``min(spot_free, fut_free)``) works, but
-        # ``futures.USDT.total`` is 0 so the equity sum doesn't double-
-        # count the same pool USDT.
-        futures = {'USDT': {'free': usdt_free, 'used': 0.0, 'total': 0.0},
-                   'free': {'USDT': usdt_free}, 'used': {'USDT': 0.0},
-                   'total': {'USDT': 0.0}}
+        spot: dict = {**per_asset}
+        for q in SUPPORTED_QUOTES:
+            tot = quote_totals[q]
+            fr = quote_free[q]
+            spot[q] = {'free': fr, 'used': max(0.0, tot - fr), 'total': tot}
+        spot['free'] = {**{q: quote_free[q] for q in SUPPORTED_QUOTES}, **{k: v['free'] for k, v in per_asset.items()}}
+        spot['used'] = {**{q: max(0.0, quote_totals[q] - quote_free[q]) for q in SUPPORTED_QUOTES}, **{k: v['used'] for k, v in per_asset.items()}}
+        spot['total'] = {**{q: quote_totals[q] for q in SUPPORTED_QUOTES}, **{k: v['total'] for k, v in per_asset.items()}}
+        # Under PM there is no separate futures wallet. Expose each
+        # quote's free amount on the futures side so trade-sizing
+        # min(spot_free, fut_free) still works per-quote, but `total` is
+        # 0 so the equity sum doesn't double-count the unified pool.
+        futures: dict = {}
+        for q in SUPPORTED_QUOTES:
+            futures[q] = {'free': quote_free[q], 'used': 0.0, 'total': 0.0}
+        futures['free'] = {q: quote_free[q] for q in SUPPORTED_QUOTES}
+        futures['used'] = {q: 0.0 for q in SUPPORTED_QUOTES}
+        futures['total'] = {q: 0.0 for q in SUPPORTED_QUOTES}
         return {'spot': spot, 'futures': futures}
 
-    def transfer_spot_to_futures(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+    def transfer_spot_to_futures(self, amount: float, paper_mode: bool, asset: str = 'USDT') -> tuple[bool, str]:
         # PM unifies margin; there's nothing to transfer.
         return True, 'PM mode: unified margin (no spot↔futures transfer needed)'
 
-    def transfer_futures_to_spot(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+    def transfer_futures_to_spot(self, amount: float, paper_mode: bool, asset: str = 'USDT') -> tuple[bool, str]:
         return True, 'PM mode: unified margin (no spot↔futures transfer needed)'
 
     def open_perp_positions_raw(self) -> list[dict]:
@@ -1359,7 +1395,8 @@ class KuCoinGateway(VenueGateway):
                         rows = rows.get('list') or rows.get('balances') or []
                     elif not isinstance(rows, list):
                         rows = []
-                    usdt_total = usdt_free = 0.0
+                    quote_totals = {q: 0.0 for q in SUPPORTED_QUOTES}
+                    quote_free = {q: 0.0 for q in SUPPORTED_QUOTES}
                     per_asset: dict[str, dict] = {}
                     for r in rows or []:
                         asset = r.get('coin') or r.get('asset') or r.get('currency') or ''
@@ -1368,22 +1405,28 @@ class KuCoinGateway(VenueGateway):
                             total = float(r.get('walletBalance') or r.get('total') or free)
                         except (TypeError, ValueError):
                             continue
-                        if asset == 'USDT':
-                            usdt_total += total
-                            usdt_free += free
+                        if asset in SUPPORTED_QUOTES:
+                            quote_totals[asset] += total
+                            quote_free[asset] += free
                         elif total > 0:
                             per_asset[asset] = {'free': free, 'used': max(0.0, total - free), 'total': total}
-                    spot = {'USDT': {'free': usdt_free, 'used': max(0.0, usdt_total - usdt_free), 'total': usdt_total},
-                            **per_asset,
-                            'free': {'USDT': usdt_free, **{k: v['free'] for k, v in per_asset.items()}},
-                            'used': {'USDT': max(0.0, usdt_total - usdt_free), **{k: v['used'] for k, v in per_asset.items()}},
-                            'total': {'USDT': usdt_total, **{k: v['total'] for k, v in per_asset.items()}}}
-                    # UTA unifies spot + futures into one pool. fut.free
-                    # mirrors pool capacity for trade-sizing min(); fut.total
-                    # is 0 so the equity sum doesn't double-count.
-                    futures = {'USDT': {'free': usdt_free, 'used': 0.0, 'total': 0.0},
-                               'free': {'USDT': usdt_free}, 'used': {'USDT': 0.0},
-                               'total': {'USDT': 0.0}}
+                    spot: dict = {**per_asset}
+                    for q in SUPPORTED_QUOTES:
+                        tot = quote_totals[q]
+                        fr = quote_free[q]
+                        spot[q] = {'free': fr, 'used': max(0.0, tot - fr), 'total': tot}
+                    spot['free'] = {**{q: quote_free[q] for q in SUPPORTED_QUOTES}, **{k: v['free'] for k, v in per_asset.items()}}
+                    spot['used'] = {**{q: max(0.0, quote_totals[q] - quote_free[q]) for q in SUPPORTED_QUOTES}, **{k: v['used'] for k, v in per_asset.items()}}
+                    spot['total'] = {**{q: quote_totals[q] for q in SUPPORTED_QUOTES}, **{k: v['total'] for k, v in per_asset.items()}}
+                    # UTA unifies spot + futures. fut.free mirrors the
+                    # pool free for trade-sizing; fut.total is 0 to avoid
+                    # double-counting the same pool in equity sums.
+                    futures: dict = {}
+                    for q in SUPPORTED_QUOTES:
+                        futures[q] = {'free': quote_free[q], 'used': 0.0, 'total': 0.0}
+                    futures['free'] = {q: quote_free[q] for q in SUPPORTED_QUOTES}
+                    futures['used'] = {q: 0.0 for q in SUPPORTED_QUOTES}
+                    futures['total'] = {q: 0.0 for q in SUPPORTED_QUOTES}
                     return {'spot': spot, 'futures': futures}
                 except Exception:
                     pass
@@ -1419,34 +1462,40 @@ class KuCoinGateway(VenueGateway):
         return 'Classic', 'isolated trade / contract / main wallets'
 
     def equity_buckets(self) -> list[dict]:
-        """KuCoin equity buckets. Two shapes depending on account mode:
+        """KuCoin equity buckets — separate USDT and USDC tracking.
 
         UTA — single unified-margin pool:
-          * ``KuCoin · UTA USDT``       — unified-pool USDT
-          * ``KuCoin · UTA collateral`` — non-USDT assets in the pool
+          * ``KuCoin · UTA USDT`` / ``UTA USDC`` — pool stablecoin balances
+          * ``KuCoin · UTA collateral``          — non-stablecoin assets
 
         Classic — isolated Trade + Contract wallets:
-          * ``KuCoin · Trade USDT``       — spot trading wallet
-          * ``KuCoin · Contract USDT``    — futures wallet
-          * ``KuCoin · Trade collateral`` — non-USDT spot assets
+          * ``KuCoin · Trade USDT`` / ``Trade USDC``
+          * ``KuCoin · Contract USDT`` / ``Contract USDC``
+          * ``KuCoin · Trade collateral``
 
-        Buckets with zero balance are omitted."""
+        Zero-balance buckets omitted. USDT and USDC are independent
+        books — bot never cross-funds; dashboard prices USDC at the
+        live USDC/USDT mid for headline equity but keeps the per-asset
+        split visible here."""
         bals = self.safe_balances() or {}
         items: list[dict] = []
-        spot_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
-        fut_usdt = float((bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
-        if self._is_uta:
-            if spot_usdt > 0:
-                items.append({'label': f'{self.name} · UTA USDT', 'value': spot_usdt, 'venue': self.venue_id, 'color': '#38bdf8'})
-        else:
-            if spot_usdt > 0:
-                items.append({'label': f'{self.name} · Trade USDT', 'value': spot_usdt, 'venue': self.venue_id, 'color': '#38bdf8'})
-            if fut_usdt > 0:
-                items.append({'label': f'{self.name} · Contract USDT', 'value': fut_usdt, 'venue': self.venue_id, 'color': '#fbbf24'})
+        QUOTE_COLORS = {'USDT': '#38bdf8', 'USDC': '#22d3ee'}
+        FUT_COLORS = {'USDT': '#fbbf24', 'USDC': '#f97316'}
+        for q in SUPPORTED_QUOTES:
+            spot_amt = float((bals.get('spot', {}).get(q) or {}).get('total') or 0)
+            fut_amt = float((bals.get('futures', {}).get(q) or {}).get('total') or 0)
+            if self._is_uta:
+                if spot_amt > 0:
+                    items.append({'label': f'{self.name} · UTA {q}', 'value': spot_amt, 'asset': q, 'venue': self.venue_id, 'color': QUOTE_COLORS[q]})
+            else:
+                if spot_amt > 0:
+                    items.append({'label': f'{self.name} · Trade {q}', 'value': spot_amt, 'asset': q, 'venue': self.venue_id, 'color': QUOTE_COLORS[q]})
+                if fut_amt > 0:
+                    items.append({'label': f'{self.name} · Contract {q}', 'value': fut_amt, 'asset': q, 'venue': self.venue_id, 'color': FUT_COLORS[q]})
         collateral_value = 0.0
         META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
         for asset, bal in (bals.get('spot') or {}).items():
-            if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+            if asset in META_KEYS or asset in SUPPORTED_QUOTES or not isinstance(bal, dict):
                 continue
             qty = float(bal.get('total') or 0)
             if qty <= 0:
@@ -1455,7 +1504,7 @@ class KuCoinGateway(VenueGateway):
             collateral_value += qty * px
         if collateral_value > 0:
             label = f'{self.name} · UTA collateral' if self._is_uta else f'{self.name} · Trade collateral'
-            items.append({'label': label, 'value': collateral_value, 'venue': self.venue_id, 'color': '#818cf8'})
+            items.append({'label': label, 'value': collateral_value, 'asset': 'USDT', 'venue': self.venue_id, 'color': '#818cf8'})
         return items
 
     # ─── Spot ↔ futures transfer (KuCoin) ────────────────────────────────
@@ -1467,35 +1516,34 @@ class KuCoinGateway(VenueGateway):
     #     including ``contract`` ↔ ``trade`` and master ↔ sub.
     # ccxt's unified ``transfer()`` picks the right one based on whether
     # the route involves a non-spot wallet, so we always go through it.
-    def _transfer(self, from_account: str, to_account: str, amount_usdt: float) -> tuple[bool, str]:
+    def _transfer(self, from_account: str, to_account: str, amount: float, asset: str = 'USDT') -> tuple[bool, str]:
         # Under UTA the unified pool handles everything — no transfers
         # between trade / contract / main needed.
         if self._is_uta:
             return True, 'UTA mode: unified pool, no transfer needed'
         try:
-            self.spot.transfer('USDT', float(amount_usdt), from_account, to_account)
+            self.spot.transfer(asset, float(amount), from_account, to_account)
         except Exception as e:
             return False, str(e)
-        # invalidate_balance_cache dropped — 30s TTL is short enough; eager invalidation triggered KuCoin 429s
         return True, ''
 
     # KuCoin's spot orders execute against the ``trade`` wallet (UI label
     # "Trading Account"); ``contract`` is the futures wallet. Spot↔futures
     # transfers move trade↔contract under Classic; under UTA the unified
     # pool removes the need for these transfers entirely.
-    def transfer_spot_to_futures(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+    def transfer_spot_to_futures(self, amount: float, paper_mode: bool, asset: str = 'USDT') -> tuple[bool, str]:
         if paper_mode:
             return True, 'paper'
-        if amount_usdt <= 0:
+        if amount <= 0:
             return True, 'noop'
-        return self._transfer('trade', 'contract', amount_usdt)
+        return self._transfer('trade', 'contract', amount, asset=asset)
 
-    def transfer_futures_to_spot(self, amount_usdt: float, paper_mode: bool) -> tuple[bool, str]:
+    def transfer_futures_to_spot(self, amount: float, paper_mode: bool, asset: str = 'USDT') -> tuple[bool, str]:
         if paper_mode:
             return True, 'paper'
-        if amount_usdt <= 0:
+        if amount <= 0:
             return True, 'noop'
-        return self._transfer('contract', 'trade', amount_usdt)
+        return self._transfer('contract', 'trade', amount, asset=asset)
 
     # ─── Capital-injection history (KuCoin) ───────────────────────────────
     # KuCoin sub-accounts: master→sub transfers come in via the

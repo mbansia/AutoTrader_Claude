@@ -126,11 +126,12 @@
       {% endif %}
     </div>
   </div>
-  {# Free deployable: idle USDT the bot can route into a new trade.
-     Excludes spot collateral assets (e.g. ETH from a long leg) — those
-     are already committed. Sum of ``free_deployable_breakdown`` from
-     main.py — one source of truth, so this card and the per-venue
-     lines below always reconcile. #}
+  {# Free deployable: idle stablecoins the bot can route into a new trade.
+     USDT counted at face; USDC priced at the live USDC/USDT mid (the
+     ``× rate`` annotation makes the conversion explicit). Excludes spot
+     collateral assets (e.g. ETH from a long leg) — those are already
+     committed. Sum of ``free_deployable_breakdown`` from main.py — one
+     source of truth, so this card and the per-venue lines reconcile. #}
   {% if view == 'live' and free_deployable_breakdown %}
     {% set free_deployable = free_deployable_breakdown|sum(attribute='value') %}
   {% else %}
@@ -142,9 +143,12 @@
     <div class="sub" style="display:flex;flex-direction:column;gap:2px;">
       {% if view == 'live' and free_deployable_breakdown %}
         {% for b in free_deployable_breakdown %}
-        <span style="display:flex;justify-content:space-between;font-size:11px;"><span class="muted">{{ b.label }}</span><span class="mono">{{ '%.2f' % b.value }}</span></span>
+        <span style="display:flex;justify-content:space-between;font-size:11px;">
+          <span class="muted">{{ b.label }}</span>
+          <span class="mono">{% if b.asset == 'USDC' %}{{ '%.2f' % b.native }} USDC{{ b.note }} → {% endif %}{{ '%.2f' % b.value }}</span>
+        </span>
         {% endfor %}
-        <span class="muted" style="font-size:10px;margin-top:2px;">Excludes spot collateral assets (e.g. ETH from a long leg) — those are already committed.</span>
+        <span class="muted" style="font-size:10px;margin-top:2px;">USDT and USDC are tracked as separate books — sizing never cross-funds. USDC priced at live USDC/USDT mid only for this headline figure.</span>
       {% else %}
         <span>equity − open positions</span>
       {% endif %}

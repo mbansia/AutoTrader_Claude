@@ -93,6 +93,9 @@ def run_schema_migrations() -> None:
     _add_column_if_missing('strategy_config', 'min_order_book_depth_usdt', 'FLOAT NOT NULL DEFAULT 500.0')
     _add_column_if_missing('strategy_config', 'depth_band_bps', 'FLOAT NOT NULL DEFAULT 10.0')
     _add_column_if_missing('positions', 'last_close_error', "TEXT NOT NULL DEFAULT ''")
+    # Per-position quote currency — 'USDT' or 'USDC'. Default USDT on
+    # every existing row preserves the historical assumption.
+    _add_column_if_missing('positions', 'quote_currency', "VARCHAR(8) NOT NULL DEFAULT 'USDT'")
     # Cross-venue tag — every per-row table carries an ``exchange`` column so
     # the dashboard, logs, scans, and exports can break down state by venue
     # without ambiguity. Default 'binance' on every existing row guarantees

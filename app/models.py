@@ -115,6 +115,10 @@ class Position(Base):
     symbol: Mapped[str] = mapped_column(String(32), index=True)
     spot_symbol: Mapped[str] = mapped_column(String(32))
     perp_symbol: Mapped[str] = mapped_column(String(32))
+    # Quote currency the position trades against — 'USDT' or 'USDC'.
+    # Tracked separately because the bot never cross-funds: a USDC
+    # entry only consumes USDC free balance, exits return to USDC, etc.
+    quote_currency: Mapped[str] = mapped_column(String(8), default='USDT', index=True)
     quantity: Mapped[float] = mapped_column(Float)
     opened_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     status: Mapped[str] = mapped_column(String(16), default='open', index=True)

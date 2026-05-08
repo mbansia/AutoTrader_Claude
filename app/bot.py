@@ -250,23 +250,17 @@ def _log_close_error(db, p: Position, leg: str, err: str) -> None:
 
 
 def _ensure_close_readiness(db, gateway: VenueGateway, p: Position, cfg: StrategyConfig) -> None:
-    """Reshuffle USDT spot↔futures so the close has both legs funded.
-    Live only — paper has no separate wallets.
-
-    Perp leg buy-back: needs futures.free ≥ position_notional / leverage + a
-    small fee buffer. Binance's order-placement check requires fresh initial
-    margin even on a reducing trade, which is why a stuck close can look like
-    "Margin is insufficient" even though the position is small. Funds the gap
-    from surplus spot USDT via spot→futures transfer.
-
-    Best-effort throughout — each step is wrapped, and the actual close attempt
-    that runs after this is the source of truth for whether we succeeded."""
+    """Reshuffle the position's quote-currency spot↔futures so the close
+    has both legs funded. Live only — paper has no separate wallets.
+    Uses ``p.quote_currency`` so a USDC position pulls from USDC free
+    balance, not USDT (and vice versa) — never cross-funded."""
     if p.mode != MODE_LIVE:
         return
 
+    quote = p.quote_currency or 'USDT'
     bals = gateway.safe_balances() or {}
-    fut_free = float((bals.get('futures', {}).get('USDT') or {}).get('free') or 0)
-    spot_free = float((bals.get('spot', {}).get('USDT') or {}).get('free') or 0)
+    fut_free = float((bals.get('futures', {}).get(quote) or {}).get('free') or 0)
+    spot_free = float((bals.get('spot', {}).get(quote) or {}).get('free') or 0)
     perp_now = gateway.safe_price(p.perp_symbol, perp=True) or p.perp_entry_price or 0.0
     if perp_now <= 0:
         return
@@ -281,11 +275,11 @@ def _ensure_close_readiness(db, gateway: VenueGateway, p: Position, cfg: Strateg
         avail = max(0.0, spot_free - 0.10)
         transfer = min(gap, avail)
         if transfer >= 0.20:
-            ok, err = gateway.transfer_spot_to_futures(transfer, False)
+            ok, err = gateway.transfer_spot_to_futures(transfer, False, asset=quote)
             if ok:
-                log_event(db, f'Pre-close: transferred {transfer:.2f} USDT spot→futures (margin top-up for {p.perp_symbol})', mode=p.mode, exchange=p.exchange)
+                log_event(db, f'Pre-close: transferred {transfer:.2f} {quote} spot→futures (margin top-up for {p.perp_symbol})', mode=p.mode, exchange=p.exchange)
             else:
-                log_event(db, f'Pre-close: spot→futures transfer for {p.perp_symbol} failed: {err[:120]}', mode=p.mode, level='WARN', exchange=p.exchange)
+                log_event(db, f'Pre-close: spot→futures {quote} transfer for {p.perp_symbol} failed: {err[:120]}', mode=p.mode, level='WARN', exchange=p.exchange)
 
 
 def _actual_spot_qty(gateway: VenueGateway, p: Position) -> float:
@@ -506,21 +500,38 @@ def reconcile_positions(gateway: VenueGateway) -> None:
         db.commit()
 
 
-def _compute_equity_and_free(db, gateway: VenueGateway, mode: str, cfg: StrategyConfig) -> tuple[float, float]:
-    """Total portfolio equity in USDT and the amount currently free for opening
-    a position **on this venue**.
+def _usdc_usdt_rate(gateway: VenueGateway) -> float:
+    """Live USDC/USDT mid for headline equity sums. Falls back to 1.0
+    when the ticker isn't reachable. Cached via ``safe_price`` (30s TTL)
+    so per-cycle reads don't burn rate-limit. The bot does NOT use this
+    rate to decide sizing or wallet routing — those stay strictly
+    per-quote so a USDC depeg can't bleed into the USDT book."""
+    try:
+        px = gateway.safe_price('USDC/USDT')
+        if px and 0.5 < float(px) < 2.0:
+            return float(px)
+    except Exception:
+        pass
+    return 1.0
+
+
+def _compute_equity_and_free(db, gateway: VenueGateway, mode: str, cfg: StrategyConfig) -> tuple[float, dict[str, float]]:
+    """Returns ``(total_equity_usdt, free_by_quote)``.
+
+    * ``total_equity_usdt`` is the venue's headline equity in USDT,
+      with USDC priced at the live USDC/USDT mid (1.0 fallback).
+    * ``free_by_quote`` is ``{'USDT': free_usdt, 'USDC': free_usdc}`` —
+      what the bot can deploy on a fresh entry per quote currency.
+      The bot never cross-funds: a USDC entry only consumes USDC.
 
     Per-venue scoping: every query filters by ``Position.exchange == gateway.venue_id``
     so two venues sharing the same StrategyConfig can size positions correctly
     against their own capital. Cross-venue capital movement is Phase 2.
-
-    Paper mode:  total = paper_starting_equity + manual_flows + realized + unrealized
-                       + open_funding + closed_funding
-                 free  = total − open_notional − unrealized
-    Live mode:   total = spot.USDT + fut.USDT + Σ (non-USDT spot assets × ticker)
-                 free  = min(spot.free, fut.free)   (both legs need margin)
     """
     if mode == MODE_PAPER:
+        # Paper has a single virtual USDT-denominated pot. USDC trades
+        # in paper draw from the same pot at 1:1 — paper is for
+        # strategy validation, not depeg simulation.
         realized = total_realized_pnl(db, mode=mode, exchange=gateway.venue_id)
         open_ps = db.scalars(select(Position).where(
             Position.status == 'open',
@@ -544,30 +555,41 @@ def _compute_equity_and_free(db, gateway: VenueGateway, mode: str, cfg: Strategy
         total_equity = (cfg.paper_starting_equity + capital_in + realized + unrealized
                         + open_funding + closed_funding)
         free = max(0.0, total_equity - open_notional - unrealized)
-        return total_equity, free
+        return total_equity, {'USDT': free, 'USDC': free}
     bals = gateway.safe_balances()
     if bals is None:
-        return 0.0, 0.0
-    spot_total = float((bals['spot'].get('USDT') or {}).get('total') or 0)
-    fut_total = float((bals['futures'].get('USDT') or {}).get('total') or 0)
-    spot_free = float((bals['spot'].get('USDT') or {}).get('free') or 0)
-    fut_free = float((bals['futures'].get('USDT') or {}).get('free') or 0)
-    # spot.USDT.total only counts USDT; base assets the bot bought on the
-    # spot leg live in their own entries. Add them back at USDT-equivalent
-    # so equity doesn't appear to drop by full notional on every entry.
+        return 0.0, {'USDT': 0.0, 'USDC': 0.0}
+    rate = _usdc_usdt_rate(gateway)
+    # Per-quote totals on the venue's wallets. PM / UTA gateways flatten
+    # the unified pool into spot.<quote>.total; Classic gateways have
+    # both spot.<quote>.total and futures.<quote>.total populated.
+    quote_total_usdt = 0.0
+    free_by_quote: dict[str, float] = {}
+    for q in ('USDT', 'USDC'):
+        spot_total = float((bals.get('spot', {}).get(q) or {}).get('total') or 0)
+        fut_total = float((bals.get('futures', {}).get(q) or {}).get('total') or 0)
+        spot_free = float((bals.get('spot', {}).get(q) or {}).get('free') or 0)
+        fut_free = float((bals.get('futures', {}).get(q) or {}).get('free') or 0)
+        amount = spot_total + fut_total  # under unified margin fut_total is 0 by convention
+        quote_total_usdt += amount * (rate if q == 'USDC' else 1.0)
+        # Per-leg margin still needs both wallets funded. Take min so
+        # sizing accounts for the binding leg.
+        free_by_quote[q] = min(spot_free, fut_free)
+    # Non-stablecoin spot assets at USDT-equivalent (long leg of an
+    # open arb that's not yet closed).
     spot_assets_value = 0.0
     spot_balances = bals.get('spot', {}) or {}
     META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
     for asset, bal in spot_balances.items():
-        if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+        if asset in META_KEYS or asset in ('USDT', 'USDC') or not isinstance(bal, dict):
             continue
         qty = float(bal.get('total') or 0)
         if qty <= 0:
             continue
         px = gateway.safe_price(f'{asset}/USDT') or 0
         spot_assets_value += qty * px
-    total_equity = spot_total + fut_total + spot_assets_value
-    return total_equity, min(spot_free, fut_free)
+    total_equity = quote_total_usdt + spot_assets_value
+    return total_equity, free_by_quote
 
 
 # Per-(mode, venue) timestamp of the last capital-flow ingest. The bot
@@ -857,15 +879,22 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                 for sym, reason, apr in rejected_scan[:20]:
                     db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=sym, reason=reason, funding_rate=apr))
 
-                total_equity, free = _compute_equity_and_free(db, gateway, mode, cfg)
-                # Pull per-wallet free balances so we can act on each leg's constraint
-                # individually (live only — paper has a single pool).
+                total_equity, free_by_quote = _compute_equity_and_free(db, gateway, mode, cfg)
+                # Per-quote spot/futures free for sizing. Each candidate's
+                # quote_currency selects the right pool — never cross-funded.
+                spot_free_by_q: dict[str, float] = {}
+                fut_free_by_q: dict[str, float] = {}
                 if mode == MODE_LIVE:
                     bals = gateway.safe_balances() or {}
-                    spot_free = float((bals.get('spot', {}).get('USDT') or {}).get('free') or 0)
-                    fut_free = float((bals.get('futures', {}).get('USDT') or {}).get('free') or 0)
+                    for q in ('USDT', 'USDC'):
+                        spot_free_by_q[q] = float((bals.get('spot', {}).get(q) or {}).get('free') or 0)
+                        fut_free_by_q[q] = float((bals.get('futures', {}).get(q) or {}).get('free') or 0)
                 else:
-                    spot_free = fut_free = free
+                    # Paper has a single pool; both quotes draw from the
+                    # same paper equity at 1:1 (paper is for strategy
+                    # validation, not depeg simulation).
+                    for q in ('USDT', 'USDC'):
+                        spot_free_by_q[q] = fut_free_by_q[q] = free_by_quote.get(q, 0.0)
 
                 if total_equity <= 0:
                     scan_action = 'balances_unavailable'
@@ -875,17 +904,23 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     desired_notional = cfg.max_position_pct * total_equity
                     min_notional = cfg.min_position_pct * total_equity
 
-                    # Transfer spot→futures so the perp leg has margin (once per cycle).
-                    if mode == MODE_LIVE and cfg.auto_transfer_enabled and fut_free < desired_notional and spot_free > desired_notional:
-                        transfer = min(desired_notional - fut_free, spot_free - desired_notional)
-                        if transfer > 0.5:
-                            ok, err = gateway.transfer_spot_to_futures(transfer, paper)
-                            if ok:
-                                spot_free -= transfer
-                                fut_free += transfer
-                                log_event(db, f'Auto-transferred {transfer:.2f} USDT spot→futures for perp margin', mode=mode, exchange=gateway.venue_id)
-                            else:
-                                log_event(db, f'spot→futures transfer failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                    # Transfer spot→futures so the perp leg has margin
+                    # (once per cycle, per-quote). For PM/UTA accounts
+                    # the transfer is a no-op since margin is unified.
+                    if mode == MODE_LIVE and cfg.auto_transfer_enabled:
+                        for q in ('USDT', 'USDC'):
+                            sf = spot_free_by_q[q]
+                            ff = fut_free_by_q[q]
+                            if ff < desired_notional and sf > desired_notional:
+                                transfer = min(desired_notional - ff, sf - desired_notional)
+                                if transfer > 0.5:
+                                    ok, err = gateway.transfer_spot_to_futures(transfer, paper, asset=q)
+                                    if ok:
+                                        spot_free_by_q[q] -= transfer
+                                        fut_free_by_q[q] += transfer
+                                        log_event(db, f'Auto-transferred {transfer:.2f} {q} spot→futures for perp margin', mode=mode, exchange=gateway.venue_id)
+                                    else:
+                                        log_event(db, f'spot→futures {q} transfer failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
                     # Diversity: skip any candidate whose base asset we already hold open
                     # in this mode. Avoids piling more capital into the same name even
@@ -910,31 +945,20 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         base = c.spot_symbol.split('/')[0]
                         if base in held_bases:
                             continue
-                        # Size based on multiple binding constraints:
-                        #  * Equity / wallet:  free cash on the binding leg
-                        #  * Strategy cap:     desired_notional (% of equity)
-                        #  * Book depth:       at most 25% of the tightest
-                        #                      side's depth at the entry band.
-                        #                      Single-fill slippage past 25%
-                        #                      of book starts being material.
-                        #  * 24h volume:       at most 0.5% of quote volume.
-                        #                      Concentration above this means
-                        #                      our exits move the market.
-                        free_for_arb = min(spot_free, fut_free)
+                        # Per-quote sizing: USDT trade reads USDT free,
+                        # USDC trade reads USDC free. Never cross-funded.
+                        cq = c.quote_currency
+                        free_for_arb = min(spot_free_by_q.get(cq, 0.0), fut_free_by_q.get(cq, 0.0))
                         wallet_cap = free_for_arb * 0.97
                         depth_cap = 0.25 * (c.min_depth_usdt or 0)
                         volume_cap = 0.005 * (c.quote_volume or 0)
-                        # If depth/volume readings are zero (scan didn't
-                        # populate), don't let them clamp to zero —
-                        # min_depth_usdt is a hard reject upstream when it
-                        # actually fails. Treat 0 as "unknown, no constraint".
                         if depth_cap <= 0:
                             depth_cap = float('inf')
                         if volume_cap <= 0:
                             volume_cap = float('inf')
                         sized_notional = min(wallet_cap, desired_notional, depth_cap, volume_cap)
                         if sized_notional < min_notional:
-                            reason = (f'below min position pct ({sized_notional:.2f} < {min_notional:.2f} USDT; '
+                            reason = (f'below min position pct ({sized_notional:.2f} < {min_notional:.2f} {cq}; '
                                       f'wallet={wallet_cap:.2f} max_pct={desired_notional:.2f} '
                                       f'depth_cap={depth_cap if depth_cap != float("inf") else "—"} '
                                       f'vol_cap={volume_cap if volume_cap != float("inf") else "—"})')
@@ -951,8 +975,6 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             scan_action = 'basis_too_wide'
                             continue
                         qty = sized_notional / max(0.0001, spot_px)
-                        # Place spot buy first. If it fails (insufficient balance, min-notional,
-                        # market down), skip the candidate and continue scanning.
                         try:
                             s = gateway.create_spot_buy(c.spot_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
                         except Exception as e:
@@ -971,6 +993,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             symbol=c.spot_symbol.split('/')[0],
                             spot_symbol=c.spot_symbol,
                             perp_symbol=c.perp_symbol,
+                            quote_currency=cq,
                             quantity=qty,
                             entry_funding_rate=c.funding_rate,
                             last_funding_rate=c.funding_rate,
@@ -1036,12 +1059,12 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                 note=scan_note,
             ))
 
-            # End-of-cycle wallet rebalance (live mode only):
-            # Drain surplus futures USDT back to spot when the buffer
-            # exceeds the % of open perp notional configured by
-            # ``cfg.futures_buffer_pct``. With no open positions, drain
-            # everything except a tiny dust margin so the spot wallet
-            # is the canonical idle pool.
+            # End-of-cycle wallet rebalance (live, per-quote): drain
+            # surplus futures balance back to spot per quote currency.
+            # Buffer = ``cfg.futures_buffer_pct`` × open perp notional in
+            # that quote (cross margin pools across symbols of the same
+            # quote, not across quotes). With no open positions in a
+            # given quote, drain to dust.
             if mode == MODE_LIVE and cfg.auto_transfer_enabled:
                 open_ps = db.scalars(select(Position).where(
                     Position.status == 'open',
@@ -1049,33 +1072,26 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     Position.exchange == gateway.venue_id,
                 )).all()
                 bals_after = gateway.safe_balances() or {}
-                fut_free_now = float((bals_after.get('futures', {}).get('USDT') or {}).get('free') or 0)
-                # Under unified margin (Binance PM, KuCoin UTA), the pool
-                # funds both spot and perp legs — there's no separate
-                # futures wallet to drain. ``futures.USDT.total`` is 0 in
-                # those cases by convention; skip the drain entirely so
-                # we don't generate spurious "Drained X USDT" log lines.
-                fut_total_now = float((bals_after.get('futures', {}).get('USDT') or {}).get('total') or 0)
-                if fut_total_now <= 0.001:
-                    fut_free_now = 0.0  # disables the drain branch below
-                if open_ps:
-                    # Keep ``cfg.futures_buffer_pct`` of open notional as free
-                    # margin in the futures wallet so the perp short can absorb
-                    # an adverse move before maintenance liquidation. 20% (the
-                    # default) covers roughly a -20% mark-price move; bump
-                    # higher in cfg for high-volatility tokens. Cross margin
-                    # pools the buffer across all open perps on the venue.
-                    open_notional = sum((p.quantity or 0) * (p.perp_entry_price or 0) for p in open_ps)
-                    keep = max(0.20, open_notional * float(cfg.futures_buffer_pct or 0.20))
-                else:
-                    keep = 0.10
-                if fut_free_now > keep + 0.10:
-                    amt = fut_free_now - keep
-                    ok, err = gateway.transfer_futures_to_spot(amt, paper)
-                    if ok:
-                        log_event(db, f'Drained {amt:.2f} USDT futures→spot (kept {keep:.2f} as margin buffer; {len(open_ps)} pos open)', mode=mode, exchange=gateway.venue_id)
+                for q in ('USDT', 'USDC'):
+                    fut_free_now = float((bals_after.get('futures', {}).get(q) or {}).get('free') or 0)
+                    fut_total_now = float((bals_after.get('futures', {}).get(q) or {}).get('total') or 0)
+                    # PM / UTA: total=0 by convention since the pool isn't a
+                    # separate wallet. Skip drain on unified margin.
+                    if fut_total_now <= 0.001:
+                        continue
+                    open_ps_q = [p for p in open_ps if (p.quote_currency or 'USDT') == q]
+                    if open_ps_q:
+                        open_notional = sum((p.quantity or 0) * (p.perp_entry_price or 0) for p in open_ps_q)
+                        keep = max(0.20, open_notional * float(cfg.futures_buffer_pct or 0.20))
                     else:
-                        log_event(db, f'futures→spot drain failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                        keep = 0.10
+                    if fut_free_now > keep + 0.10:
+                        amt = fut_free_now - keep
+                        ok, err = gateway.transfer_futures_to_spot(amt, paper, asset=q)
+                        if ok:
+                            log_event(db, f'Drained {amt:.2f} {q} futures→spot (kept {keep:.2f} as margin buffer; {len(open_ps_q)} {q} pos open)', mode=mode, exchange=gateway.venue_id)
+                        else:
+                            log_event(db, f'futures→spot {q} drain failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
             # End-of-cycle bookkeeping. Two cadences:
             #   * Capital-flow ingest (deposits / withdrawals / transfers)
