@@ -461,13 +461,35 @@ tr.position-stuck:hover > td { background: color-mix(in srgb, var(--bad) 14%, tr
   .equity-donut { margin: 0 auto; }
 }
 
-/* ===== Searchable / collapsible tables ============================ */
+/* ===== Searchable / collapsible / sortable tables ================== */
 
 /* Class selectors set `display: grid` / `display: flex` on rows (e.g.
    `.log-line`) which would override the browser's UA `[hidden]` rule.
    Force-hide any element our table helper marks hidden so collapse +
    search filtering work for non-table containers. */
 [hidden] { display: none !important; }
+
+/* Sortable headers: cursor + click affordance, asc/desc indicator. */
+th.sortable {
+  cursor: pointer;
+  user-select: none;
+  position: relative;
+  padding-right: 18px;
+}
+th.sortable::after {
+  content: '↕';
+  opacity: 0.30;
+  font-size: 10px;
+  margin-left: 4px;
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+th.sortable:hover { color: var(--accent); }
+th.sortable.sort-asc::after { content: '▲'; opacity: 1; color: var(--accent); }
+th.sortable.sort-desc::after { content: '▼'; opacity: 1; color: var(--accent); }
+th.sortable:focus { outline: 2px solid var(--accent); outline-offset: -2px; }
 
 .table-search-wrap {
   display: flex;

@@ -311,11 +311,16 @@ class VenueGateway:
         except Exception as e:
             if self._is_rate_limit_error(e):
                 self._note_rate_limit(str(e))
-                # Keep the previous cache instead of nulling — stale data
-                # is more useful than nothing while we wait.
-                return self._balance_cache[1] if self._balance_cache else None
             self.last_balance_error = str(e)
-            self._balance_cache = (time.time(), None)
+            # Always preserve the last-good cached payload across any
+            # API failure (rate-limit, network timeout, 5xx, parse
+            # error). Showing a stale balance + a banner with the
+            # error is far better UX than blanking the dashboard to
+            # zero — the user explicitly asked for this in feedback
+            # round 3. The cache only gets overwritten on a fresh
+            # successful read above; never with None here.
+            if self._balance_cache is not None and self._balance_cache[1] is not None:
+                return self._balance_cache[1]
             return None
 
     def _fetch_balances_uncached(self) -> dict:
@@ -1324,7 +1329,7 @@ class KuCoinGateway(VenueGateway):
             self.futures.load_markets()
         out: dict = {}
         for symbol, market in self.futures.markets.items():
-            if market.get('type') != 'swap' or market.get('quote') != 'USDT':
+            if market.get('type') != 'swap' or market.get('quote') not in SUPPORTED_QUOTES:
                 continue
             info = market.get('info') or {}
             fr = info.get('fundingFeeRate')
@@ -1428,8 +1433,42 @@ class KuCoinGateway(VenueGateway):
                     return {'spot': spot, 'futures': futures}
                 except Exception:
                     pass
+        # Classic — KuCoin splits cash across THREE wallet types
+        # (``trade`` for spot orders, ``main`` for deposits/funding,
+        # ``contract`` for perp margin). Reading just ``trade`` would
+        # miss whatever the user has parked in the funding wallet —
+        # which is the default landing spot for new deposits and
+        # master→sub transfers. Sum trade + main into the synthesised
+        # ``spot`` bucket so equity reflects the full account.
+        trade_bal = self.spot.fetch_balance({'type': 'trade'})
+        try:
+            main_bal = self.spot.fetch_balance({'type': 'main'})
+        except Exception:
+            main_bal = {}
+        spot: dict = {'free': {}, 'used': {}, 'total': {}}
+        META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
+        seen: set[str] = set()
+        for source in (trade_bal, main_bal):
+            for asset, bal in (source or {}).items():
+                if asset in META_KEYS or not isinstance(bal, dict):
+                    continue
+                free_amt = float(bal.get('free') or 0)
+                used_amt = float(bal.get('used') or 0)
+                total_amt = float(bal.get('total') or 0)
+                if total_amt <= 0:
+                    continue
+                if asset in seen:
+                    spot[asset]['free'] += free_amt
+                    spot[asset]['used'] += used_amt
+                    spot[asset]['total'] += total_amt
+                else:
+                    spot[asset] = {'free': free_amt, 'used': used_amt, 'total': total_amt}
+                    seen.add(asset)
+                spot['free'][asset] = spot['free'].get(asset, 0.0) + free_amt
+                spot['used'][asset] = spot['used'].get(asset, 0.0) + used_amt
+                spot['total'][asset] = spot['total'].get(asset, 0.0) + total_amt
         return {
-            'spot': self.spot.fetch_balance({'type': 'trade'}),
+            'spot': spot,
             'futures': self.futures.fetch_balance(),
         }
 

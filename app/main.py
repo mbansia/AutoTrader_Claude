@@ -594,8 +594,12 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
                 if g.is_rate_limited():
                     pause_remaining = max(0, int(g._rate_limit_pause_until - time.time()))
                     errors.append(f'{g.name}: rate-limited, pausing API calls for ~{pause_remaining}s. Showing cached balance.')
+                elif g.last_balance_error and bals is not None:
+                    # Stale-fallback path: live API failed but we're serving
+                    # the last-good cached balance. Tell the user explicitly.
+                    errors.append(f'{g.name}: API error ({g.last_balance_error[:120]}). Showing cached balance from last successful fetch.')
                 elif bals is None and g.last_balance_error:
-                    errors.append(f'{g.name}: {g.last_balance_error[:140]}')
+                    errors.append(f'{g.name}: {g.last_balance_error[:140]} (no cached balance available)')
             if errors:
                 balances_error = ' · '.join(errors)
 
