@@ -269,6 +269,14 @@ class StrategyConfig(Base):
     exit_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     max_entry_basis_bps: Mapped[float] = mapped_column(Float, default=20.0)
     max_exit_basis_bps: Mapped[float] = mapped_column(Float, default=5.0)
+    # Limit-IOC tick buffer for the protected execution path. The bot
+    # walks the order book to find the worst-level price required to
+    # fill ``qty`` and posts a limit-IOC at that price + this buffer
+    # (buy side) or − this buffer (sell side). 1 bps absorbs a single
+    # venue tick of movement during the round-trip; bump higher for
+    # very volatile / low-tick-density pairs if IOC rejections climb.
+    entry_tick_buffer_bps: Mapped[float] = mapped_column(Float, default=1.0)
+    exit_tick_buffer_bps: Mapped[float] = mapped_column(Float, default=2.0)
     enforce_hedge_check: Mapped[bool] = mapped_column(Boolean, default=True)
     delisting_check: Mapped[bool] = mapped_column(Boolean, default=True)
     # Live-only: auto-move USDT spot↔futures so the perp leg always has margin.
