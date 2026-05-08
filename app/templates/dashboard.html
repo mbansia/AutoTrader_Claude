@@ -260,7 +260,7 @@
   <h3>Open positions ({{ rows|length }})</h3>
   {% if rows %}
   <div class="table-wrapper">
-  <table class="positions-table">
+  <table class="positions-table" data-searchable>
     <thead>
       <tr>
         <th></th>
@@ -370,7 +370,7 @@
   <h3>Closed positions (last 20) <span class="muted" style="font-size:13px;font-weight:400;">— click ▶ for per-leg trade detail</span></h3>
   {% if closed %}
   <div class="table-wrapper">
-  <table>
+  <table data-searchable>
     <thead><tr>
       <th style="width:32px;"></th>
       <th>Symbol</th>
@@ -531,7 +531,7 @@
       <span class="muted" style="font-size:11px;margin-left:8px;">Idempotent · safe to spam · check Logs for per-endpoint diagnostics</span>
     </form>
     {% if flows %}
-    <table>
+    <table data-searchable>
       <thead><tr><th>Date</th><th>Venue</th><th class="num">Amount (USDT)</th><th>Kind</th><th>Source</th><th>Note</th></tr></thead>
       <tbody>
       {% for f in flows %}
