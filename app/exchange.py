@@ -217,6 +217,12 @@ class VenueGateway:
         # so the bot loop can surface "scanned N USDT + M USDC perps"
         # in scan_results.note for dashboard visibility.
         self.last_scan_per_quote: dict = {}
+        # Markets cache freshness — load_markets() runs once at init,
+        # but venues list new pairs continually (e.g. KuCoin added
+        # DOGE/USDC mid-session, our cached market list missed it
+        # until restart). Periodically reload so freshly-listed pairs
+        # become tradable without operator intervention.
+        self._markets_loaded_at: float = 0.0
         # Per-endpoint error map populated by ``list_capital_flow_records``
         # so /monitoring can show which API endpoint refused (most common
         # cause: missing permission on the API key).
@@ -252,9 +258,33 @@ class VenueGateway:
 
     # ─── Market data + read-only helpers (ccxt-uniform) ───────────────────
 
-    def load_markets(self) -> None:
-        self.spot.load_markets()
-        self.futures.load_markets()
+    # Markets cache TTL — newly-listed pairs become tradable within this
+    # window without needing a worker restart. KuCoin/Binance both list a
+    # handful of new perps per day; an hour is short enough to catch them
+    # before the funding rate decays, long enough to cost almost no rate
+    # limit (each reload is one /api/v1/exchangeInfo call per client).
+    MARKETS_RELOAD_TTL_S = 3600.0
+
+    def load_markets(self, *, force: bool = False) -> None:
+        """Reload ccxt's cached spot + futures market lists. Called
+        once at startup and then opportunistically (with the TTL above
+        as a throttle) by ``maybe_reload_markets`` so freshly-listed
+        pairs become tradable without restarting the worker."""
+        self.spot.load_markets(reload=force)
+        self.futures.load_markets(reload=force)
+        self._markets_loaded_at = time.time()
+
+    def maybe_reload_markets(self, *, force: bool = False) -> bool:
+        """Reload markets if older than ``MARKETS_RELOAD_TTL_S`` (or if
+        ``force=True``). Returns True iff a reload happened. Failures
+        are swallowed — stale markets are better than a crashed cycle."""
+        if not force and self._markets_loaded_at and (time.time() - self._markets_loaded_at) < self.MARKETS_RELOAD_TTL_S:
+            return False
+        try:
+            self.load_markets(force=True)
+            return True
+        except Exception:
+            return False
 
     def order_book_depth_usdt(self, symbol: str, side: str = 'ask', band_bps: float = 10.0, perp: bool = False) -> float:
         """Sum of USDT-equivalent quantity on `side` of the book within `band_bps`
@@ -452,6 +482,11 @@ class VenueGateway:
         Each :class:`Candidate` carries ``venue_id`` and ``quote_currency``
         so the bot can route the entry to the matching wallet's free
         balance and never cross-fund USDT ↔ USDC."""
+        # Refresh the markets cache opportunistically before scanning so
+        # newly-listed pairs (DOGE/USDC was the canonical case) become
+        # eligible without a worker restart. Throttled by the TTL —
+        # each reload is one /exchangeInfo call per ccxt client.
+        self.maybe_reload_markets()
         try:
             rates = self.funding_rates_dict()
         except Exception:
@@ -466,6 +501,9 @@ class VenueGateway:
         passing: list[Candidate] = []
         rejected: list[tuple[str, str, float]] = []
         total = 0
+        # Per-scan flag: do the force-reload at most once even if many
+        # candidates are missing spot, so we don't spam /exchangeInfo.
+        forced_reload_this_scan = False
         # Per-quote scan-coverage counts so the dashboard can surface
         # "scanned N USDT + M USDC perps" — gives the operator real
         # confidence that USDC pairs are reaching the scan, not silently
@@ -501,31 +539,43 @@ class VenueGateway:
                 per_quote_top_below[quote].append((symbol, apr))
                 continue
             base = symbol.split('/')[0]
-            # Pair the perp with the matching-quote spot first; if that
-            # doesn't exist on this venue, fall back to the OTHER stable
-            # (USDC perp ↔ USDT spot, USDT perp ↔ USDC spot). The 1:1ish
-            # USDC↔USDT peg makes the cross-stable hedge real — basis
-            # risk per cycle is bps; typical funding spreads pay
-            # multiple percent per day. The Candidate carries
-            # ``spot_quote_currency`` separately so the bot's wallet
-            # routing knows which quote the SPOT leg consumes (vs the
-            # perp's margin which uses ``quote_currency``).
-            preferred = f'{base}/{quote}'
+            # Spot-leg pairing: spot is just spot — the stablecoin
+            # we pay in doesn't change the long-base hedge. So we
+            # accept ANY {base}/<supported_stable> spot pair, with a
+            # mild preference for the perp's quote first (saves a
+            # USDC↔USDT swap when both wallets aren't pre-funded).
+            # If no spot pair exists for any supported quote, force-
+            # reload markets ONCE and retry — handles pairs listed
+            # mid-session that the cached market dict missed. Final
+            # rejection enumerates every symbol checked so the
+            # operator can see the bot really did try.
+            tried = []
             spot_symbol = None
             spot_quote = quote
-            if preferred in self.spot.markets:
-                spot_symbol = preferred
-            else:
-                for alt_q in SUPPORTED_QUOTES:
-                    if alt_q == quote:
-                        continue
-                    cand = f'{base}/{alt_q}'
+            for q_pref in (quote,) + tuple(q for q in SUPPORTED_QUOTES if q != quote):
+                cand = f'{base}/{q_pref}'
+                tried.append(cand)
+                if cand in self.spot.markets:
+                    spot_symbol = cand
+                    spot_quote = q_pref
+                    break
+            if spot_symbol is None and not forced_reload_this_scan:
+                # First miss in this scan — force-reload markets once
+                # (cap is per-scan, not per-candidate, so we never
+                # spam /exchangeInfo). A single reload repopulates
+                # `self.spot.markets` for every pair, so subsequent
+                # missing-spot lookups re-check the fresh dict for
+                # free without another network call.
+                forced_reload_this_scan = True
+                self.maybe_reload_markets(force=True)
+                for q_pref in (quote,) + tuple(q for q in SUPPORTED_QUOTES if q != quote):
+                    cand = f'{base}/{q_pref}'
                     if cand in self.spot.markets:
                         spot_symbol = cand
-                        spot_quote = alt_q
+                        spot_quote = q_pref
                         break
             if spot_symbol is None:
-                rejected.append((symbol, f'no_spot_market ({"+".join(SUPPORTED_QUOTES)})', apr))
+                rejected.append((symbol, f'no_spot_market (tried {", ".join(tried)})', apr))
                 continue
             prefiltered.append((symbol, spot_symbol, float(fr), interval_h, quote, spot_quote))
 
