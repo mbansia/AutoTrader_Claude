@@ -1096,6 +1096,22 @@ class VenueGateway:
             return True, 'paper'
         return False, f'{asset} futures→spot transfer not wired on {self.name}'
 
+    def consolidate_spot_wallets(self, assets: tuple[str, ...] = SUPPORTED_QUOTES, paper_mode: bool = False) -> list[tuple[str, float, str]]:
+        """Move sibling spot sub-wallet balances into the single wallet that
+        actually executes spot orders, so the synthesised
+        ``spot.<asset>.free`` exposed by :meth:`safe_balances` matches the
+        amount the venue will let us spend on a market/limit order.
+
+        Default is a no-op — venues with a single spot wallet (Binance
+        Classic, Binance PM, KuCoin UTA) need nothing here. KuCoin Classic
+        overrides this to hop ``main → trade`` so the abstraction stops
+        lying about how much the bot can actually spend on a spot leg.
+
+        Returns a list of ``(asset, amount_moved, error_or_empty)`` so the
+        caller can log per-asset what happened.
+        """
+        return []
+
     def net_injected_capital_usdt(self, lookback_days: int = 30) -> tuple[float | None, dict]:
         """Returns ``(net, meta)`` where ``net`` is in USDT and ``meta`` carries
         a per-component breakdown for the UI. ``None`` signals the caller to
@@ -2209,6 +2225,33 @@ class KuCoinGateway(VenueGateway):
         if amount <= 0:
             return True, 'noop'
         return self._transfer('contract', 'trade', amount, asset=asset)
+
+    # KuCoin Classic ships funds in three buckets on the spot side: ``trade``
+    # (where spot orders execute), ``main`` (default deposit / funding /
+    # master-sub landing zone) and ``contract`` (perp margin). Our
+    # synthesised ``spot.<asset>.free`` *aggregates* trade+main, but the
+    # spot order book only sees ``trade``. That mismatch is what triggered
+    # the persistent "below min position pct (wallet=0.10 spot_leg_free=9.90)"
+    # rejections — the abstraction lied about what we could actually spend.
+    # Sweeping main → trade once per cycle aligns the abstraction with
+    # reality so every downstream consumer (sizing, basis, swap) works
+    # without needing to know about KuCoin's internal wallet split.
+    def consolidate_spot_wallets(self, assets: tuple[str, ...] = SUPPORTED_QUOTES, paper_mode: bool = False) -> list[tuple[str, float, str]]:
+        if paper_mode or self._is_uta:
+            return []
+        results: list[tuple[str, float, str]] = []
+        DUST = 0.01
+        for asset in assets:
+            try:
+                main_free = float((self.spot.fetch_balance({'type': 'main'}).get(asset) or {}).get('free') or 0)
+            except Exception as e:
+                results.append((asset, 0.0, f'fetch main balance failed: {e}'))
+                continue
+            if main_free <= DUST:
+                continue
+            ok, err = self._transfer('main', 'trade', main_free, asset=asset)
+            results.append((asset, main_free if ok else 0.0, '' if ok else err))
+        return results
 
     # ─── Capital-injection history (KuCoin) ───────────────────────────────
     # KuCoin sub-accounts: master→sub transfers come in via the
