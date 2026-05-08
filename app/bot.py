@@ -1199,11 +1199,38 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         if spot_avg <= 0 or perp_avg <= 0:
                             continue
                         fill_basis_bps = (perp_avg - spot_avg) / spot_avg * 10000.0
+                        # Hard sanity bound: a basis gap that exceeds
+                        # max_entry_basis_bps indicates a market
+                        # dislocation or stale data — reject regardless
+                        # of profitability.
                         if abs(fill_basis_bps) > cfg.max_entry_basis_bps:
                             db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol,
-                                reason=f'fill_basis_too_wide ({fill_basis_bps:+.1f}bps > ±{cfg.max_entry_basis_bps:.1f}bps at fill prices spot={spot_avg:.6f} perp={perp_avg:.6f})',
+                                reason=f'basis_dislocated ({fill_basis_bps:+.1f}bps > ±{cfg.max_entry_basis_bps:.1f}bps sanity bound at fill prices spot={spot_avg:.6f} perp={perp_avg:.6f})',
                                 funding_rate=c.funding_apr))
-                            scan_action = 'fill_basis_too_wide'
+                            scan_action = 'basis_dislocated'
+                            continue
+                        # Profitability gate: compute net expected profit
+                        # for a single funding window. The trade must
+                        # earn enough funding to cover entry basis,
+                        # worst-case exit basis (entry × multiplier),
+                        # and round-trip taker fees on both legs.
+                        # All bps are of position notional (= spot_avg
+                        # × qty).
+                        funding_window_bps = c.funding_rate * 10000.0  # signed; bot is short perp
+                        entry_basis_cost_bps = abs(fill_basis_bps)
+                        exit_buffer = float(cfg.exit_basis_buffer_multiple or 3.0)
+                        round_trip_basis_bps = entry_basis_cost_bps * (1.0 + exit_buffer)
+                        fees_bps = 4.0 * float(cfg.taker_fee_bps or 5.0)
+                        net_profit_bps = funding_window_bps - round_trip_basis_bps - fees_bps
+                        min_profit = float(cfg.min_window_profit_bps or 0.0)
+                        if net_profit_bps < min_profit:
+                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol,
+                                reason=(f'insufficient_profit '
+                                        f'(funding={funding_window_bps:+.1f}bps − '
+                                        f'basis={round_trip_basis_bps:.1f}bps [entry {entry_basis_cost_bps:.1f}× (1+{exit_buffer:.1f})] − '
+                                        f'fees={fees_bps:.1f}bps = net {net_profit_bps:+.1f}bps < {min_profit:.1f}bps required)'),
+                                funding_rate=c.funding_apr))
+                            scan_action = 'insufficient_profit'
                             continue
                         # Limit prices at the worst-level + tick buffer.
                         # Buy: pay UP TO this. Sell: accept DOWN TO this.
@@ -1292,7 +1319,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         held_bases.add(base)
                         scan_action = f'opened {c.perp_symbol}'
                         cross_stable_tag = '' if sq == cq else f' [cross-stable {sq}-spot / {cq}-perp]'
-                        log_event(db, f'Opened {c.perp_symbol} qty={pos.quantity:.6f} funding_apy={c.funding_apr:.2%} fill_basis={fill_basis_bps:+.1f}bps spot@{spot_avg:.6f} perp@{perp_avg:.6f}{cross_stable_tag}', mode=mode, exchange=gateway.venue_id)
+                        log_event(db, f'Opened {c.perp_symbol} qty={pos.quantity:.6f} funding_apy={c.funding_apr:.2%} fill_basis={fill_basis_bps:+.1f}bps net_profit_per_window={net_profit_bps:+.1f}bps spot@{spot_avg:.6f} perp@{perp_avg:.6f}{cross_stable_tag}', mode=mode, exchange=gateway.venue_id)
                         bus.emit('position_opened',
                                  position_id=pos.id, mode=mode, exchange=gateway.venue_id,
                                  symbol=c.spot_symbol, quantity=pos.quantity,
