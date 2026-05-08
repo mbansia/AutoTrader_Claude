@@ -106,6 +106,7 @@ def run_schema_migrations() -> None:
     _add_column_if_missing('strategy_config', 'taker_fee_bps', 'FLOAT NOT NULL DEFAULT 5.0')
     _add_column_if_missing('strategy_config', 'exit_basis_buffer_multiple', 'FLOAT NOT NULL DEFAULT 3.0')
     _add_column_if_missing('strategy_config', 'min_window_profit_bps', 'FLOAT NOT NULL DEFAULT 0.0')
+    _add_column_if_missing('strategy_config', 'auto_quote_swap_enabled', 'BOOLEAN NOT NULL DEFAULT 1')
     # Cross-venue tag — every per-row table carries an ``exchange`` column so
     # the dashboard, logs, scans, and exports can break down state by venue
     # without ambiguity. Default 'binance' on every existing row guarantees
