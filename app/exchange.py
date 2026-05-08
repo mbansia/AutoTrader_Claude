@@ -19,12 +19,6 @@ Class hierarchy
   SAPI. Capital-flow history is deferred; ``net_injected_capital_usdt``
   returns ``None`` so the dashboard falls back to manual capital flows.
 
-Yield optimisation (BFUSD subscribe, KuCoin auto-lend, Earn subscribe of
-spot leg base assets) was removed — see ``archive/yield/`` for the
-preserved code and re-enable preconditions. USDT now sits in PM (Binance)
-or UTA (KuCoin) as plain collateral; the bot does not move it into any
-yield surface.
-
 Design invariants
 -----------------
 * Every method that touches the network is wrapped to fail-soft: it
@@ -317,11 +311,16 @@ class VenueGateway:
         except Exception as e:
             if self._is_rate_limit_error(e):
                 self._note_rate_limit(str(e))
-                # Keep the previous cache instead of nulling — stale data
-                # is more useful than nothing while we wait.
-                return self._balance_cache[1] if self._balance_cache else None
             self.last_balance_error = str(e)
-            self._balance_cache = (time.time(), None)
+            # Always preserve the last-good cached payload across any
+            # API failure (rate-limit, network timeout, 5xx, parse
+            # error). Showing a stale balance + a banner with the
+            # error is far better UX than blanking the dashboard to
+            # zero — the user explicitly asked for this in feedback
+            # round 3. The cache only gets overwritten on a fresh
+            # successful read above; never with None here.
+            if self._balance_cache is not None and self._balance_cache[1] is not None:
+                return self._balance_cache[1]
             return None
 
     def _fetch_balances_uncached(self) -> dict:
@@ -441,6 +440,13 @@ class VenueGateway:
             rates = self.funding_rates_dict()
         except Exception:
             return [], 0, []
+        # First pass: filter by quote, threshold, and spot-market existence.
+        # Per-symbol fetch_ticker calls used to be made here in a loop —
+        # that took N round-trips and routinely tripped venue rate limits
+        # (the user saw "ticker_error" rejections as a result). We now
+        # do ONE batch fetch_tickers() for every spot symbol that
+        # survived the cheap filters; one HTTP call instead of dozens.
+        prefiltered: list[tuple[str, str, float, float, str]] = []
         passing: list[Candidate] = []
         rejected: list[tuple[str, str, float]] = []
         total = 0
@@ -466,11 +472,34 @@ class VenueGateway:
             if spot_symbol not in self.spot.markets:
                 rejected.append((symbol, f'no_spot_market ({quote})', apr))
                 continue
+            prefiltered.append((symbol, spot_symbol, float(fr), interval_h, quote))
+
+        # Batch ticker fetch for everything that passed the cheap filters.
+        # ccxt's spot.fetch_tickers(symbols) returns {symbol: ticker} in
+        # one HTTP call on both Binance and KuCoin, so we never hit the
+        # per-symbol rate limit that produced "ticker_error" rejections.
+        spot_symbols_needed = sorted({s[1] for s in prefiltered})
+        tickers: dict = {}
+        if spot_symbols_needed:
             try:
-                t = self.spot.fetch_ticker(spot_symbol)
-            except Exception:
-                rejected.append((symbol, 'ticker_error', apr))
-                continue
+                tickers = self.spot.fetch_tickers(spot_symbols_needed) or {}
+            except Exception as e:
+                # Fall back to fetching all tickers (no symbol arg) — some
+                # ccxt versions don't accept a symbol list on fetch_tickers
+                # for KuCoin. If that also fails the candidates without a
+                # ticker get rejected with the actual error message.
+                try:
+                    tickers = self.spot.fetch_tickers() or {}
+                except Exception as e2:
+                    e = e2
+                    msg = str(e)[:60]
+                    for sym, _, _, _, _ in prefiltered:
+                        rejected.append((sym, f'ticker_fetch_failed: {msg}', annualize_rate(0.0, 8.0)))
+                    prefiltered = []
+
+        for symbol, spot_symbol, fr_v, interval_h, quote in prefiltered:
+            apr = annualize_rate(fr_v, interval_h)
+            t = tickers.get(spot_symbol) or {}
             qv = float(t.get('quoteVolume') or 0)
             if qv < min_quote_volume:
                 rejected.append((symbol, f'volume<{min_quote_volume:.0f}', apr))
@@ -486,7 +515,7 @@ class VenueGateway:
             passing.append(Candidate(
                 spot_symbol=spot_symbol,
                 perp_symbol=symbol,
-                funding_rate=float(fr),
+                funding_rate=fr_v,
                 funding_interval_hours=interval_h,
                 quote_volume=qv,
                 spot_depth_usdt=spot_depth,
@@ -609,25 +638,20 @@ class VenueGateway:
         return 'Unknown', 'no probe wired'
 
     def equity_buckets(self) -> list[dict]:
-        """Return per-bucket equity items for the dashboard donut, with
-        venue-correct labels. Surfaces both USDT and USDC as separate
-        buckets — they are tracked as independent books. Default impl
-        used by Classic accounts; PM/UTA subclasses override.
-
-        Bucket ``value`` is in the asset's native unit. The dashboard
-        prices USDC at the live USDC/USDT mid for headline equity but
-        keeps the breakdown honest about the per-asset split."""
+        """Return per-(venue, asset) equity buckets — one line per
+        stablecoin (sum of spot + futures wallets) plus one for
+        non-stablecoin collateral. USDT and USDC are tracked as
+        independent books; the dashboard prices USDC at live USDC/USDT
+        mid for headline equity but renders the per-asset split here."""
         bals = self.safe_balances() or {}
         items: list[dict] = []
         QUOTE_COLORS = {'USDT': '#38bdf8', 'USDC': '#22d3ee'}
-        FUT_COLORS = {'USDT': '#fbbf24', 'USDC': '#f97316'}
         for q in SUPPORTED_QUOTES:
             spot_amt = float((bals.get('spot', {}).get(q) or {}).get('total') or 0)
             fut_amt = float((bals.get('futures', {}).get(q) or {}).get('total') or 0)
-            if spot_amt > 0:
-                items.append({'label': f'{self.name} · Spot {q}', 'value': spot_amt, 'asset': q, 'venue': self.venue_id, 'color': QUOTE_COLORS[q]})
-            if fut_amt > 0:
-                items.append({'label': f'{self.name} · Futures {q}', 'value': fut_amt, 'asset': q, 'venue': self.venue_id, 'color': FUT_COLORS[q]})
+            total = spot_amt + fut_amt
+            if total > 0:
+                items.append({'label': f'{self.name} · {q}', 'value': total, 'asset': q, 'venue': self.venue_id, 'color': QUOTE_COLORS[q]})
         spot_assets_value = 0.0
         META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
         for asset, bal in (bals.get('spot') or {}).items():
@@ -639,7 +663,7 @@ class VenueGateway:
             px = self.safe_price(f'{asset}/USDT') or 0
             spot_assets_value += qty * px
         if spot_assets_value > 0:
-            items.append({'label': f'{self.name} · Spot assets', 'value': spot_assets_value, 'venue': self.venue_id, 'color': '#818cf8'})
+            items.append({'label': f'{self.name} · collateral assets', 'value': spot_assets_value, 'asset': 'USDT', 'venue': self.venue_id, 'color': '#818cf8'})
         return items
 
 
@@ -956,13 +980,11 @@ class BinanceGateway(VenueGateway):
 
     # ─── Portfolio Margin overrides (active when account is in PM mode) ────
     # Binance Portfolio Margin replaces the Classic spot/futures split with
-    # a unified margin pool that holds USDT, BFUSD (USDT-pegged collateral
-    # the user may have from prior subscriptions), USDC, and other margin
-    # assets simultaneously. Orders route through ``/papi/v1/*`` (separate
-    # from ``/api/v3/*`` and ``/fapi/v1/*``); calling Classic endpoints on
-    # a PM account returns -2015. The user has confirmed the sub-account
-    # is in PM mode, so we always go through these paths — no Classic
-    # fallback to maintain.
+    # a unified margin pool that holds USDT, USDC, and other margin assets
+    # simultaneously. Orders route through ``/papi/v1/*`` (separate from
+    # ``/api/v3/*`` and ``/fapi/v1/*``); calling Classic endpoints on a PM
+    # account returns -2015. We always go through the PM paths — no
+    # Classic fallback to maintain.
     #
     # Endpoint references (Binance API docs, Sept 2024 revision):
     #   /papi/v1/balance           — unified balance per asset
@@ -971,10 +993,6 @@ class BinanceGateway(VenueGateway):
     #   /papi/v1/um/leverage       — set leverage on a UM symbol
     #   /papi/v1/margin/order      — cross-margin spot order placement
     #   /papi/v1/um/positionRisk   — open UM positions
-    #
-    # BFUSD is read as a balance (it's real margin collateral) but never
-    # subscribed or redeemed — the yield-optimisation subsystem was removed;
-    # see archive/yield/ for the original code and re-enable preconditions.
 
     @staticmethod
     def _papi(client, candidates: tuple[str, ...]):
@@ -1021,32 +1039,21 @@ class BinanceGateway(VenueGateway):
         return 'Unknown', 'PM probe rejected, Classic probe returned nothing'
 
     def equity_buckets(self) -> list[dict]:
-        """PM equity buckets:
-          * ``Binance · PM USDT``        — USDT in the unified margin pool
-          * ``Binance · PM USDC``        — USDC in the unified margin pool
-          * ``Binance · BFUSD``          — USDT-pegged collateral the user
-                                            may hold from before the yield
-                                            subsystem was retired
-          * ``Binance · PM collateral``  — non-stablecoin assets in the
-                                            pool (e.g. ETH from a long leg)
-        Buckets with zero balance are omitted. USDT and USDC are
-        tracked as separate books — the dashboard prices USDC at the
-        live USDC/USDT mid for headline equity but keeps the per-asset
-        split visible here."""
+        """Per-(venue, asset) equity buckets — one line per stablecoin
+        + one for non-stablecoin collateral. USDT and USDC are tracked
+        as separate books; the dashboard prices USDC at live USDC/USDT
+        mid for headline equity but renders the per-asset split here."""
         bals = self.safe_balances() or {}
         items: list[dict] = []
         QUOTE_COLORS = {'USDT': '#38bdf8', 'USDC': '#22d3ee'}
         for q in SUPPORTED_QUOTES:
             amt = float((bals.get('spot', {}).get(q) or {}).get('total') or 0)
             if amt > 0:
-                items.append({'label': f'{self.name} · PM {q}', 'value': amt, 'asset': q, 'venue': self.venue_id, 'color': QUOTE_COLORS[q]})
-        bfusd = float((bals.get('spot', {}).get('BFUSD') or {}).get('total') or 0)
-        if bfusd > 0:
-            items.append({'label': f'{self.name} · BFUSD', 'value': bfusd, 'asset': 'BFUSD', 'venue': self.venue_id, 'color': '#4ade80'})
+                items.append({'label': f'{self.name} · {q}', 'value': amt, 'asset': q, 'venue': self.venue_id, 'color': QUOTE_COLORS[q]})
         collateral_value = 0.0
         META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
         for asset, bal in (bals.get('spot') or {}).items():
-            if asset in META_KEYS or asset in SUPPORTED_QUOTES or asset == 'BFUSD' or not isinstance(bal, dict):
+            if asset in META_KEYS or asset in SUPPORTED_QUOTES or not isinstance(bal, dict):
                 continue
             qty = float(bal.get('total') or 0)
             if qty <= 0:
@@ -1054,18 +1061,14 @@ class BinanceGateway(VenueGateway):
             px = self.safe_price(f'{asset}/USDT') or 0
             collateral_value += qty * px
         if collateral_value > 0:
-            # collateral_value is already USDT-priced via safe_price.
-            items.append({'label': f'{self.name} · PM collateral assets', 'value': collateral_value, 'asset': 'USDT', 'venue': self.venue_id, 'color': '#818cf8'})
+            items.append({'label': f'{self.name} · collateral assets', 'value': collateral_value, 'asset': 'USDT', 'venue': self.venue_id, 'color': '#818cf8'})
         return items
 
     def _fetch_balances_uncached(self) -> dict:
         """Read PM unified balance + classic Spot wallet, then synthesise
         the bot's two-bucket shape (spot · futures). Both quote currencies
         the bot trades — USDT and USDC — are surfaced as top-level keys
-        in spot/futures so per-quote sizing stays self-contained.
-
-        BFUSD lands in ``spot['BFUSD']`` as a regular asset row — margin
-        collateral surfaced for visibility but never written by this bot."""
+        in spot/futures so per-quote sizing stays self-contained."""
         fn = self._papi(self.spot, ('papiGetBalance', 'papi_get_balance'))
         if fn is None:
             return {'spot': self.spot.fetch_balance(), 'futures': self.futures.fetch_balance()}
@@ -1326,7 +1329,7 @@ class KuCoinGateway(VenueGateway):
             self.futures.load_markets()
         out: dict = {}
         for symbol, market in self.futures.markets.items():
-            if market.get('type') != 'swap' or market.get('quote') != 'USDT':
+            if market.get('type') != 'swap' or market.get('quote') not in SUPPORTED_QUOTES:
                 continue
             info = market.get('info') or {}
             fr = info.get('fundingFeeRate')
@@ -1430,8 +1433,42 @@ class KuCoinGateway(VenueGateway):
                     return {'spot': spot, 'futures': futures}
                 except Exception:
                     pass
+        # Classic — KuCoin splits cash across THREE wallet types
+        # (``trade`` for spot orders, ``main`` for deposits/funding,
+        # ``contract`` for perp margin). Reading just ``trade`` would
+        # miss whatever the user has parked in the funding wallet —
+        # which is the default landing spot for new deposits and
+        # master→sub transfers. Sum trade + main into the synthesised
+        # ``spot`` bucket so equity reflects the full account.
+        trade_bal = self.spot.fetch_balance({'type': 'trade'})
+        try:
+            main_bal = self.spot.fetch_balance({'type': 'main'})
+        except Exception:
+            main_bal = {}
+        spot: dict = {'free': {}, 'used': {}, 'total': {}}
+        META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
+        seen: set[str] = set()
+        for source in (trade_bal, main_bal):
+            for asset, bal in (source or {}).items():
+                if asset in META_KEYS or not isinstance(bal, dict):
+                    continue
+                free_amt = float(bal.get('free') or 0)
+                used_amt = float(bal.get('used') or 0)
+                total_amt = float(bal.get('total') or 0)
+                if total_amt <= 0:
+                    continue
+                if asset in seen:
+                    spot[asset]['free'] += free_amt
+                    spot[asset]['used'] += used_amt
+                    spot[asset]['total'] += total_amt
+                else:
+                    spot[asset] = {'free': free_amt, 'used': used_amt, 'total': total_amt}
+                    seen.add(asset)
+                spot['free'][asset] = spot['free'].get(asset, 0.0) + free_amt
+                spot['used'][asset] = spot['used'].get(asset, 0.0) + used_amt
+                spot['total'][asset] = spot['total'].get(asset, 0.0) + total_amt
         return {
-            'spot': self.spot.fetch_balance({'type': 'trade'}),
+            'spot': spot,
             'futures': self.futures.fetch_balance(),
         }
 
@@ -1462,36 +1499,20 @@ class KuCoinGateway(VenueGateway):
         return 'Classic', 'isolated trade / contract / main wallets'
 
     def equity_buckets(self) -> list[dict]:
-        """KuCoin equity buckets — separate USDT and USDC tracking.
-
-        UTA — single unified-margin pool:
-          * ``KuCoin · UTA USDT`` / ``UTA USDC`` — pool stablecoin balances
-          * ``KuCoin · UTA collateral``          — non-stablecoin assets
-
-        Classic — isolated Trade + Contract wallets:
-          * ``KuCoin · Trade USDT`` / ``Trade USDC``
-          * ``KuCoin · Contract USDT`` / ``Contract USDC``
-          * ``KuCoin · Trade collateral``
-
-        Zero-balance buckets omitted. USDT and USDC are independent
-        books — bot never cross-funds; dashboard prices USDC at the
-        live USDC/USDT mid for headline equity but keeps the per-asset
-        split visible here."""
+        """Per-(venue, asset) equity buckets — one line per stablecoin
+        (sum of trade + contract wallets) plus one for non-stablecoin
+        collateral. USDT and USDC are tracked as independent books;
+        the dashboard prices USDC at live USDC/USDT mid for headline
+        equity but renders the per-asset split here."""
         bals = self.safe_balances() or {}
         items: list[dict] = []
         QUOTE_COLORS = {'USDT': '#38bdf8', 'USDC': '#22d3ee'}
-        FUT_COLORS = {'USDT': '#fbbf24', 'USDC': '#f97316'}
         for q in SUPPORTED_QUOTES:
             spot_amt = float((bals.get('spot', {}).get(q) or {}).get('total') or 0)
             fut_amt = float((bals.get('futures', {}).get(q) or {}).get('total') or 0)
-            if self._is_uta:
-                if spot_amt > 0:
-                    items.append({'label': f'{self.name} · UTA {q}', 'value': spot_amt, 'asset': q, 'venue': self.venue_id, 'color': QUOTE_COLORS[q]})
-            else:
-                if spot_amt > 0:
-                    items.append({'label': f'{self.name} · Trade {q}', 'value': spot_amt, 'asset': q, 'venue': self.venue_id, 'color': QUOTE_COLORS[q]})
-                if fut_amt > 0:
-                    items.append({'label': f'{self.name} · Contract {q}', 'value': fut_amt, 'asset': q, 'venue': self.venue_id, 'color': FUT_COLORS[q]})
+            total = spot_amt + fut_amt
+            if total > 0:
+                items.append({'label': f'{self.name} · {q}', 'value': total, 'asset': q, 'venue': self.venue_id, 'color': QUOTE_COLORS[q]})
         collateral_value = 0.0
         META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
         for asset, bal in (bals.get('spot') or {}).items():
@@ -1503,8 +1524,7 @@ class KuCoinGateway(VenueGateway):
             px = self.safe_price(f'{asset}/USDT') or 0
             collateral_value += qty * px
         if collateral_value > 0:
-            label = f'{self.name} · UTA collateral' if self._is_uta else f'{self.name} · Trade collateral'
-            items.append({'label': label, 'value': collateral_value, 'asset': 'USDT', 'venue': self.venue_id, 'color': '#818cf8'})
+            items.append({'label': f'{self.name} · collateral assets', 'value': collateral_value, 'asset': 'USDT', 'venue': self.venue_id, 'color': '#818cf8'})
         return items
 
     # ─── Spot ↔ futures transfer (KuCoin) ────────────────────────────────

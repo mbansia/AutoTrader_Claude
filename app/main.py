@@ -91,6 +91,22 @@ from app.safety import basis_bps
 app = FastAPI(title='Funding Arb Bot')
 app.mount('/static', StaticFiles(directory='app/static'), name='static')
 templates = Jinja2Templates(directory='app/templates')
+
+# Cache-bust static assets via ?v=<mtime-hash>. Recomputed on each call
+# so iterating in dev (uvicorn auto-reload) picks up changes without
+# manual ctrl-shift-R; in prod the values are stable per process.
+def _static_version() -> str:
+    import hashlib
+    h = hashlib.sha1()
+    for fname in ('style.css', 'tables.js', 'favicon.svg'):
+        try:
+            h.update(str(os.path.getmtime(f'app/static/{fname}')).encode())
+        except OSError:
+            pass
+    return h.hexdigest()[:8]
+
+
+templates.env.globals['static_v'] = _static_version()
 security = HTTPBasic()
 
 
@@ -578,8 +594,12 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
                 if g.is_rate_limited():
                     pause_remaining = max(0, int(g._rate_limit_pause_until - time.time()))
                     errors.append(f'{g.name}: rate-limited, pausing API calls for ~{pause_remaining}s. Showing cached balance.')
+                elif g.last_balance_error and bals is not None:
+                    # Stale-fallback path: live API failed but we're serving
+                    # the last-good cached balance. Tell the user explicitly.
+                    errors.append(f'{g.name}: API error ({g.last_balance_error[:120]}). Showing cached balance from last successful fetch.')
                 elif bals is None and g.last_balance_error:
-                    errors.append(f'{g.name}: {g.last_balance_error[:140]}')
+                    errors.append(f'{g.name}: {g.last_balance_error[:140]} (no cached balance available)')
             if errors:
                 balances_error = ' · '.join(errors)
 
@@ -686,15 +706,13 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         # spot.free alone in that case. For Classic accounts (still real
         # for IBKR / future venues) we keep the sum.
         if v == MODE_LIVE:
-            spot_free_total = 0.0
-            fut_free_total = 0.0
+            free_total = 0.0
             free_breakdown: list[dict] = []
             for g in gateways:
                 bals_for_display = g.safe_balances() or {}
                 # USDC priced at the live USDC/USDT mid (1.0 fallback).
                 # The bot never cross-funds USDT ↔ USDC for sizing — the
-                # rate is only used here to express both as USDT for the
-                # headline equity/free figure.
+                # rate is only used here for the headline figure.
                 try:
                     rate = g.safe_price('USDC/USDT') or 1.0
                     if not (0.5 < rate < 2.0):
@@ -705,27 +723,29 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
                     spot_free_native = float((bals_for_display.get('spot', {}).get(q) or {}).get('free') or 0)
                     fut_free_native = float((bals_for_display.get('futures', {}).get(q) or {}).get('free') or 0)
                     fut_total_native = float((bals_for_display.get('futures', {}).get(q) or {}).get('total') or 0)
-                    if spot_free_native <= 0.001 and fut_free_native <= 0.001:
+                    # Under unified margin (PM / UTA) fut_total is 0 and
+                    # spot_free already accounts for the full pool — adding
+                    # fut_free would double-count. Under Classic the two
+                    # wallets are separate so their free amounts sum to the
+                    # actual deployable.
+                    if fut_total_native > 0.001:
+                        native_total = spot_free_native + fut_free_native
+                    else:
+                        native_total = spot_free_native
+                    if native_total <= 0.001:
                         continue
                     rate_q = rate if q == 'USDC' else 1.0
                     rate_note = '' if q == 'USDT' else f' × {rate_q:.4f}'
-                    if fut_total_native > 0.001:
-                        # Classic — separate spot + futures wallets.
-                        fut_free_total += fut_free_native * rate_q
-                        spot_free_total += spot_free_native * rate_q
-                        if spot_free_native > 0.001:
-                            free_breakdown.append({'label': f'{g.name} · {q} (spot)', 'value': spot_free_native * rate_q, 'native': spot_free_native, 'asset': q, 'note': rate_note})
-                        if fut_free_native > 0.001:
-                            free_breakdown.append({'label': f'{g.name} · {q} (futures)', 'value': fut_free_native * rate_q, 'native': fut_free_native, 'asset': q, 'note': rate_note})
-                    else:
-                        # Unified margin — single line.
-                        spot_free_total += spot_free_native * rate_q
-                        free_breakdown.append({'label': f'{g.name} · {q} (unified pool)', 'value': spot_free_native * rate_q, 'native': spot_free_native, 'asset': q, 'note': rate_note})
-            ctx['live_spot_free'] = spot_free_total
-            ctx['live_fut_free'] = fut_free_total
+                    free_total += native_total * rate_q
+                    free_breakdown.append({
+                        'label': f'{g.name} · {q}',
+                        'value': native_total * rate_q,
+                        'native': native_total,
+                        'asset': q,
+                        'note': rate_note,
+                    })
             ctx['free_deployable_breakdown'] = free_breakdown
         else:
-            ctx['live_spot_free'] = ctx['live_fut_free'] = None
             ctx['free_deployable_breakdown'] = []
 
         # Open positions rows + leg detail (formerly /positions).
@@ -1046,11 +1066,14 @@ def logs_page(
         events = db.scalars(select(BotEvent).where(BotEvent.mode == v).order_by(desc(BotEvent.id)).limit(100)).all()
         events_v = [{'ts': _fmt_ts(e.ts), 'venue': e.exchange, 'level': e.level, 'message': e.message} for e in events]
 
-        # Rejected candidates: server-side search over the WHOLE table
-        # when ``reject_q`` is set (so the operator can debug why a given
-        # symbol never got opened across the full history). No-query
-        # mode shows the last 50 as the cheap default; query mode caps
-        # at 1000 rows so the page stays renderable on a busy DB.
+        # Rejected candidates: server-side search over the WHOLE
+        # retention window when ``reject_q`` is set (so the operator
+        # can debug why a given symbol never opened, e.g. typing
+        # "TRIA" returns every reason TRIA was rejected over the
+        # last N days). The cycle loop prunes rows older than
+        # REJECTED_RETENTION_DAYS so this stays tractable.
+        REJECTED_RETENTION_DAYS = 7
+        REJECTED_SEARCH_CAP = 5000
         rq = (reject_q or '').strip()
         rejected_total = db.scalar(select(func.count(RejectedCandidate.id)).where(RejectedCandidate.mode == v)) or 0
         rejected_stmt = select(RejectedCandidate).where(RejectedCandidate.mode == v)
@@ -1059,13 +1082,15 @@ def logs_page(
             rejected_stmt = rejected_stmt.where(
                 RejectedCandidate.symbol.ilike(like) | RejectedCandidate.reason.ilike(like)
             )
-            rejected_stmt = rejected_stmt.order_by(desc(RejectedCandidate.id)).limit(1000)
+            rejected_stmt = rejected_stmt.order_by(desc(RejectedCandidate.id)).limit(REJECTED_SEARCH_CAP)
         else:
             rejected_stmt = rejected_stmt.order_by(desc(RejectedCandidate.id)).limit(50)
         rejected = db.scalars(rejected_stmt).all()
         rejected_v = [{'ts': _fmt_ts(r.ts), 'venue': r.exchange, 'symbol': r.symbol, 'reason': r.reason, 'funding_rate': r.funding_rate} for r in rejected]
         ctx['reject_q'] = rq
         ctx['rejected_total'] = rejected_total
+        ctx['retention_days'] = REJECTED_RETENTION_DAYS
+        ctx['search_cap'] = REJECTED_SEARCH_CAP
 
         trades = db.scalars(select(Trade).where(Trade.mode == v).order_by(desc(Trade.id)).limit(30)).all()
         trades_v = [{'ts': _fmt_ts(t.ts), 'symbol': t.symbol, 'exchange': t.exchange, 'leg': t.venue, 'side': t.side, 'quantity': t.quantity, 'price': t.price, 'fee': t.fee} for t in trades]

@@ -58,18 +58,18 @@
 <div class="card">
   <h3>Rejected candidates
     <span class="muted" style="font-size:13px;font-weight:400;">
-      {% if reject_q %}— {{ rejected|length }} match{{ 'es' if rejected|length != 1 else '' }} for "{{ reject_q }}" (out of {{ rejected_total }} total)
-      {% else %}— last 50 of {{ rejected_total }} total
+      {% if reject_q %}— {{ rejected|length }} match{{ 'es' if rejected|length != 1 else '' }} for "{{ reject_q }}" (showing newest first, out of {{ rejected_total }} rows in {{ retention_days }}-day window)
+      {% else %}— {{ rejected_total }} row{{ 's' if rejected_total != 1 else '' }} in last {{ retention_days }} day{{ 's' if retention_days != 1 else '' }} (showing newest 50 — search to query the full window)
       {% endif %}
     </span>
   </h3>
   <form method="get" action="/logs" style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
     <input type="search" name="reject_q" value="{{ reject_q or '' }}"
-           placeholder="Search the entire database (symbol or reason)…"
+           placeholder="Search the full {{ retention_days }}-day window (symbol or reason)…"
            class="table-search" style="width:360px;max-width:100%;">
-    <button type="submit" class="btn">Search</button>
+    <button type="submit" class="btn btn-primary">Search</button>
     {% if reject_q %}<a href="/logs" class="muted" style="font-size:12px;">clear</a>{% endif %}
-    <span class="muted" style="font-size:11px;margin-left:auto;">Server-side · queries the whole {{ view|upper }} history (capped at 1000 rows)</span>
+    <span class="muted" style="font-size:11px;margin-left:auto;">Server-side · {{ view|upper }} history · last {{ retention_days }} days, capped at {{ search_cap }} matches</span>
   </form>
   {% if rejected %}
   <table data-collapse-after="5">
