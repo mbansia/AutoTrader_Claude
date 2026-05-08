@@ -1,18 +1,22 @@
-// Lightweight enhancement for tables across the dashboard.
+// Lightweight enhancement layer for tables across the dashboard.
 //
-// Two layered behaviours:
-// 1) Search + collapse on any element marked `data-searchable` and/or
-//    `data-collapse-after="N"`. Tables: rows are `tbody > tr`. Lists:
-//    direct children with class `log-line`. Search filters rows by
-//    case-insensitive substring on textContent. While a search query is
-//    active, the collapse cap is bypassed so all matches are visible.
-// 2) Sortable headers on every `<table>` with a `<thead>`. Click a `<th>`
-//    to sort the column (text or numeric, auto-detected). Three states
-//    cycle: unsorted (DOM order) → asc → desc → unsorted. Add
-//    `data-no-sort` on a `<th>` to opt that column out (e.g. action
-//    columns whose cell content isn't comparable).
+// Three independent subsystems share a single per-row visibility model so
+// they layer cleanly:
 //
-// No deps. IE11+ syntax kept conservative.
+//   data-match-search       global search input (data-searchable)
+//   data-match-collapse     show-N-rows toggle (data-collapse-after)
+//   data-match-col-filters  per-column filter inputs (auto on every table)
+//
+// A row is visible iff every flag is non-"0". Each subsystem updates its
+// flag and calls applyVisibility(rows). No subsystem touches `hidden`
+// directly — that's the unified output, not the input.
+//
+// Plus: clickable column-header sorting (asc → desc → original DOM order).
+//
+// Opt-outs: `data-no-sort` on a `<th>` skips sort for that column;
+// `data-no-column-filter` on a `<table>` skips the per-column filter row.
+//
+// No deps. Conservative IE11+ syntax.
 
 (function () {
   function getRows(container) {
@@ -24,8 +28,18 @@
     });
   }
 
-  // ─── Layer 1: search + collapse ─────────────────────────────────────
-  function instrument(container) {
+  function applyVisibility(rows) {
+    rows.forEach(function (r) {
+      var hide = r.dataset.matchSearch === '0'
+              || r.dataset.matchCollapse === '0'
+              || r.dataset.matchColFilters === '0';
+      if (hide) r.setAttribute('hidden', '');
+      else r.removeAttribute('hidden');
+    });
+  }
+
+  // ─── Layer 1: global search + collapse ──────────────────────────────
+  function instrumentSearchCollapse(container) {
     var n = parseInt(container.getAttribute('data-collapse-after') || '0', 10);
     var searchable = container.hasAttribute('data-searchable');
     if (!n && !searchable) return;
@@ -41,16 +55,21 @@
       var totalMatching = 0;
       rows.forEach(function (r) {
         var matches = !q || (r.textContent || '').toLowerCase().indexOf(q) !== -1;
+        r.dataset.matchSearch = matches ? '1' : '0';
         if (matches) totalMatching++;
       });
       var matchIdx = 0;
       rows.forEach(function (r) {
-        var matches = !q || (r.textContent || '').toLowerCase().indexOf(q) !== -1;
+        if (r.dataset.matchSearch !== '1') return;
         var collapseHide = !state.expanded && !q && n > 0 && matchIdx >= n;
-        if (matches) matchIdx++;
-        if (!matches || collapseHide) r.setAttribute('hidden', '');
-        else r.removeAttribute('hidden');
+        r.dataset.matchCollapse = collapseHide ? '0' : '1';
+        matchIdx++;
       });
+      // Rows that didn't match search still need a definite collapse flag.
+      rows.forEach(function (r) {
+        if (r.dataset.matchSearch !== '1') r.dataset.matchCollapse = '1';
+      });
+      applyVisibility(rows);
       if (toggle) {
         if (q || totalMatching <= n) {
           toggle.style.display = 'none';
@@ -98,13 +117,14 @@
       afterAnchor.parentNode.insertBefore(toggle, afterAnchor.nextSibling);
     }
 
+    rows.forEach(function (r) {
+      r.dataset.matchSearch = '1';
+      r.dataset.matchCollapse = '1';
+    });
     recompute();
   }
 
   // ─── Layer 2: sortable headers ──────────────────────────────────────
-  // Numeric detector: strip $, %, +/-, commas, surrounding whitespace, and
-  // try parseFloat. Empty-string-like values (—, n/a) sort as -Infinity
-  // ascending so they cluster at the bottom on desc / top on asc.
   function parseNumeric(s) {
     if (s == null) return null;
     var t = String(s).replace(/[\s,$%]/g, '').replace(/^([+\-]?)(.*)$/, '$1$2');
@@ -128,10 +148,7 @@
     if (!headerRow) return;
     var ths = Array.prototype.slice.call(headerRow.children);
     if (!ths.length) return;
-    // Capture original DOM order so the third click reverts to it. We
-    // tag each row with its original index; if rows appear/disappear
-    // (server-side re-render) the next click reads the fresh order.
-    var sortState = { col: -1, dir: 0 };  // dir: 0 unsorted, 1 asc, -1 desc
+    var sortState = { col: -1, dir: 0 };
 
     function snapshotOrder() {
       var rows = Array.prototype.slice.call(tbody.children);
@@ -142,7 +159,6 @@
 
     function sortByColumn(idx) {
       var rows = Array.prototype.slice.call(tbody.children);
-      // Sample numeric-ness: if every non-empty cell parses, treat numeric.
       var allNumeric = true;
       var sampled = 0;
       for (var i = 0; i < rows.length && sampled < 10; i++) {
@@ -159,7 +175,7 @@
           var an = parseNumeric(av);
           var bn = parseNumeric(bv);
           if (an === null && bn === null) return 0;
-          if (an === null) return 1;     // empties sink in asc
+          if (an === null) return 1;
           if (bn === null) return -1;
           return dir * (an - bn);
         }
@@ -186,8 +202,6 @@
 
     ths.forEach(function (th, idx) {
       if (th.hasAttribute('data-no-sort')) return;
-      // Skip headers whose body cells appear to be controls only
-      // (buttons / forms) — they have no comparable content.
       th.classList.add('sortable');
       th.setAttribute('role', 'button');
       th.setAttribute('tabindex', '0');
@@ -217,8 +231,79 @@
     });
   }
 
+  // ─── Layer 3: per-column filter inputs ──────────────────────────────
+  // Injects a second <tr> into <thead> with one <th> per column. Each
+  // <th> has a small <input type="search">; typing narrows visible
+  // rows to those whose cell at that column contains the substring
+  // (case-insensitive). Multiple column filters AND together. Combined
+  // with the global search + collapse via the shared visibility model.
+  function instrumentColumnFilters(table) {
+    if (table.hasAttribute('data-no-column-filter')) return;
+    var thead = table.querySelector(':scope > thead');
+    var tbody = table.querySelector(':scope > tbody');
+    if (!thead || !tbody) return;
+    var headerRow = thead.querySelector(':scope > tr');
+    if (!headerRow) return;
+    var ths = Array.prototype.slice.call(headerRow.children);
+    if (!ths.length) return;
+
+    // Build the filter row mirroring the header column count.
+    var filterRow = document.createElement('tr');
+    filterRow.className = 'col-filter-row';
+    var filterValues = ths.map(function () { return ''; });
+
+    var rowsRef = [];
+
+    function recompute() {
+      // Refresh rows snapshot in case sort reordered them in-place
+      // (sort uses appendChild so the live HTMLCollection still works,
+      // but cells indices are stable).
+      rowsRef = Array.prototype.slice.call(tbody.children);
+      rowsRef.forEach(function (r) {
+        var pass = true;
+        for (var i = 0; i < filterValues.length; i++) {
+          var q = filterValues[i];
+          if (!q) continue;
+          var v = cellValue(r, i).toLowerCase();
+          if (v.indexOf(q) === -1) { pass = false; break; }
+        }
+        r.dataset.matchColFilters = pass ? '1' : '0';
+      });
+      applyVisibility(rowsRef);
+    }
+
+    ths.forEach(function (th, idx) {
+      var cell = document.createElement('th');
+      cell.className = 'col-filter-cell';
+      var input = document.createElement('input');
+      input.type = 'search';
+      input.className = 'col-filter-input';
+      input.setAttribute('aria-label', 'Filter ' + ((th.textContent || '').trim() || ('column ' + (idx + 1))));
+      input.placeholder = 'filter…';
+      // Stop click events here from bubbling to the sortable header
+      // sitting above (otherwise typing into the filter would also
+      // trigger a sort cycle on every focus click).
+      input.addEventListener('click', function (e) { e.stopPropagation(); });
+      input.addEventListener('keydown', function (e) { e.stopPropagation(); });
+      input.addEventListener('input', function () {
+        filterValues[idx] = input.value.toLowerCase().trim();
+        recompute();
+      });
+      cell.appendChild(input);
+      filterRow.appendChild(cell);
+    });
+    thead.appendChild(filterRow);
+
+    // Initialize all rows to "passing" so the unified visibility model
+    // doesn't hide them before any filter is typed.
+    Array.prototype.slice.call(tbody.children).forEach(function (r) {
+      r.dataset.matchColFilters = '1';
+    });
+  }
+
   document.addEventListener('DOMContentLoaded', function () {
-    document.querySelectorAll('[data-searchable], [data-collapse-after]').forEach(instrument);
+    document.querySelectorAll('[data-searchable], [data-collapse-after]').forEach(instrumentSearchCollapse);
     document.querySelectorAll('table').forEach(instrumentSort);
+    document.querySelectorAll('table').forEach(instrumentColumnFilters);
   });
 })();
