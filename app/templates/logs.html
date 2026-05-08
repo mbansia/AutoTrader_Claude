@@ -56,9 +56,23 @@
 </div>
 
 <div class="card">
-  <h3>Rejected candidates (last 50)</h3>
+  <h3>Rejected candidates
+    <span class="muted" style="font-size:13px;font-weight:400;">
+      {% if reject_q %}— {{ rejected|length }} match{{ 'es' if rejected|length != 1 else '' }} for "{{ reject_q }}" (out of {{ rejected_total }} total)
+      {% else %}— last 50 of {{ rejected_total }} total
+      {% endif %}
+    </span>
+  </h3>
+  <form method="get" action="/logs" style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;">
+    <input type="search" name="reject_q" value="{{ reject_q or '' }}"
+           placeholder="Search the entire database (symbol or reason)…"
+           class="table-search" style="width:360px;max-width:100%;">
+    <button type="submit" class="btn">Search</button>
+    {% if reject_q %}<a href="/logs" class="muted" style="font-size:12px;">clear</a>{% endif %}
+    <span class="muted" style="font-size:11px;margin-left:auto;">Server-side · queries the whole {{ view|upper }} history (capped at 1000 rows)</span>
+  </form>
   {% if rejected %}
-  <table data-searchable data-collapse-after="5">
+  <table data-collapse-after="5">
     <thead><tr>
       <th>Time</th>
       <th>Venue</th>
@@ -78,6 +92,8 @@
     {% endfor %}
     </tbody>
   </table>
+  {% elif reject_q %}
+  <div class="empty">No rejected candidates match "{{ reject_q }}" in {{ view|upper }} history.</div>
   {% else %}
   <div class="empty">Nothing rejected yet.</div>
   {% endif %}

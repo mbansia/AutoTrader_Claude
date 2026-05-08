@@ -3,7 +3,7 @@
 Every per-row table carries a :data:`mode` tag (``'paper'`` or
 ``'live'``) so the same DB cleanly serves both views. Aggregate tables
 (:class:`StrategyConfig`, :class:`RuntimeState`) are single-row
-singletons; :class:`ModeState` and :class:`EarnState` are keyed by mode.
+singletons; :class:`ModeState` and :class:`StrategyState` are keyed by mode.
 
 Schema versioning is in-place via :func:`app.db.run_schema_migrations`
 which adds new columns with defaults. We never destructively alter
@@ -115,6 +115,10 @@ class Position(Base):
     symbol: Mapped[str] = mapped_column(String(32), index=True)
     spot_symbol: Mapped[str] = mapped_column(String(32))
     perp_symbol: Mapped[str] = mapped_column(String(32))
+    # Quote currency the position trades against — 'USDT' or 'USDC'.
+    # Tracked separately because the bot never cross-funds: a USDC
+    # entry only consumes USDC free balance, exits return to USDC, etc.
+    quote_currency: Mapped[str] = mapped_column(String(8), default='USDT', index=True)
     quantity: Mapped[float] = mapped_column(Float)
     opened_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     status: Mapped[str] = mapped_column(String(16), default='open', index=True)
@@ -262,12 +266,7 @@ class StrategyConfig(Base):
     max_exit_basis_bps: Mapped[float] = mapped_column(Float, default=5.0)
     enforce_hedge_check: Mapped[bool] = mapped_column(Boolean, default=True)
     delisting_check: Mapped[bool] = mapped_column(Boolean, default=True)
-    # Earn / Binance Simple Earn Flexible USDT sweep.
-    earn_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
-    earn_idle_threshold_usdt: Mapped[float] = mapped_column(Float, default=1.0)
-    earn_paper_apr: Mapped[float] = mapped_column(Float, default=0.05)
-    # Live-only: auto-move USDT spot↔futures so the perp leg always has margin
-    # and idle USDT ends up back in spot for Earn sweeping.
+    # Live-only: auto-move USDT spot↔futures so the perp leg always has margin.
     auto_transfer_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     # Continuous spot ↔ futures rebalance: keep both wallets' free balances near
     # equal each cycle. Threshold is the minimum imbalance (USDT) before we move.
@@ -284,26 +283,6 @@ class StrategyConfig(Base):
     # 1x is the only safe choice for a delta-neutral arb (perp margin ==
     # spot notional). Bump only if you understand the liquidation math.
     max_perp_leverage: Mapped[int] = mapped_column(Integer, default=1)
-    # Max share of total Binance equity that may be auto-converted to
-    # BFUSD (Binance's yield-bearing margin asset under Portfolio Margin).
-    # The cap is a safety throttle on rollout: BFUSD redeems are usually
-    # instant but can queue under stress, so we keep some plain USDT for
-    # immediate-deploy. Default 0.20 (20% of equity); bump to 0.80 once
-    # BFUSD redemption behaviour has been observed under your trading load.
-    binance_max_bfusd_pct: Mapped[float] = mapped_column(Float, default=0.20)
-    # Enable KuCoin auto-lend for USDT (sub-account API key calls
-    # /api/v1/margin/toggle-auto-lend). When on, idle USDT in the
-    # margin / unified pool is auto-lent to margin traders and earns
-    # variable interest. Under UTA the lent portion still counts as
-    # cross-margin collateral; under Classic margin the funds are
-    # locked for the lend term (7d default) so auto-lend is best on
-    # UTA. Default True — the bot retries the toggle on every startup
-    # so the setting always converges to what the operator wants.
-    kucoin_auto_lend_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    # Subscribe base assets (SOL, ETH, etc.) to Binance Simple Earn Flexible after
-    # the spot buy fills. Default off — opt-in because not every asset has a
-    # flexible product and redeem-on-close is one extra failure mode.
-    earn_subscribe_spot_assets: Mapped[bool] = mapped_column(Boolean, default=False)
     # Leverage for the perp leg. 1x is the only safe choice for a hedge — keeps
     # the perp's used margin equal to its notional, matching the spot leg.
     perp_leverage: Mapped[int] = mapped_column(Integer, default=1)
@@ -361,17 +340,5 @@ class ScanResult(Base):
     note: Mapped[str] = mapped_column(Text, default='')
 
 
-class EarnState(Base):
-    """Per-(mode, venue) tracking of USDT in earn surfaces (Binance Simple
-    Earn flexible, KuCoin funding-wallet auto-lend, paper-simulated). The
-    composite primary key is critical: a single shared row across venues
-    causes each gateway's refresh to overwrite the previous, producing
-    nonsense aggregate balances and runaway cumulative_yield deltas."""
-    __tablename__ = 'earn_state'
-    mode: Mapped[str] = mapped_column(String(8), primary_key=True)
-    exchange: Mapped[str] = mapped_column(String(16), primary_key=True, default=VENUE_BINANCE)
-    deployed_usdt: Mapped[float] = mapped_column(Float, default=0.0)
-    cumulative_yield_usdt: Mapped[float] = mapped_column(Float, default=0.0)
-    last_accrual_ts: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    last_error: Mapped[str] = mapped_column(Text, default='')
-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+# EarnState removed — see archive/yield/README.md. The `earn_state` table
+# may still exist in legacy DBs from before the rip; it is unreferenced.

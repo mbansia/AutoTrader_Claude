@@ -48,8 +48,6 @@ from sqlalchemy import desc, func, select
 
 from app.bot import (
     _position_leg_states,
-    get_all_earn_states,
-    get_earn_state,
     get_mode_state,
     get_runtime_state,
     get_strategy_config,
@@ -78,7 +76,6 @@ from app.models import (
     BalanceSnapshot,
     BotEvent,
     CapitalFlow,
-    EarnState,
     EquityCurve,
     ModeState,
     Position,
@@ -159,12 +156,6 @@ def startup() -> None:
         get_strategy_config(db)
         for m in ALL_MODES:
             get_mode_state(db, m)
-            # Bootstrap one EarnState row per venue so the per-(mode, venue)
-            # composite key is populated and the dashboard finds something
-            # to read on first render. Live venues we know about explicitly
-            # plus a 'paper' pseudo-venue for the paper mode display.
-            for vid in ('binance', 'kucoin', 'paper'):
-                get_earn_state(db, m, exchange=vid)
         db.commit()
     if os.environ.get('BOT_WORKER_ENABLED', '1') not in ('0', 'false', 'False', ''):
         _start_worker()
@@ -224,24 +215,29 @@ def _current_equity(db, mode: str, gateways=None) -> tuple[float, str, bool]:
         venues_seen: list[str] = []
         for gw in gateways:
             bals = gw.safe_balances() or {}
-            spot_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
-            fut_usdt = float((bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
+            # USDT counts at face value; USDC priced at live USDC/USDT
+            # mid (1.0 fallback if the ticker isn't reachable).
+            try:
+                usdc_rate = gw.safe_price('USDC/USDT') or 1.0
+                if not (0.5 < usdc_rate < 2.0):
+                    usdc_rate = 1.0
+            except Exception:
+                usdc_rate = 1.0
+            usdt_total = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0) \
+                       + float((bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
+            usdc_total = float((bals.get('spot', {}).get('USDC') or {}).get('total') or 0) \
+                       + float((bals.get('futures', {}).get('USDC') or {}).get('total') or 0)
             spot_assets = 0.0
             META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
             for asset, bal in (bals.get('spot') or {}).items():
-                if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+                if asset in META_KEYS or asset in ('USDT', 'USDC') or not isinstance(bal, dict):
                     continue
                 qty = float(bal.get('total') or 0)
                 if qty <= 0:
                     continue
                 px = gw.safe_price(f'{asset}/USDT') or 0
                 spot_assets += qty * px
-            try:
-                earn_usdt, _ = gw.earn_balance_usdt()
-                earn_usdt = earn_usdt or 0.0
-            except Exception:
-                earn_usdt = 0.0
-            total += spot_usdt + fut_usdt + spot_assets + earn_usdt
+            total += usdt_total + (usdc_total * usdc_rate) + spot_assets
             venues_seen.append(gw.venue_id)
         return total, f'live aggregate across {", ".join(venues_seen)}', False
     snap = db.scalar(select(BalanceSnapshot).where(BalanceSnapshot.source == mode).order_by(desc(BalanceSnapshot.id)).limit(1))
@@ -628,78 +624,6 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         stuck_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == v, Position.last_close_error != '')).all()
         ctx['stuck_positions'] = [{'symbol': p.symbol, 'err': p.last_close_error[:160]} for p in stuck_positions]
 
-        # Earn aggregation. ``deployed`` is read live per venue (single
-        # source of truth — the API) so the dashboard never shows a value
-        # larger than equity due to a stale cache. ``cumulative_yield``
-        # comes from the EarnState rows because that's only place we
-        # accumulate it. The earlier "126% coverage" bug was the deployed
-        # cache drifting above reality after several sweep / refresh
-        # races; reading live API removes the drift entirely.
-        earn_states = get_all_earn_states(db, v)
-        earn_yield_by_venue = {es.exchange: es.cumulative_yield_usdt for es in earn_states}
-        earn_err_by_venue = {es.exchange: es.last_error for es in earn_states if es.last_error}
-        earn_first_accrual_by_venue = {es.exchange: es.last_accrual_ts for es in earn_states if es.last_accrual_ts}
-        earn_deployed_by_venue: dict[str, float] = {}
-        if v == MODE_LIVE and gateways:
-            for gw in gateways:
-                try:
-                    bal, _ = gw.earn_balance_usdt()
-                    earn_deployed_by_venue[gw.venue_id] = bal or 0.0
-                except Exception:
-                    earn_deployed_by_venue[gw.venue_id] = 0.0
-        else:
-            # Paper mode: trust the EarnState cache (the bot synthesises yield).
-            earn_deployed_by_venue = {es.exchange: es.deployed_usdt for es in earn_states}
-        earn_total = sum(earn_deployed_by_venue.values())
-        earn_yield_total = sum(earn_yield_by_venue.values())
-
-        # Source label per venue — what's actually generating the yield?
-        # Lets the dashboard say "BFUSD mint" or "KuCoin auto-lend" rather
-        # than the generic "Earn".
-        EARN_SOURCE_LABEL = {
-            'binance': 'BFUSD',
-            'kucoin': 'auto-lent USDT',
-            'paper': 'simulated',
-        }
-        # Realised APY estimate per venue. Uses the EarnState's first-
-        # accrual timestamp as the start point and divides cumulative
-        # yield by the days deployed × current balance to get an
-        # annualised rate. Returns None when there's not enough history
-        # (less than 1 day) so we don't show meaningless extrapolation.
-        def _estimate_apy(deployed: float, income: float, since: datetime | None) -> float | None:
-            if deployed <= 0.01 or since is None:
-                return None
-            days = max(0.0, (datetime.utcnow() - since).total_seconds() / 86400.0)
-            if days < 1.0:
-                return None
-            return (income / deployed) * (365.0 / days)
-
-        per_venue_earn = {}
-        for vid in set(earn_deployed_by_venue) | set(earn_yield_by_venue):
-            deployed = earn_deployed_by_venue.get(vid, 0.0)
-            income = earn_yield_by_venue.get(vid, 0.0)
-            apy = _estimate_apy(deployed, income, earn_first_accrual_by_venue.get(vid))
-            per_venue_earn[vid] = {
-                'deployed': deployed,
-                'income': income,
-                'source': EARN_SOURCE_LABEL.get(vid, vid),
-                'realised_apy': apy,  # None or float (e.g. 0.045 = 4.5%)
-            }
-        # Pool-wide APY estimate.
-        pool_apy = _estimate_apy(
-            earn_total,
-            earn_yield_total,
-            min(earn_first_accrual_by_venue.values()) if earn_first_accrual_by_venue else None,
-        )
-        ctx['earn'] = {
-            'enabled': cfg.earn_enabled,
-            'deployed': earn_total,
-            'cumulative_yield': earn_yield_total,
-            'last_error': '; '.join(earn_err_by_venue.values()),
-            'per_venue': per_venue_earn,
-            'realised_apy': pool_apy,
-        }
-
         # Fees paid across every trade in this mode. Avg fee % = total fees
         # / total notional, the realistic round-trip cost the bot is paying.
         # Notional is computed inline (Trade has quantity + price; no stored
@@ -733,7 +657,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             ),
         }
 
-        breakdown_items = equity_breakdown(db, gateways, v, earn_total)
+        breakdown_items = equity_breakdown(db, gateways, v)
         if v == MODE_PAPER:
             tracked = sum(max(0.0, i['value']) for i in breakdown_items)
             free_cash = max(0.0, current_equity - tracked)
@@ -767,24 +691,36 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             free_breakdown: list[dict] = []
             for g in gateways:
                 bals_for_display = g.safe_balances() or {}
-                gw_spot_free = float((bals_for_display.get('spot', {}).get('USDT') or {}).get('free') or 0)
-                gw_fut_free = float((bals_for_display.get('futures', {}).get('USDT') or {}).get('free') or 0)
-                gw_fut_total = float((bals_for_display.get('futures', {}).get('USDT') or {}).get('total') or 0)
-                gw_earn = earn_deployed_by_venue.get(g.venue_id, 0.0)
-                spot_free_total += gw_spot_free
-                # Only credit the futures wallet's free amount when it's
-                # genuinely a separate pool (Classic) — under unified
-                # margin spot already covers it.
-                if gw_fut_total > 0.001:
-                    fut_free_total += gw_fut_free
-                    free_breakdown.append({'label': f'{g.name} · USDT (spot)', 'value': gw_spot_free})
-                    free_breakdown.append({'label': f'{g.name} · USDT (futures)', 'value': gw_fut_free})
-                else:
-                    # Unified margin — single line, not split.
-                    free_breakdown.append({'label': f'{g.name} · USDT (unified pool)', 'value': gw_spot_free})
-                if gw_earn > 0:
-                    earn_label = 'BFUSD' if g.venue_id == 'binance' else ('USDT (auto-lent)' if g.venue_id == 'kucoin' else 'earn')
-                    free_breakdown.append({'label': f'{g.name} · {earn_label}', 'value': gw_earn})
+                # USDC priced at the live USDC/USDT mid (1.0 fallback).
+                # The bot never cross-funds USDT ↔ USDC for sizing — the
+                # rate is only used here to express both as USDT for the
+                # headline equity/free figure.
+                try:
+                    rate = g.safe_price('USDC/USDT') or 1.0
+                    if not (0.5 < rate < 2.0):
+                        rate = 1.0
+                except Exception:
+                    rate = 1.0
+                for q in ('USDT', 'USDC'):
+                    spot_free_native = float((bals_for_display.get('spot', {}).get(q) or {}).get('free') or 0)
+                    fut_free_native = float((bals_for_display.get('futures', {}).get(q) or {}).get('free') or 0)
+                    fut_total_native = float((bals_for_display.get('futures', {}).get(q) or {}).get('total') or 0)
+                    if spot_free_native <= 0.001 and fut_free_native <= 0.001:
+                        continue
+                    rate_q = rate if q == 'USDC' else 1.0
+                    rate_note = '' if q == 'USDT' else f' × {rate_q:.4f}'
+                    if fut_total_native > 0.001:
+                        # Classic — separate spot + futures wallets.
+                        fut_free_total += fut_free_native * rate_q
+                        spot_free_total += spot_free_native * rate_q
+                        if spot_free_native > 0.001:
+                            free_breakdown.append({'label': f'{g.name} · {q} (spot)', 'value': spot_free_native * rate_q, 'native': spot_free_native, 'asset': q, 'note': rate_note})
+                        if fut_free_native > 0.001:
+                            free_breakdown.append({'label': f'{g.name} · {q} (futures)', 'value': fut_free_native * rate_q, 'native': fut_free_native, 'asset': q, 'note': rate_note})
+                    else:
+                        # Unified margin — single line.
+                        spot_free_total += spot_free_native * rate_q
+                        free_breakdown.append({'label': f'{g.name} · {q} (unified pool)', 'value': spot_free_native * rate_q, 'native': spot_free_native, 'asset': q, 'note': rate_note})
             ctx['live_spot_free'] = spot_free_total
             ctx['live_fut_free'] = fut_free_total
             ctx['free_deployable_breakdown'] = free_breakdown
@@ -1075,7 +1011,13 @@ def transactions_page(request: Request, view: str | None = None, limit: int = 10
 
 
 @app.get('/logs', response_class=HTMLResponse)
-def logs_page(request: Request, view: str | None = None, view_cookie: str | None = Cookie(default=None, alias='view'), _: None = Depends(auth)):
+def logs_page(
+    request: Request,
+    view: str | None = None,
+    view_cookie: str | None = Cookie(default=None, alias='view'),
+    reject_q: str | None = None,
+    _: None = Depends(auth),
+):
     v = _resolve_view(view, view_cookie)
     with SessionLocal() as db:
         ctx = _shared_ctx(request, v, db)
@@ -1104,8 +1046,26 @@ def logs_page(request: Request, view: str | None = None, view_cookie: str | None
         events = db.scalars(select(BotEvent).where(BotEvent.mode == v).order_by(desc(BotEvent.id)).limit(100)).all()
         events_v = [{'ts': _fmt_ts(e.ts), 'venue': e.exchange, 'level': e.level, 'message': e.message} for e in events]
 
-        rejected = db.scalars(select(RejectedCandidate).where(RejectedCandidate.mode == v).order_by(desc(RejectedCandidate.id)).limit(50)).all()
+        # Rejected candidates: server-side search over the WHOLE table
+        # when ``reject_q`` is set (so the operator can debug why a given
+        # symbol never got opened across the full history). No-query
+        # mode shows the last 50 as the cheap default; query mode caps
+        # at 1000 rows so the page stays renderable on a busy DB.
+        rq = (reject_q or '').strip()
+        rejected_total = db.scalar(select(func.count(RejectedCandidate.id)).where(RejectedCandidate.mode == v)) or 0
+        rejected_stmt = select(RejectedCandidate).where(RejectedCandidate.mode == v)
+        if rq:
+            like = f'%{rq}%'
+            rejected_stmt = rejected_stmt.where(
+                RejectedCandidate.symbol.ilike(like) | RejectedCandidate.reason.ilike(like)
+            )
+            rejected_stmt = rejected_stmt.order_by(desc(RejectedCandidate.id)).limit(1000)
+        else:
+            rejected_stmt = rejected_stmt.order_by(desc(RejectedCandidate.id)).limit(50)
+        rejected = db.scalars(rejected_stmt).all()
         rejected_v = [{'ts': _fmt_ts(r.ts), 'venue': r.exchange, 'symbol': r.symbol, 'reason': r.reason, 'funding_rate': r.funding_rate} for r in rejected]
+        ctx['reject_q'] = rq
+        ctx['rejected_total'] = rejected_total
 
         trades = db.scalars(select(Trade).where(Trade.mode == v).order_by(desc(Trade.id)).limit(30)).all()
         trades_v = [{'ts': _fmt_ts(t.ts), 'symbol': t.symbol, 'exchange': t.exchange, 'leg': t.venue, 'side': t.side, 'quantity': t.quantity, 'price': t.price, 'fee': t.fee} for t in trades]
@@ -1171,8 +1131,6 @@ def save_config(
     min_position_pct_pct: float = Form(...),
     max_position_pct_pct: float = Form(...),
     futures_buffer_pct_pct: float = Form(...),
-    binance_max_bfusd_pct_pct: float = Form(...),
-    earn_paper_apr_pct: float = Form(...),
     # Plain integer / decimal fields below.
     min_24h_quote_volume: float = Form(...),
     max_open_positions: int = Form(...),
@@ -1186,12 +1144,8 @@ def save_config(
     max_exit_basis_bps: float = Form(...),
     enforce_hedge_check: int = Form(...),
     delisting_check: int = Form(...),
-    earn_enabled: int = Form(...),
-    earn_idle_threshold_usdt: float = Form(...),
     auto_transfer_enabled: int = Form(...),
-    earn_subscribe_spot_assets: int = Form(0),
     max_perp_leverage: int = Form(1),
-    kucoin_auto_lend_enabled: int = Form(1),
     min_order_book_depth_usdt: float = Form(500.0),
     depth_band_bps: float = Form(10.0),
     _: None = Depends(auth),
@@ -1205,8 +1159,6 @@ def save_config(
         cfg.min_position_pct = min_position_pct_pct / 100.0
         cfg.max_position_pct = max_position_pct_pct / 100.0
         cfg.futures_buffer_pct = max(0.05, min(1.0, futures_buffer_pct_pct / 100.0))
-        cfg.binance_max_bfusd_pct = max(0.0, min(1.0, binance_max_bfusd_pct_pct / 100.0))
-        cfg.earn_paper_apr = earn_paper_apr_pct / 100.0
         # Plain values.
         cfg.min_24h_quote_volume = min_24h_quote_volume
         cfg.max_open_positions = max_open_positions
@@ -1220,14 +1172,10 @@ def save_config(
         cfg.max_exit_basis_bps = max_exit_basis_bps
         cfg.enforce_hedge_check = bool(enforce_hedge_check)
         cfg.delisting_check = bool(delisting_check)
-        cfg.earn_enabled = bool(earn_enabled)
-        cfg.earn_idle_threshold_usdt = earn_idle_threshold_usdt
         cfg.auto_transfer_enabled = bool(auto_transfer_enabled)
-        cfg.earn_subscribe_spot_assets = bool(earn_subscribe_spot_assets)
         new_lev = max(1, max_perp_leverage or 1)
         cfg.max_perp_leverage = new_lev
         cfg.perp_leverage = new_lev  # legacy mirror
-        cfg.kucoin_auto_lend_enabled = bool(kucoin_auto_lend_enabled)
         cfg.min_order_book_depth_usdt = max(0.0, min_order_book_depth_usdt)
         cfg.depth_band_bps = max(1.0, depth_band_bps)
         db.commit()
@@ -1339,42 +1287,6 @@ def _gather_exchange_status() -> list[dict]:
     if has_creds and bn_active:
         probes.append(_probe('Spot fetch_balance()', lambda: gw.spot.fetch_balance()))
         probes.append(_probe('Futures fetch_balance()', lambda: gw.futures.fetch_balance()))
-        probes.append(_probe('Earn flexible USDT position', lambda: gw._call_sapi((
-            'sapiV1GetSimpleEarnFlexiblePosition',
-            'sapi_v1_get_simple_earn_flexible_position',
-            'sapiGetSimpleEarnFlexiblePosition',
-        ), {'asset': 'USDT'})))
-        # BFUSD debug probes — surface every earn surface that COULD list
-        # BFUSD so the operator can see where it actually lives. Different
-        # product types (flexible / locked / lending-project / auto-invest
-        # target asset) live under different SAPI endpoints. Whichever
-        # one shows BFUSD is the one the bot should subscribe through.
-        probes.append(_probe('BFUSD: simple-earn flexible list', lambda: gw._call_sapi((
-            'sapiV1GetSimpleEarnFlexibleList',
-            'sapi_v1_get_simple_earn_flexible_list',
-            'sapiGetSimpleEarnFlexibleList',
-        ), {'asset': 'BFUSD'})))
-        probes.append(_probe('BFUSD: simple-earn locked list', lambda: gw._call_sapi((
-            'sapiV1GetSimpleEarnLockedList',
-            'sapi_v1_get_simple_earn_locked_list',
-            'sapiGetSimpleEarnLockedList',
-        ), {'asset': 'BFUSD'})))
-        probes.append(_probe('BFUSD: simple-earn flexible list (no asset filter, paged)', lambda: gw._call_sapi((
-            'sapiV1GetSimpleEarnFlexibleList',
-            'sapi_v1_get_simple_earn_flexible_list',
-            'sapiGetSimpleEarnFlexibleList',
-        ), {'size': 100})))
-        probes.append(_probe('BFUSD: lending daily product list (legacy)', lambda: gw._call_sapi((
-            'sapiV1GetLendingDailyProductList',
-            'sapi_v1_get_lending_daily_product_list',
-            'sapiGetLendingDailyProductList',
-        ), {'asset': 'BFUSD'})))
-        probes.append(_probe('BFUSD: auto-invest target assets', lambda: gw._call_sapi((
-            'sapiV1GetLendingAutoInvestTargetAssetList',
-            'sapi_v1_get_lending_auto_invest_target_asset_list',
-            'sapiGetLendingAutoInvestTargetAssetList',
-        ), {})))
-        probes.append(_probe('BFUSD: papi balance (current holdings)', lambda: (gw._papi(gw.spot, ('papiGetBalance', 'papi_get_balance'))({'asset': 'BFUSD'}) if gw._papi(gw.spot, ('papiGetBalance', 'papi_get_balance')) else 'papiGetBalance not in this ccxt build')))
         probes.append(_probe('Deposit history (USDT, 30d)', lambda: gw.deposit_history('USDT', lookback_days=30, ttl_seconds=0)))
         probes.append(_probe('Withdrawal history (USDT, 30d)', lambda: gw.withdrawal_history('USDT', lookback_days=30, ttl_seconds=0)))
         probes.append(_probe('Sub-account transfer in (USDT, 30d)', lambda: gw.sub_account_transfer_history('USDT', incoming=True, lookback_days=30, ttl_seconds=0)))
@@ -1399,7 +1311,7 @@ def _gather_exchange_status() -> list[dict]:
             'rows': gw.list_capital_flow_records(lookback_days=30),
             'errors': gw.last_history_errors,
         }))
-        # Capital subtotal: cash + spot assets + futures + earn (all USDT-denominated).
+        # Capital subtotal: cash + spot assets + futures (all USDT-denominated).
         bals = gw.safe_balances() or {}
         spot_usdt = float((bals.get('spot', {}).get('USDT') or {}).get('total') or 0)
         fut_usdt = float((bals.get('futures', {}).get('USDT') or {}).get('total') or 0)
@@ -1413,15 +1325,12 @@ def _gather_exchange_status() -> list[dict]:
                 continue
             px = gw.safe_price(f'{asset}/USDT') or 0
             spot_assets += qty * px
-        earn_usdt, _ = gw.earn_balance_usdt()
-        earn_usdt = earn_usdt or 0.0
         capital_breakdown = [
             {'label': 'Spot · USDT', 'value': spot_usdt},
             {'label': 'Spot · assets', 'value': spot_assets},
             {'label': 'Futures · USDT', 'value': fut_usdt},
-            {'label': 'Earn · USDT', 'value': earn_usdt},
         ]
-        capital_subtotal = spot_usdt + spot_assets + fut_usdt + earn_usdt
+        capital_subtotal = spot_usdt + spot_assets + fut_usdt
     bn_account_label = bn_account_detail = ''
     if has_creds and bn_active:
         try:
@@ -1490,18 +1399,12 @@ def _gather_exchange_status() -> list[dict]:
                 continue
             px = kgw.safe_price(f'{asset}/USDT') or 0
             kc_spot_assets += qty * px
-        # KuCoin's "earn" surface is the funding (main) wallet — that's
-        # where auto-lend / Pool-X draws idle USDT from. Pull it via the
-        # gateway so the cached balance dict is reused (no extra round-trip).
-        kc_earn_usdt, _ = kgw.earn_balance_usdt()
-        kc_earn_usdt = kc_earn_usdt or 0.0
         kc_capital_breakdown = [
             {'label': 'Spot · USDT (trade wallet)', 'value': kc_spot_usdt},
             {'label': 'Spot · assets', 'value': kc_spot_assets},
             {'label': 'Futures · USDT (contract wallet)', 'value': kc_fut_usdt},
-            {'label': 'Earn · USDT (main / funding wallet)', 'value': kc_earn_usdt},
         ]
-        kc_capital_subtotal = kc_spot_usdt + kc_spot_assets + kc_fut_usdt + kc_earn_usdt
+        kc_capital_subtotal = kc_spot_usdt + kc_spot_assets + kc_fut_usdt
     kc_account_label = kc_account_detail = ''
     if kc_configured and kc_active:
         try:
@@ -1545,13 +1448,10 @@ def _gather_exchange_status() -> list[dict]:
         'role': 'cross-asset / equities (future) — for high-funding stock perps like INCL, MSTR',
     })
 
-    # ---- Onchain (future — DEX perps + lending) -----------------------
-    # Hyperliquid, Drift, Aevo, GMX-class venues let us trade perps with
-    # collateral that simultaneously earns yield (USDC.e on Aave, sUSDe,
-    # etc.) — exactly the "yield + liquidation buffer" combo the user
-    # asked about. Wallet keys + RPC endpoint go here once we pick a
-    # primary protocol. Placeholder section so the maintenance UI shows
-    # the venue is on the roadmap.
+    # ---- Onchain (future — DEX perps) ---------------------------------
+    # Hyperliquid, Drift, Aevo, GMX-class venues. Wallet keys + RPC endpoint
+    # go here once we pick a primary protocol. Placeholder section so the
+    # maintenance UI shows the venue is on the roadmap.
     sections.append({
         'name': 'Onchain',
         'venue_id': 'onchain',
@@ -1572,7 +1472,7 @@ def _gather_exchange_status() -> list[dict]:
 @app.get('/monitoring/export.md', response_class=PlainTextResponse)
 def monitoring_export(view: str | None = None, view_cookie: str | None = Cookie(default=None, alias='view'), _: None = Depends(auth)):
     """Single-shot markdown dump of the bot's full state for diagnostic
-    sharing. Includes: configuration, mode/earn states, open + closed
+    sharing. Includes: configuration, mode states, open + closed
     positions (with leg states), recent trades / events / capital flows,
     equity composition, current Binance probe results, and the outbound IP.
 
@@ -1617,14 +1517,6 @@ def _render_export_md(v: str) -> str:
         cfg = get_strategy_config(db)
         paper_state = get_mode_state(db, MODE_PAPER)
         live_state = get_mode_state(db, MODE_LIVE)
-        # Aggregate across venues so the export captures the full pool,
-        # not just one venue's slice.
-        paper_earn_states = get_all_earn_states(db, MODE_PAPER)
-        live_earn_states = get_all_earn_states(db, MODE_LIVE)
-        paper_earn_deployed = sum(es.deployed_usdt for es in paper_earn_states)
-        paper_earn_yield = sum(es.cumulative_yield_usdt for es in paper_earn_states)
-        live_earn_deployed = sum(es.deployed_usdt for es in live_earn_states)
-        live_earn_yield = sum(es.cumulative_yield_usdt for es in live_earn_states)
 
         # ---- Configuration ----
         parts.append('## Strategy configuration\n')
@@ -1648,27 +1540,17 @@ def _render_export_md(v: str) -> str:
             ['max_exit_basis_bps', cfg.max_exit_basis_bps],
             ['enforce_hedge_check', cfg.enforce_hedge_check],
             ['delisting_check', cfg.delisting_check],
-            ['earn_enabled', cfg.earn_enabled],
-            ['earn_idle_threshold_usdt', cfg.earn_idle_threshold_usdt],
-            ['earn_paper_apr', cfg.earn_paper_apr],
-            ['earn_subscribe_spot_assets', cfg.earn_subscribe_spot_assets],
             ['auto_transfer_enabled', cfg.auto_transfer_enabled],
             ['perp_leverage', cfg.perp_leverage],
         ]
         parts.append(_md_table(['key', 'value'], cfg_rows))
 
-        # ---- Mode + earn states ----
+        # ---- Mode states ----
         parts.append('\n## Mode states\n')
         parts.append(_md_table(
             ['mode', 'entry_enabled', 'exit_enabled', 'maintenance_mode', 'updated_at'],
             [[m.mode, m.entry_enabled, m.exit_enabled, m.maintenance_mode, m.updated_at]
              for m in (paper_state, live_state)],
-        ))
-        parts.append('\n## Earn states (per mode + venue)\n')
-        parts.append(_md_table(
-            ['mode', 'venue', 'deployed_usdt', 'cumulative_yield_usdt', 'last_accrual_ts', 'last_error'],
-            [[e.mode, e.exchange, e.deployed_usdt, e.cumulative_yield_usdt, e.last_accrual_ts, e.last_error or '']
-             for e in (*paper_earn_states, *live_earn_states)],
         ))
 
         # ---- Live wallet snapshot, per venue ----
@@ -1696,9 +1578,8 @@ def _render_export_md(v: str) -> str:
                 parts.append(_md_table(['wallet', 'asset', 'free', 'used', 'total'], bal_rows))
 
         # ---- Equity composition for current view ----
-        earn_deployed_for_view = live_earn_deployed if v == MODE_LIVE else paper_earn_deployed
         try:
-            breakdown = equity_breakdown(db, gateways, v, earn_deployed_for_view)
+            breakdown = equity_breakdown(db, gateways, v)
         except Exception as e:
             breakdown = []
             parts.append(f'\n_equity breakdown failed: {e}_\n')

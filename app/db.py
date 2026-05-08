@@ -59,12 +59,9 @@ def run_schema_migrations() -> None:
     # Mode tagging — added when paper/live data was segregated.
     for table in ('positions', 'trades', 'equity_curve', 'rejected_candidates', 'bot_events', 'capital_flows', 'scan_results'):
         _add_column_if_missing(table, 'mode', "VARCHAR(8) NOT NULL DEFAULT 'paper'")
-    # Position sizing as % of portfolio + Earn sweep.
+    # Position sizing as % of portfolio.
     _add_column_if_missing('strategy_config', 'min_position_pct', 'FLOAT NOT NULL DEFAULT 0.005')
     _add_column_if_missing('strategy_config', 'max_position_pct', 'FLOAT NOT NULL DEFAULT 0.10')
-    _add_column_if_missing('strategy_config', 'earn_enabled', 'BOOLEAN NOT NULL DEFAULT 0')
-    _add_column_if_missing('strategy_config', 'earn_idle_threshold_usdt', 'FLOAT NOT NULL DEFAULT 1.0')
-    _add_column_if_missing('strategy_config', 'earn_paper_apr', 'FLOAT NOT NULL DEFAULT 0.05')
     # Per-position funding-income tracking.
     _add_column_if_missing('positions', 'funding_income_accrued', 'FLOAT NOT NULL DEFAULT 0.0')
     _add_column_if_missing('positions', 'last_funding_accrual_ts', "DATETIME NOT NULL DEFAULT '1970-01-01 00:00:00'")
@@ -73,8 +70,6 @@ def run_schema_migrations() -> None:
     _add_column_if_missing('strategy_config', 'auto_rebalance_threshold', 'FLOAT NOT NULL DEFAULT 1.0')
     _add_column_if_missing('strategy_config', 'futures_buffer_pct', 'FLOAT NOT NULL DEFAULT 0.20')
     _add_column_if_missing('strategy_config', 'max_perp_leverage', 'INTEGER NOT NULL DEFAULT 1')
-    _add_column_if_missing('strategy_config', 'binance_max_bfusd_pct', 'FLOAT NOT NULL DEFAULT 0.20')
-    _add_column_if_missing('strategy_config', 'kucoin_auto_lend_enabled', 'BOOLEAN NOT NULL DEFAULT 1')
     # Trade-type taxonomy — every position / trade carries one tag so the
     # dashboard can group by strategy and the orchestrator can apply the
     # right buffer / sizing rules per type. Same-venue funding-arb is the
@@ -94,11 +89,13 @@ def run_schema_migrations() -> None:
                 "UPDATE trades SET trade_type = 'kucoin_same_venue_funding_arb' "
                 "WHERE exchange = 'kucoin' AND trade_type = 'binance_same_venue_funding_arb'"
             ))
-    _add_column_if_missing('strategy_config', 'earn_subscribe_spot_assets', 'BOOLEAN NOT NULL DEFAULT 0')
     _add_column_if_missing('strategy_config', 'perp_leverage', 'INTEGER NOT NULL DEFAULT 1')
     _add_column_if_missing('strategy_config', 'min_order_book_depth_usdt', 'FLOAT NOT NULL DEFAULT 500.0')
     _add_column_if_missing('strategy_config', 'depth_band_bps', 'FLOAT NOT NULL DEFAULT 10.0')
     _add_column_if_missing('positions', 'last_close_error', "TEXT NOT NULL DEFAULT ''")
+    # Per-position quote currency — 'USDT' or 'USDC'. Default USDT on
+    # every existing row preserves the historical assumption.
+    _add_column_if_missing('positions', 'quote_currency', "VARCHAR(8) NOT NULL DEFAULT 'USDT'")
     # Cross-venue tag — every per-row table carries an ``exchange`` column so
     # the dashboard, logs, scans, and exports can break down state by venue
     # without ambiguity. Default 'binance' on every existing row guarantees
@@ -109,34 +106,9 @@ def run_schema_migrations() -> None:
     # Stable per-venue id for auto-ingested capital flows (so re-runs don't
     # duplicate the same deposit / withdrawal / sub-transfer row).
     _add_column_if_missing('capital_flows', 'external_id', "VARCHAR(128) NOT NULL DEFAULT ''")
-    # Per-venue earn-state. Without this column, Binance and KuCoin shared
-    # a single row keyed only by mode — the second gateway each cycle
-    # overwrote the first, producing aggregate-earn nonsense (e.g., the
-    # dashboard's "In Earn" showing only the last venue's value, plus a
-    # cumulative_yield that grew by the cross-venue diff every cycle).
-    #
-    # SQLite can't widen a primary key in place (no ALTER COLUMN), so we
-    # drop the old table when it lacks ``exchange`` and let SQLAlchemy's
-    # create_all recreate it with the new composite PK. The data we lose
-    # (cumulative_yield, last_accrual_ts) was wrong anyway from the
-    # cross-venue overwrite bug — the next refresh cycle re-derives
-    # deployed_usdt from live API per venue.
-    insp = inspect(engine)
-    if 'earn_state' in insp.get_table_names():
-        cols = {c['name'] for c in insp.get_columns('earn_state')}
-        if 'exchange' not in cols:
-            with engine.begin() as conn:
-                conn.execute(text('DROP TABLE earn_state'))
-        else:
-            # One-shot reset of cumulative_yield_usdt: the previous code
-            # synthesised yield from balance deltas, which over-counted
-            # whenever the bot moved funds in/out of the earn wallet
-            # (every sweep registered as "yield"). Real interest accrual
-            # is now read from venue interest-history endpoints (when
-            # wired); until then the column stays at 0 rather than
-            # showing fictional totals.
-            with engine.begin() as conn:
-                conn.execute(text('UPDATE earn_state SET cumulative_yield_usdt = 0'))
+    # The legacy ``earn_state`` table is left in place if it exists in old
+    # DBs (the yield-optimisation subsystem was removed; see archive/yield/).
+    # No active code reads it.
 
     # One-shot cleanup: the *old* auto-detect heuristic created CapitalFlow
     # rows whenever the live wallet drifted from the previous snapshot —

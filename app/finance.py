@@ -132,7 +132,7 @@ def total_funding_income(db, mode: str | None = None, status: str | None = None,
     return float(db.scalar(stmt) or 0.0)
 
 
-def equity_breakdown(db, gateways, mode: str, earn_deployed: float) -> list[dict]:
+def equity_breakdown(db, gateways, mode: str) -> list[dict]:
     """Return a per-component slice of total equity for the donut chart.
     Each item: ``{label, value, color, venue}``. ``venue`` tags the bucket to
     the exchange / broker it lives on so the dashboard can group buckets by
@@ -150,28 +150,20 @@ def equity_breakdown(db, gateways, mode: str, earn_deployed: float) -> list[dict
         'spot_usdt': '#38bdf8',
         'fut_usdt': '#fbbf24',
         'spot_assets': '#818cf8',
-        'earn': '#4ade80',
         'free_cash': '#38bdf8',
         'in_positions': '#818cf8',
     }
-    # Normalise gateways into a list — tolerate the old single-arg signature.
     if not isinstance(gateways, list):
         gateways = [gateways] if gateways is not None else []
     items: list[dict] = []
     if mode == MODE_LIVE:
         # Each gateway returns its own venue-correct buckets via
-        # ``equity_buckets()`` — Binance under PM yields PM USDT / BFUSD /
-        # PM collateral / Classic Spot / Simple Earn (legacy); KuCoin
-        # under UTA yields UTA USDT / UTA auto-lent / UTA collateral;
-        # Classic accounts still get the trade/contract/main triple.
-        # The dashboard donut renders whatever each venue provides, no
-        # hardcoded labels here.
+        # ``equity_buckets()``. The dashboard donut renders whatever
+        # each venue provides; no hardcoded labels here.
         for gw in gateways:
             try:
                 items.extend(gw.equity_buckets())
             except Exception:
-                # Fail-soft per venue — one venue's outage shouldn't
-                # blank the whole dashboard.
                 continue
     else:
         # Paper mode — use the first gateway (typically Binance) for price lookups.
@@ -184,12 +176,7 @@ def equity_breakdown(db, gateways, mode: str, earn_deployed: float) -> list[dict
                 spot_now = price_gw.safe_price(p.spot_symbol) or p.spot_entry_price or 0
                 perp_now = price_gw.safe_price(p.perp_symbol, perp=True) or p.perp_entry_price or 0
                 unrealized += position_unrealized_pnl(p, spot_now, perp_now)
-        # Free cash for paper = total_equity - earn - in_positions - unrealized.
-        # Caller computes total_equity separately; we expose the raw components.
-        # We don't include realized + funding in items because they're already
-        # rolled into "free cash" in paper accounting.
         items.append({'label': 'Paper · In positions', 'value': max(0.0, in_positions), 'color': PALETTE['in_positions'], 'venue': 'paper'})
-        items.append({'label': 'Paper · In Earn', 'value': earn_deployed, 'color': PALETTE['earn'], 'venue': 'paper'})
         # 'Free cash' computed by caller and added so totals match.
     return items
 

@@ -14,14 +14,13 @@ top-level functions are:
 Helper functions are grouped roughly by responsibility:
 
 * State accessors: :func:`get_runtime_state`, :func:`get_mode_state`,
-  :func:`get_strategy_config`, :func:`get_earn_state`.
+  :func:`get_strategy_config`.
 * Closing: :func:`_force_close_both`, :func:`_close_naked_leg`,
   :func:`_ensure_close_readiness`, :func:`_actual_spot_qty`,
   :func:`_actual_perp_qty`, :func:`manual_close`.
-* Capital provisioning: pre-trade earn redemption + spot↔futures top-up,
+* Capital provisioning: spot↔futures top-up before close,
   :func:`_take_balance_snapshot`.
-* Paper-mode simulation: :func:`_accrue_paper_yield`,
-  :func:`_accrue_paper_funding`.
+* Paper-mode simulation: :func:`_accrue_paper_funding`.
 * Reconciliation: :func:`reconcile_positions` (orphan perp →
   rehydrate), :func:`_reconcile_open_position_state` (DB open but
   Binance flat → mark closed).
@@ -49,7 +48,7 @@ from sqlalchemy import func, select
 from app.config import settings
 from app.db import SessionLocal
 from app.events import bus
-from app.exchange import BINANCE_ERR_NO_EARN_POSITION, VenueGateway, _interval_hours, annualize_rate, make_gateways
+from app.exchange import VenueGateway, _interval_hours, annualize_rate, make_gateways
 from app.finance import position_realized_pnl, position_unrealized_pnl, total_realized_pnl
 from app.models import (
     ALL_MODES,
@@ -59,7 +58,6 @@ from app.models import (
     BalanceSnapshot,
     BotEvent,
     CapitalFlow,
-    EarnState,
     EquityCurve,
     ModeState,
     Position,
@@ -135,58 +133,6 @@ def get_strategy_state(db, mode: str, trade_type: str) -> 'StrategyState':
     return s
 
 
-def _earn_sweep_for_venue(mode: str, exchange: str, **_ignored) -> None:
-    """Event handler: try an earn-sweep on (mode, exchange) right now.
-    Subscribed to ``position_closed`` and ``deposit_detected`` so freed-up
-    or newly-arrived cash flows to earn without waiting for the next
-    cycle. Respects the gateway's per-asset cooldown (use the dashboard
-    "Sweep now" button to bypass that).
-
-    Side-effect-only — opens its own DB session and gateway, doesn't
-    return anything. Safe to call from any thread because the gateway
-    instances we make here are throwaway."""
-    if mode != MODE_LIVE:
-        return
-    gateways = make_gateways()
-    target = next((g for g in gateways if g.venue_id == exchange), None)
-    if target is None:
-        return
-    with SessionLocal() as db:
-        cfg = get_strategy_config(db)
-        if not cfg.earn_enabled:
-            return
-        bals = target.safe_balances(force_refresh=True) or {}
-        spot_free = float((bals.get('spot', {}).get('USDT') or {}).get('free') or 0)
-        if spot_free <= cfg.earn_idle_threshold_usdt:
-            return
-        amount = max(0.0, spot_free - 0.10)
-        ok, err = target.earn_subscribe(amount, paper_mode=False)
-        if ok:
-            log_event(db, f'Event-driven sweep: {amount:.2f} USDT spot → earn', mode=mode, exchange=exchange)
-        else:
-            log_event(db, f'Event-driven sweep blocked: {amount:.2f} USDT — {err}', mode=mode, level='WARN', exchange=exchange)
-        db.commit()
-
-
-bus.subscribe('position_closed', _earn_sweep_for_venue)
-bus.subscribe('deposit_detected', _earn_sweep_for_venue)
-
-
-def get_earn_state(db, mode: str, exchange: str = 'binance') -> EarnState:
-    """Per-(mode, venue) earn tracker. Each venue gets its own row so the
-    Binance flexible balance and KuCoin funding-wallet balance don't
-    overwrite each other on the same shared key."""
-    state = db.scalar(select(EarnState).where(
-        EarnState.mode == mode,
-        EarnState.exchange == exchange,
-    ))
-    if state is None:
-        state = EarnState(mode=mode, exchange=exchange, deployed_usdt=0.0, cumulative_yield_usdt=0.0)
-        db.add(state)
-        db.flush()
-    return state
-
-
 def venue_is_active(db, venue_id: str) -> bool:
     """True iff at least one strategy that uses ``venue_id`` as a leg has
     ``entry_enabled=True`` in either mode. When this returns False, the
@@ -206,26 +152,6 @@ def venue_is_active(db, venue_id: str) -> bool:
         # bootstrap rows via get_strategy_state.
         return True
     return any(r.entry_enabled for r in rows)
-
-
-def get_all_earn_states(db, mode: str) -> list[EarnState]:
-    """Every venue's EarnState row for ``mode``. Used by the dashboard to
-    aggregate earn balances across venues without missing any."""
-    return list(db.scalars(select(EarnState).where(EarnState.mode == mode)).all())
-
-
-def _accrue_paper_yield(earn: EarnState, apr: float) -> None:
-    """For paper mode only — compound interest at the configured APR over the elapsed wall time."""
-    now = datetime.utcnow()
-    elapsed = (now - earn.last_accrual_ts).total_seconds()
-    if elapsed <= 0 or earn.deployed_usdt <= 0 or apr <= 0:
-        earn.last_accrual_ts = now
-        return
-    rate_per_second = apr / (365.0 * 24 * 3600)
-    yield_amt = earn.deployed_usdt * rate_per_second * elapsed
-    earn.deployed_usdt += yield_amt
-    earn.cumulative_yield_usdt += yield_amt
-    earn.last_accrual_ts = now
 
 
 def _accrue_paper_funding(db, gateway, mode: str) -> None:
@@ -263,32 +189,6 @@ def _accrue_paper_funding(db, gateway, mode: str) -> None:
         income = notional * p.last_funding_rate * (elapsed_seconds / period_seconds)
         p.funding_income_accrued += income
         p.last_funding_accrual_ts = now
-
-
-def _refresh_live_earn_balance(gateway: VenueGateway, earn: EarnState) -> None:
-    bal, err = gateway.earn_balance_usdt()
-    if bal is not None:
-        # We deliberately do NOT synthesize cumulative_yield from balance
-        # deltas anymore. The previous design — credit ``min(delta, 1%
-        # × deployed)`` per cycle when the balance went up — was supposed
-        # to approximate accrual but in practice picked up every internal
-        # transfer the bot did (sweep trade→main on KuCoin, mint USDT→
-        # BFUSD on Binance). With cycles every 30s, the cumulative figure
-        # drifted to absurd values (~$6 on $10 deployed in a few hours,
-        # i.e. ~50,000× the realistic Simple Earn rate).
-        #
-        # Real interest accrual lives in dedicated endpoints — KuCoin's
-        # utaPrivateGetAccountInterestHistory and Binance's
-        # /sapi/v1/simple-earn/flexible/history/rewardsRecord. Wiring
-        # those is the right way; until then cumulative_yield stays at
-        # whatever it was (the migration zeros it on each deploy that
-        # touches earn_state schema). The dashboard now renders 'not yet
-        # measured' for the income line.
-        earn.deployed_usdt = bal
-        earn.last_error = ''
-    elif err:
-        earn.last_error = err
-    earn.last_accrual_ts = datetime.utcnow()
 
 
 _LEGACY_PERIOD_SENTINEL = 0.005
@@ -350,86 +250,36 @@ def _log_close_error(db, p: Position, leg: str, err: str) -> None:
 
 
 def _ensure_close_readiness(db, gateway: VenueGateway, p: Position, cfg: StrategyConfig) -> None:
-    """Walk all three wallets (spot, futures, earn) and reshuffle capital so the
-    close has both legs funded. Live only — paper has no separate wallets.
-
-    Spot leg: needs `p.quantity` of the base asset on spot. If short, redeems
-    that exact deficit from the base asset's flexible Earn product.
-
-    Perp leg buy-back: needs futures.free ≥ position_notional / leverage + a
-    small fee buffer. Binance's order-placement check requires fresh initial
-    margin even on a reducing trade, which is why a stuck close looks like
-    "Margin is insufficient" even though the position is small. Funds the gap
-    by, in order: surplus spot USDT → spot→futures transfer; then, if still
-    short, USDT redeem from Earn → spot → transfer.
-
-    Best-effort throughout — each step is wrapped, and the actual close attempt
-    that runs after this is the source of truth for whether we succeeded.
-    Logs only when an action actually fires (no spam if pre-flight is a no-op
-    or if global capital is genuinely insufficient)."""
+    """Reshuffle the position's quote-currency spot↔futures so the close
+    has both legs funded. Live only — paper has no separate wallets.
+    Uses ``p.quote_currency`` so a USDC position pulls from USDC free
+    balance, not USDT (and vice versa) — never cross-funded."""
     if p.mode != MODE_LIVE:
         return
 
+    quote = p.quote_currency or 'USDT'
     bals = gateway.safe_balances() or {}
-    base = p.spot_symbol.split('/')[0]
-
-    # ---- Spot asset side ----
-    spot_asset_qty = float((bals.get('spot', {}).get(base) or {}).get('total') or 0)
-    if cfg.earn_subscribe_spot_assets and spot_asset_qty < p.quantity * 0.99:
-        deficit = max(0.0, p.quantity - spot_asset_qty)
-        if deficit > 0:
-            ok, err = gateway.earn_redeem_asset(base, deficit, False)
-            if ok:
-                log_event(db, f'Pre-close: redeemed {deficit:.6f} {base} from Earn', mode=p.mode, exchange=p.exchange)
-            elif BINANCE_ERR_NO_EARN_POSITION in err or "doesn't exist" in err.lower() or 'no flexible product' in err.lower():
-                pass  # nothing was subscribed; close_spot will use whatever's already in spot
-            else:
-                log_event(db, f'Pre-close: redeem {base} for {p.perp_symbol} failed: {err[:120]}', mode=p.mode, level='WARN', exchange=p.exchange)
-
-    # ---- Perp leg margin side ----
-    fut_free = float((bals.get('futures', {}).get('USDT') or {}).get('free') or 0)
-    spot_free = float((bals.get('spot', {}).get('USDT') or {}).get('free') or 0)
+    fut_free = float((bals.get('futures', {}).get(quote) or {}).get('free') or 0)
+    spot_free = float((bals.get('spot', {}).get(quote) or {}).get('free') or 0)
     perp_now = gateway.safe_price(p.perp_symbol, perp=True) or p.perp_entry_price or 0.0
     if perp_now <= 0:
-        return  # can't size the requirement; the close attempt will surface the failure
+        return
     leverage = max(1, cfg.max_perp_leverage or cfg.perp_leverage or 1)
     needed_margin = p.quantity * perp_now / leverage
-    target = needed_margin * 1.005  # +50 bps buffer for fee + tiny adverse drift
+    target = needed_margin * 1.005
     if fut_free >= target:
         return
 
     gap = target - fut_free
-
-    # Step 1: surplus spot USDT → futures
     if cfg.auto_transfer_enabled and spot_free > 0.30:
-        avail = max(0.0, spot_free - 0.10)  # leave dust in spot
+        avail = max(0.0, spot_free - 0.10)
         transfer = min(gap, avail)
         if transfer >= 0.20:
-            ok, err = gateway.transfer_spot_to_futures(transfer, False)
+            ok, err = gateway.transfer_spot_to_futures(transfer, False, asset=quote)
             if ok:
-                spot_free -= transfer
-                fut_free += transfer
-                gap -= transfer
-                log_event(db, f'Pre-close: transferred {transfer:.2f} USDT spot→futures (margin top-up for {p.perp_symbol})', mode=p.mode, exchange=p.exchange)
+                log_event(db, f'Pre-close: transferred {transfer:.2f} {quote} spot→futures (margin top-up for {p.perp_symbol})', mode=p.mode, exchange=p.exchange)
             else:
-                log_event(db, f'Pre-close: spot→futures transfer for {p.perp_symbol} failed: {err[:120]}', mode=p.mode, level='WARN', exchange=p.exchange)
-
-    # Step 2: redeem USDT from Earn → spot → futures
-    if gap >= 0.20 and cfg.earn_enabled and cfg.auto_transfer_enabled:
-        earn_bal, _ = gateway.earn_balance_usdt()
-        earn_bal = earn_bal or 0.0
-        if earn_bal >= 0.20:
-            redeem_amt = min(gap + 0.20, earn_bal)  # tiny extra so subsequent transfer has room
-            ok, err = gateway.earn_redeem(redeem_amt, False)
-            if ok:
-                log_event(db, f'Pre-close: redeemed {redeem_amt:.2f} USDT from Earn (margin top-up for {p.perp_symbol})', mode=p.mode, exchange=p.exchange)
-                transfer = min(gap, redeem_amt)
-                if transfer >= 0.20:
-                    ok2, err2 = gateway.transfer_spot_to_futures(transfer, False)
-                    if ok2:
-                        log_event(db, f'Pre-close: transferred {transfer:.2f} USDT to futures (Earn → spot → futures)', mode=p.mode, exchange=p.exchange)
-                    else:
-                        log_event(db, f'Pre-close: post-redeem transfer for {p.perp_symbol} failed: {err2[:120]}', mode=p.mode, level='WARN', exchange=p.exchange)
+                log_event(db, f'Pre-close: spot→futures {quote} transfer for {p.perp_symbol} failed: {err[:120]}', mode=p.mode, level='WARN', exchange=p.exchange)
 
 
 def _actual_spot_qty(gateway: VenueGateway, p: Position) -> float:
@@ -650,22 +500,38 @@ def reconcile_positions(gateway: VenueGateway) -> None:
         db.commit()
 
 
-def _compute_equity_and_free(db, gateway: VenueGateway, mode: str, cfg: StrategyConfig, earn: EarnState) -> tuple[float, float]:
-    """Total portfolio equity in USDT and the amount currently free for opening
-    a position **on this venue**.
+def _usdc_usdt_rate(gateway: VenueGateway) -> float:
+    """Live USDC/USDT mid for headline equity sums. Falls back to 1.0
+    when the ticker isn't reachable. Cached via ``safe_price`` (30s TTL)
+    so per-cycle reads don't burn rate-limit. The bot does NOT use this
+    rate to decide sizing or wallet routing — those stay strictly
+    per-quote so a USDC depeg can't bleed into the USDT book."""
+    try:
+        px = gateway.safe_price('USDC/USDT')
+        if px and 0.5 < float(px) < 2.0:
+            return float(px)
+    except Exception:
+        pass
+    return 1.0
+
+
+def _compute_equity_and_free(db, gateway: VenueGateway, mode: str, cfg: StrategyConfig) -> tuple[float, dict[str, float]]:
+    """Returns ``(total_equity_usdt, free_by_quote)``.
+
+    * ``total_equity_usdt`` is the venue's headline equity in USDT,
+      with USDC priced at the live USDC/USDT mid (1.0 fallback).
+    * ``free_by_quote`` is ``{'USDT': free_usdt, 'USDC': free_usdc}`` —
+      what the bot can deploy on a fresh entry per quote currency.
+      The bot never cross-funds: a USDC entry only consumes USDC.
 
     Per-venue scoping: every query filters by ``Position.exchange == gateway.venue_id``
     so two venues sharing the same StrategyConfig can size positions correctly
     against their own capital. Cross-venue capital movement is Phase 2.
-
-    Paper mode:  total = paper_starting_equity + manual_flows + realized + unrealized
-                       + open_funding + closed_funding + earn_yield
-                 free  = total − earn_deployed − open_notional − unrealized
-    Live mode:   total = spot.USDT + fut.USDT + Σ (non-USDT spot assets × ticker)
-                       + venue's Earn balance
-                 free  = min(spot.free, fut.free)   (both legs need margin)
     """
     if mode == MODE_PAPER:
+        # Paper has a single virtual USDT-denominated pot. USDC trades
+        # in paper draw from the same pot at 1:1 — paper is for
+        # strategy validation, not depeg simulation.
         realized = total_realized_pnl(db, mode=mode, exchange=gateway.venue_id)
         open_ps = db.scalars(select(Position).where(
             Position.status == 'open',
@@ -681,45 +547,49 @@ def _compute_equity_and_free(db, gateway: VenueGateway, mode: str, cfg: Strategy
             unrealized += position_unrealized_pnl(p, spot_now, perp_now)
             open_notional += p.quantity * p.spot_entry_price
             open_funding += p.funding_income_accrued
-        # Funding on already-closed positions is part of total_realized_pnl (added
-        # below); open positions' accrued funding is tracked separately so it can
-        # be treated as liquid cash for the free-balance calc — this is what
-        # makes "auto-reinvest" work.
         closed_funding = total_funding_income(db, mode=mode, status='closed', exchange=gateway.venue_id)
-        # Manual capital flows are scoped per-venue (default 'binance' on legacy rows).
         capital_in = db.scalar(select(func.coalesce(func.sum(CapitalFlow.amount_usdt), 0.0)).where(
             CapitalFlow.mode == mode,
             CapitalFlow.exchange == gateway.venue_id,
         )) or 0.0
         total_equity = (cfg.paper_starting_equity + capital_in + realized + unrealized
-                        + open_funding + closed_funding + earn.cumulative_yield_usdt)
-        free = max(0.0, total_equity - earn.deployed_usdt - open_notional - unrealized)
-        return total_equity, free
-    # Live mode — every value comes from the venue's own balances API.
+                        + open_funding + closed_funding)
+        free = max(0.0, total_equity - open_notional - unrealized)
+        return total_equity, {'USDT': free, 'USDC': free}
     bals = gateway.safe_balances()
     if bals is None:
-        return 0.0, 0.0
-    spot_total = float((bals['spot'].get('USDT') or {}).get('total') or 0)
-    fut_total = float((bals['futures'].get('USDT') or {}).get('total') or 0)
-    spot_free = float((bals['spot'].get('USDT') or {}).get('free') or 0)
-    fut_free = float((bals['futures'].get('USDT') or {}).get('free') or 0)
-    # IMPORTANT: spot.USDT.total only counts USDT — base assets the bot bought
-    # on the spot leg (SOL, ETH, etc.) live in their own balance entries.
-    # Without adding them back at USDT-equivalent, equity appears to drop by
-    # the full position notional every time we open a trade.
+        return 0.0, {'USDT': 0.0, 'USDC': 0.0}
+    rate = _usdc_usdt_rate(gateway)
+    # Per-quote totals on the venue's wallets. PM / UTA gateways flatten
+    # the unified pool into spot.<quote>.total; Classic gateways have
+    # both spot.<quote>.total and futures.<quote>.total populated.
+    quote_total_usdt = 0.0
+    free_by_quote: dict[str, float] = {}
+    for q in ('USDT', 'USDC'):
+        spot_total = float((bals.get('spot', {}).get(q) or {}).get('total') or 0)
+        fut_total = float((bals.get('futures', {}).get(q) or {}).get('total') or 0)
+        spot_free = float((bals.get('spot', {}).get(q) or {}).get('free') or 0)
+        fut_free = float((bals.get('futures', {}).get(q) or {}).get('free') or 0)
+        amount = spot_total + fut_total  # under unified margin fut_total is 0 by convention
+        quote_total_usdt += amount * (rate if q == 'USDC' else 1.0)
+        # Per-leg margin still needs both wallets funded. Take min so
+        # sizing accounts for the binding leg.
+        free_by_quote[q] = min(spot_free, fut_free)
+    # Non-stablecoin spot assets at USDT-equivalent (long leg of an
+    # open arb that's not yet closed).
     spot_assets_value = 0.0
     spot_balances = bals.get('spot', {}) or {}
     META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
     for asset, bal in spot_balances.items():
-        if asset in META_KEYS or asset == 'USDT' or not isinstance(bal, dict):
+        if asset in META_KEYS or asset in ('USDT', 'USDC') or not isinstance(bal, dict):
             continue
         qty = float(bal.get('total') or 0)
         if qty <= 0:
             continue
         px = gateway.safe_price(f'{asset}/USDT') or 0
         spot_assets_value += qty * px
-    total_equity = spot_total + fut_total + spot_assets_value + earn.deployed_usdt
-    return total_equity, min(spot_free, fut_free)
+    total_equity = quote_total_usdt + spot_assets_value
+    return total_equity, free_by_quote
 
 
 # Per-(mode, venue) timestamp of the last capital-flow ingest. The bot
@@ -786,14 +656,6 @@ def _ingest_api_capital_flows(db, gateway: VenueGateway, mode: str, lookback_day
         ))
         seen_ids.add(ext)
         inserted += 1
-        # Fire one event per inflow so subscribers (earn-sweep) can route
-        # the new cash without waiting for the next cycle. Outflows
-        # don't trigger anything — the wallet is already short by the
-        # withdrawal amount; nothing to sweep.
-        if r['amount'] > 0:
-            bus.emit('deposit_detected',
-                     mode=mode, exchange=gateway.venue_id,
-                     amount_usdt=r['amount'], kind=r.get('kind') or 'deposit', ts=r['ts'])
     if inserted:
         db.flush()
     summary = ', '.join(f'{k}={v}' for k, v in counts.items()) or 'no rows returned by any endpoint'
@@ -801,10 +663,10 @@ def _ingest_api_capital_flows(db, gateway: VenueGateway, mode: str, lookback_day
     return inserted
 
 
-def _take_balance_snapshot(db, gateway: VenueGateway, mode: str, cfg: StrategyConfig, earn: EarnState) -> BalanceSnapshot:
+def _take_balance_snapshot(db, gateway: VenueGateway, mode: str, cfg: StrategyConfig) -> BalanceSnapshot:
     # Both modes share the live/paper-aware equity calc which already includes
     # spot asset values for tracked positions in live mode.
-    total_equity, _ = _compute_equity_and_free(db, gateway, mode, cfg, earn)
+    total_equity, _ = _compute_equity_and_free(db, gateway, mode, cfg)
     if mode == MODE_LIVE:
         bals = gateway.safe_balances()
         spot = float((bals['spot'].get('USDT') or {}).get('total') or 0) if bals else 0.0
@@ -829,7 +691,6 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                 return
             cfg = get_strategy_config(db)
             mstate = get_mode_state(db, mode)
-            earn = get_earn_state(db, mode, exchange=gateway.venue_id)
 
             # Paper-mode funding income accrual on open positions (live is auto-credited
             # by Binance into the futures wallet, which our equity calc already sees).
@@ -848,7 +709,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             db,
                             f'Live API unreachable: {err}. Pausing live cycles. '
                             f'Common -2015 causes: bad key/secret, IP not whitelisted on the key, '
-                            f'or missing Spot/Futures/Earn permission.',
+                            f'or missing Spot/Futures permission.',
                             mode=MODE_LIVE,
                             level='ERROR',
                         )
@@ -858,13 +719,6 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                 elif _LIVE_API_UNHEALTHY_LOGGED:
                     log_event(db, f'{gateway.name} API recovered.', mode=MODE_LIVE, level='INFO', exchange=gateway.venue_id)
                     _LIVE_API_UNHEALTHY_LOGGED = False
-
-            # Earn upkeep: accrue paper-mode interest or fetch the live deployed balance.
-            if cfg.earn_enabled:
-                if paper:
-                    _accrue_paper_yield(earn, cfg.earn_paper_apr)
-                else:
-                    _refresh_live_earn_balance(gateway, earn)
 
             # Live: rehydrate any perp positions Binance shows but our DB doesn't.
             # Cheap (one auth call), keeps the dashboard in sync if the user opened
@@ -898,10 +752,10 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                 except Exception as e:
                     log_event(db, f'State reconcile failed on {gateway.name}: {str(e)[:120]}', mode=MODE_LIVE, level='WARN', exchange=gateway.venue_id)
 
-            # Live short-circuit: if entries are off, no positions, and no earn or
+            # Live short-circuit: if entries are off, no positions, and no
             # auto-transfer to do, skip the API hits entirely.
             if (mode == MODE_LIVE and not mstate.entry_enabled and not mstate.maintenance_mode
-                    and not cfg.earn_enabled and not cfg.auto_transfer_enabled):
+                    and not cfg.auto_transfer_enabled):
                 open_count = db.scalar(select(func.count(Position.id)).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)) or 0
                 if open_count == 0:
                     return
@@ -1008,7 +862,6 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         cfg.min_24h_quote_volume,
                         min_depth_usdt=cfg.min_order_book_depth_usdt or 0.0,
                         depth_band_bps=cfg.depth_band_bps or 10.0,
-                        include_earn_apr=bool(cfg.earn_subscribe_spot_assets),
                     )
                 except Exception as e:
                     passing, candidates_total, rejected_scan = [], 0, []
@@ -1022,21 +875,26 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     'qv': c.quote_volume,
                     'spot_depth': c.spot_depth_usdt,
                     'perp_depth': c.perp_depth_usdt,
-                    'spot_earn_apr': c.spot_earn_apr,
-                    'combined_apy': c.combined_apy,
                 } for c in passing[:5]]
                 for sym, reason, apr in rejected_scan[:20]:
                     db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=sym, reason=reason, funding_rate=apr))
 
-                total_equity, free = _compute_equity_and_free(db, gateway, mode, cfg, earn)
-                # Pull per-wallet free balances so we can act on each leg's constraint
-                # individually (live only — paper has a single pool).
+                total_equity, free_by_quote = _compute_equity_and_free(db, gateway, mode, cfg)
+                # Per-quote spot/futures free for sizing. Each candidate's
+                # quote_currency selects the right pool — never cross-funded.
+                spot_free_by_q: dict[str, float] = {}
+                fut_free_by_q: dict[str, float] = {}
                 if mode == MODE_LIVE:
                     bals = gateway.safe_balances() or {}
-                    spot_free = float((bals.get('spot', {}).get('USDT') or {}).get('free') or 0)
-                    fut_free = float((bals.get('futures', {}).get('USDT') or {}).get('free') or 0)
+                    for q in ('USDT', 'USDC'):
+                        spot_free_by_q[q] = float((bals.get('spot', {}).get(q) or {}).get('free') or 0)
+                        fut_free_by_q[q] = float((bals.get('futures', {}).get(q) or {}).get('free') or 0)
                 else:
-                    spot_free = fut_free = free
+                    # Paper has a single pool; both quotes draw from the
+                    # same paper equity at 1:1 (paper is for strategy
+                    # validation, not depeg simulation).
+                    for q in ('USDT', 'USDC'):
+                        spot_free_by_q[q] = fut_free_by_q[q] = free_by_quote.get(q, 0.0)
 
                 if total_equity <= 0:
                     scan_action = 'balances_unavailable'
@@ -1046,30 +904,23 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     desired_notional = cfg.max_position_pct * total_equity
                     min_notional = cfg.min_position_pct * total_equity
 
-                    # NOTE: speculative pre-trade earn-redeem REMOVED. The
-                    # previous code redeemed from earn → spot at the top
-                    # of the open path, before checking whether any
-                    # candidate actually passes basis / depth / sizing
-                    # filters. Result on a venue with no passing
-                    # candidates (e.g. KuCoin where most small-caps lack
-                    # spot markets) — money flowed earn → spot → cycle
-                    # ends → post-cycle sweep moves it back to earn.
-                    # Same loop every 30s, no trades. The redeem now
-                    # lives inside the per-candidate loop below, AFTER
-                    # the basis check passes, so it only fires when an
-                    # entry is actually about to be placed.
-
-                    # Transfer spot→futures so the perp leg has margin (once per cycle).
-                    if mode == MODE_LIVE and cfg.auto_transfer_enabled and fut_free < desired_notional and spot_free > desired_notional:
-                        transfer = min(desired_notional - fut_free, spot_free - desired_notional)
-                        if transfer > 0.5:
-                            ok, err = gateway.transfer_spot_to_futures(transfer, paper)
-                            if ok:
-                                spot_free -= transfer
-                                fut_free += transfer
-                                log_event(db, f'Auto-transferred {transfer:.2f} USDT spot→futures for perp margin', mode=mode, exchange=gateway.venue_id)
-                            else:
-                                log_event(db, f'spot→futures transfer failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                    # Transfer spot→futures so the perp leg has margin
+                    # (once per cycle, per-quote). For PM/UTA accounts
+                    # the transfer is a no-op since margin is unified.
+                    if mode == MODE_LIVE and cfg.auto_transfer_enabled:
+                        for q in ('USDT', 'USDC'):
+                            sf = spot_free_by_q[q]
+                            ff = fut_free_by_q[q]
+                            if ff < desired_notional and sf > desired_notional:
+                                transfer = min(desired_notional - ff, sf - desired_notional)
+                                if transfer > 0.5:
+                                    ok, err = gateway.transfer_spot_to_futures(transfer, paper, asset=q)
+                                    if ok:
+                                        spot_free_by_q[q] -= transfer
+                                        fut_free_by_q[q] += transfer
+                                        log_event(db, f'Auto-transferred {transfer:.2f} {q} spot→futures for perp margin', mode=mode, exchange=gateway.venue_id)
+                                    else:
+                                        log_event(db, f'spot→futures {q} transfer failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
                     # Diversity: skip any candidate whose base asset we already hold open
                     # in this mode. Avoids piling more capital into the same name even
@@ -1094,31 +945,20 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         base = c.spot_symbol.split('/')[0]
                         if base in held_bases:
                             continue
-                        # Size based on multiple binding constraints:
-                        #  * Equity / wallet:  free cash on the binding leg
-                        #  * Strategy cap:     desired_notional (% of equity)
-                        #  * Book depth:       at most 25% of the tightest
-                        #                      side's depth at the entry band.
-                        #                      Single-fill slippage past 25%
-                        #                      of book starts being material.
-                        #  * 24h volume:       at most 0.5% of quote volume.
-                        #                      Concentration above this means
-                        #                      our exits move the market.
-                        free_for_arb = min(spot_free, fut_free)
+                        # Per-quote sizing: USDT trade reads USDT free,
+                        # USDC trade reads USDC free. Never cross-funded.
+                        cq = c.quote_currency
+                        free_for_arb = min(spot_free_by_q.get(cq, 0.0), fut_free_by_q.get(cq, 0.0))
                         wallet_cap = free_for_arb * 0.97
                         depth_cap = 0.25 * (c.min_depth_usdt or 0)
                         volume_cap = 0.005 * (c.quote_volume or 0)
-                        # If depth/volume readings are zero (scan didn't
-                        # populate), don't let them clamp to zero —
-                        # min_depth_usdt is a hard reject upstream when it
-                        # actually fails. Treat 0 as "unknown, no constraint".
                         if depth_cap <= 0:
                             depth_cap = float('inf')
                         if volume_cap <= 0:
                             volume_cap = float('inf')
                         sized_notional = min(wallet_cap, desired_notional, depth_cap, volume_cap)
                         if sized_notional < min_notional:
-                            reason = (f'below min position pct ({sized_notional:.2f} < {min_notional:.2f} USDT; '
+                            reason = (f'below min position pct ({sized_notional:.2f} < {min_notional:.2f} {cq}; '
                                       f'wallet={wallet_cap:.2f} max_pct={desired_notional:.2f} '
                                       f'depth_cap={depth_cap if depth_cap != float("inf") else "—"} '
                                       f'vol_cap={volume_cap if volume_cap != float("inf") else "—"})')
@@ -1135,27 +975,6 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             scan_action = 'basis_too_wide'
                             continue
                         qty = sized_notional / max(0.0001, spot_px)
-                        # Just-in-time earn redeem: this candidate has
-                        # passed every gate above; only NOW pull funds
-                        # from earn for the spot leg's exact need. Avoids
-                        # the previous loop where we redeemed
-                        # speculatively then swept back if no candidate
-                        # actually opened.
-                        if (cfg.earn_enabled and mode == MODE_LIVE
-                                and spot_free < sized_notional and earn.deployed_usdt > 0.10):
-                            need = min(sized_notional - spot_free + 0.05, earn.deployed_usdt)
-                            if need >= 0.10:
-                                ok_r, err_r = gateway.earn_redeem(need, paper)
-                                if ok_r:
-                                    earn.deployed_usdt = max(0.0, earn.deployed_usdt - need)
-                                    spot_free += need
-                                    log_event(db, f'Redeemed {need:.4f} USDT for {c.perp_symbol} entry', mode=mode, exchange=gateway.venue_id)
-                                else:
-                                    earn.last_error = err_r
-                                    db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=f'earn_redeem_failed: {err_r[:80]}', funding_rate=c.funding_apr))
-                                    continue
-                        # Place spot buy first. If it fails (insufficient balance, min-notional,
-                        # market down), skip the candidate and continue scanning.
                         try:
                             s = gateway.create_spot_buy(c.spot_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
                         except Exception as e:
@@ -1174,6 +993,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             symbol=c.spot_symbol.split('/')[0],
                             spot_symbol=c.spot_symbol,
                             perp_symbol=c.perp_symbol,
+                            quote_currency=cq,
                             quantity=qty,
                             entry_funding_rate=c.funding_rate,
                             last_funding_rate=c.funding_rate,
@@ -1199,9 +1019,6 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             err = str(e)[:140]
                             log_event(db, f'Perp short failed for {c.perp_symbol} after spot bought: {err} — rolling back spot leg', mode=mode, level='ERROR', exchange=gateway.venue_id)
                             try:
-                                if not paper and cfg.earn_subscribe_spot_assets:
-                                    base = c.spot_symbol.split('/')[0]
-                                    gateway.earn_redeem_asset(base, qty, False)
                                 rev = gateway.close_spot(c.spot_symbol, qty, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
                                 record_trade(db, pos.id, mode, c.spot_symbol, 'spot', 'sell', qty, rev, exchange=gateway.venue_id)
                                 pos.status = 'closed'
@@ -1213,24 +1030,12 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             scan_action = 'perp_short_error'
                             continue
 
-                        # Spot leg → Earn (opt-in). Skipping is fine if no flexible product
-                        # exists for the asset; the asset just sits in spot wallet.
-                        if not paper and cfg.earn_subscribe_spot_assets:
-                            base = c.spot_symbol.split('/')[0]
-                            ok_e, err_e = gateway.earn_subscribe_asset(base, qty, False)
-                            if ok_e:
-                                log_event(db, f'Subscribed {qty:.6f} {base} to flexible Earn ({c.perp_symbol})', mode=mode, exchange=gateway.venue_id)
-                            elif 'cooldown active' in err_e:
-                                log_event(db, f'Earn subscribe for {base} skipped (cooldown — {c.perp_symbol})', mode=mode, exchange=gateway.venue_id)
-                            else:
-                                log_event(db, f'Earn subscribe for {base} on {c.perp_symbol} skipped: {err_e[:120]}', mode=mode, level='WARN', exchange=gateway.venue_id)
-
                         # Both legs filled — finalize.
                         pos.perp_entry_price = float(f.get('price') or 0)
                         record_trade(db, pos.id, mode, c.perp_symbol, 'futures', 'sell', qty, f, exchange=gateway.venue_id)
                         held_bases.add(base)
                         scan_action = f'opened {c.perp_symbol}'
-                        log_event(db, f'Opened {c.perp_symbol} qty={qty:.6f} funding_apy={c.funding_apr:.2%} earn_apr={c.spot_earn_apr:.2%} combined={c.combined_apy:.2%} depth=${c.min_depth_usdt:.0f}', mode=mode, exchange=gateway.venue_id)
+                        log_event(db, f'Opened {c.perp_symbol} qty={qty:.6f} funding_apy={c.funding_apr:.2%} depth=${c.min_depth_usdt:.0f}', mode=mode, exchange=gateway.venue_id)
                         bus.emit('position_opened',
                                  position_id=pos.id, mode=mode, exchange=gateway.venue_id,
                                  symbol=c.spot_symbol, quantity=qty,
@@ -1254,18 +1059,12 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                 note=scan_note,
             ))
 
-            # Earn-first model: idle USDT lives in earn between trades.
-            # Pre-trade provision_margin redeems from earn to top up
-            # whichever wallet the upcoming leg needs.
-            #
-            # Drain rules (live mode):
-            #   * No positions open on the venue → drain fut→spot down to
-            #     dust (0.10 USDT). Everything funnels into earn.
-            #   * Positions open → drain only the portion of fut.free that
-            #     exceeds 10% of total open notional. Below that threshold
-            #     we leave a free-margin buffer so a price move against
-            #     the perp short doesn't trigger maintenance liquidation
-            #     before the next provision_margin call.
+            # End-of-cycle wallet rebalance (live, per-quote): drain
+            # surplus futures balance back to spot per quote currency.
+            # Buffer = ``cfg.futures_buffer_pct`` × open perp notional in
+            # that quote (cross margin pools across symbols of the same
+            # quote, not across quotes). With no open positions in a
+            # given quote, drain to dust.
             if mode == MODE_LIVE and cfg.auto_transfer_enabled:
                 open_ps = db.scalars(select(Position).where(
                     Position.status == 'open',
@@ -1273,76 +1072,26 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     Position.exchange == gateway.venue_id,
                 )).all()
                 bals_after = gateway.safe_balances() or {}
-                fut_free_now = float((bals_after.get('futures', {}).get('USDT') or {}).get('free') or 0)
-                # Under unified margin (Binance PM, KuCoin UTA), the pool
-                # funds both spot and perp legs — there's no separate
-                # futures wallet to drain. ``futures.USDT.total`` is 0 in
-                # those cases by convention; skip the drain entirely so
-                # we don't generate spurious "Drained X USDT" log lines.
-                fut_total_now = float((bals_after.get('futures', {}).get('USDT') or {}).get('total') or 0)
-                if fut_total_now <= 0.001:
-                    fut_free_now = 0.0  # disables the drain branch below
-                if open_ps:
-                    # Keep ``cfg.futures_buffer_pct`` of open notional as free
-                    # margin in the futures wallet so the perp short can absorb
-                    # an adverse move before maintenance liquidation. 20% (the
-                    # default) covers roughly a -20% mark-price move; bump
-                    # higher in cfg for high-volatility tokens. Cross margin
-                    # pools the buffer across all open perps on the venue.
-                    open_notional = sum((p.quantity or 0) * (p.perp_entry_price or 0) for p in open_ps)
-                    keep = max(0.20, open_notional * float(cfg.futures_buffer_pct or 0.20))
-                else:
-                    keep = 0.10
-                if fut_free_now > keep + 0.10:
-                    amt = fut_free_now - keep
-                    ok, err = gateway.transfer_futures_to_spot(amt, paper)
-                    if ok:
-                        log_event(db, f'Drained {amt:.2f} USDT futures→spot (kept {keep:.2f} as margin buffer; {len(open_ps)} pos open)', mode=mode, exchange=gateway.venue_id)
+                for q in ('USDT', 'USDC'):
+                    fut_free_now = float((bals_after.get('futures', {}).get(q) or {}).get('free') or 0)
+                    fut_total_now = float((bals_after.get('futures', {}).get(q) or {}).get('total') or 0)
+                    # PM / UTA: total=0 by convention since the pool isn't a
+                    # separate wallet. Skip drain on unified margin.
+                    if fut_total_now <= 0.001:
+                        continue
+                    open_ps_q = [p for p in open_ps if (p.quote_currency or 'USDT') == q]
+                    if open_ps_q:
+                        open_notional = sum((p.quantity or 0) * (p.perp_entry_price or 0) for p in open_ps_q)
+                        keep = max(0.20, open_notional * float(cfg.futures_buffer_pct or 0.20))
                     else:
-                        log_event(db, f'futures→spot drain failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
-
-            # Sweep idle USDT into earn. Use ``spot.free`` directly rather
-            # than ``min(spot_free, fut_free)`` from _compute_equity_and_free
-            # — that minimum was the right shape for the old continuous-
-            # rebalance model where both legs needed equal margin, but in
-            # the earn-first model the spot wallet's free cash IS the idle
-            # amount (futures cash gets routed pre-trade by provision_margin
-            # rather than kept hot). The old min() left 7.90 in trade
-            # because fut had only 0.10 — fix is using spot.free directly.
-            if cfg.earn_enabled:
-                bals_for_sweep = gateway.safe_balances() or {}
-                spot_free_now = float((bals_for_sweep.get('spot', {}).get('USDT') or {}).get('free') or 0)
-                if spot_free_now > cfg.earn_idle_threshold_usdt:
-                    sweep = max(0.0, spot_free_now - 0.10)  # 0.10 USDT dust buffer
-                    # Binance-only safety throttle: cap BFUSD share of total
-                    # equity at cfg.binance_max_bfusd_pct. Keeps a portion in
-                    # plain USDT for instant deploy without the BFUSD redeem
-                    # queue. Wire is no-op on KuCoin since auto-lent USDT
-                    # stays liquid as cross-collateral anyway.
-                    if gateway.venue_id == 'binance' and cfg.binance_max_bfusd_pct < 1.0:
-                        total_eq, _ = _compute_equity_and_free(db, gateway, mode, cfg, earn)
-                        cap = max(0.0, total_eq * float(cfg.binance_max_bfusd_pct or 0.20) - earn.deployed_usdt)
-                        if sweep > cap:
-                            sweep = cap
-                    if sweep <= 0.10:
-                        # After cap, nothing meaningful to sweep this cycle.
-                        sweep = 0.0
-                    ok, err = (True, 'capped') if sweep <= 0 else gateway.earn_subscribe(sweep, paper)
-                    if ok:
-                        earn.deployed_usdt += sweep
-                        earn.last_error = ''
-                        log_event(db, f'Swept {sweep:.2f} USDT idle → earn', mode=mode, exchange=gateway.venue_id)
-                    else:
-                        earn.last_error = err
-                        # Distinguish transient races (112002 "no balance"
-                        # — KuCoin balance API hasn't yet reflected a
-                        # prior transfer) from real failures. Transient
-                        # ones get re-tried next cycle automatically;
-                        # logging them at WARN was just noise.
-                        is_transient = ('112002' in err or 'no balance' in err.lower()
-                                        or 'cooldown active' in err)
-                        if not is_transient:
-                            log_event(db, f'Earn sweep blocked: {sweep:.2f} USDT idle in spot — {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                        keep = 0.10
+                    if fut_free_now > keep + 0.10:
+                        amt = fut_free_now - keep
+                        ok, err = gateway.transfer_futures_to_spot(amt, paper, asset=q)
+                        if ok:
+                            log_event(db, f'Drained {amt:.2f} {q} futures→spot (kept {keep:.2f} as margin buffer; {len(open_ps_q)} {q} pos open)', mode=mode, exchange=gateway.venue_id)
+                        else:
+                            log_event(db, f'futures→spot {q} drain failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
             # End-of-cycle bookkeeping. Two cadences:
             #   * Capital-flow ingest (deposits / withdrawals / transfers)
@@ -1356,7 +1105,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
             #     these are cheap (cached safe_balances) and feed the
             #     real-time total-account-value indicator.
             _maybe_ingest_capital_flows(db, gateway, mode)
-            snap = _take_balance_snapshot(db, gateway, mode, cfg, earn)
+            snap = _take_balance_snapshot(db, gateway, mode, cfg)
             db.add(EquityCurve(mode=mode, exchange=gateway.venue_id, equity_usdt=snap.total_usdt))
             db.commit()
     except Exception as e:
@@ -1390,39 +1139,6 @@ def run_one_cycle(gateways: list | None = None, mode: str | None = None) -> int:
     return sleep_seconds
 
 
-def _enforce_venue_yield_settings(gateways: list, db) -> None:
-    """One-shot per-startup: push each venue's yield surface into the
-    state the operator wants. Idempotent — calling repeatedly with the
-    same flags just confirms the existing setting.
-
-    KuCoin: toggles auto-lend for USDT according to
-    ``cfg.kucoin_auto_lend_enabled``. The sub-account API key calls
-    /api/v1/margin/toggle-auto-lend directly — the user doesn't need
-    UI access on the sub-account (which they can't get when master
-    settings don't propagate). Auto-lent USDT continues to count as
-    margin collateral under UTA, so the position-opening flow is
-    unaffected.
-
-    Binance: BFUSD mint is event-driven (post-trade earn sweep) — no
-    one-shot toggle needed."""
-    cfg = get_strategy_config(db)
-    for gw in gateways:
-        if gw.venue_id == 'kucoin':
-            # toggle_auto_lend now only reports status — KuCoin's legacy
-            # toggle endpoint is no longer ccxt-exposed; the operator
-            # enables auto-lend once via the KuCoin UI. We log INFO
-            # (not WARN) so the operator sees the once-per-startup
-            # reminder without alarming-level noise.
-            target_enabled = bool(cfg.kucoin_auto_lend_enabled)
-            ok, err = gw.toggle_auto_lend(enabled=target_enabled, asset='USDT')
-            if ok:
-                log_event(db, f'KuCoin auto-lend USDT: {"ENABLED" if target_enabled else "DISABLED"}', mode=MODE_LIVE, exchange=gw.venue_id)
-            elif target_enabled:
-                # Only worth logging when the user WANTS auto-lend on;
-                # if they've disabled it, the missing toggle isn't relevant.
-                log_event(db, f'KuCoin auto-lend: programmatic toggle unavailable. {err}', mode=MODE_LIVE, exchange=gw.venue_id)
-
-
 def run_loop() -> None:
     gateways = make_gateways()
     for gw in gateways:
@@ -1432,9 +1148,6 @@ def run_loop() -> None:
             with SessionLocal() as db:
                 log_event(db, f'{gw.name} load_markets failed: {e}', mode=MODE_PAPER, level='ERROR', exchange=gw.venue_id)
                 db.commit()
-    with SessionLocal() as db:
-        _enforce_venue_yield_settings(gateways, db)
-        db.commit()
     for gw in gateways:
         reconcile_positions(gw)
     while True:
