@@ -71,6 +71,33 @@ def venue_to_trade_type(venue_id: str) -> str:
     }.get(venue_id, TRADE_TYPE_BINANCE_FUNDING_ARB)
 
 
+def trade_types_touching_venue(venue_id: str) -> tuple[str, ...]:
+    """Every TRADE_TYPE that uses ``venue_id`` as a leg. Drives the
+    'is this venue active at all' check — if every strategy that
+    touches the venue is disabled in both modes, we can skip API
+    calls (balance/orders/scans) on that venue entirely until the
+    operator re-enables one. Cross-venue and onchain strategies
+    that REQUIRE this venue keep it active even if the same-venue
+    strategy is off."""
+    return {
+        VENUE_BINANCE: (
+            TRADE_TYPE_BINANCE_FUNDING_ARB,
+            TRADE_TYPE_BINANCE_KUCOIN_ARB,
+            TRADE_TYPE_ONCHAIN_BINANCE_ARB,
+            TRADE_TYPE_IBKR_BINANCE_ARB,
+        ),
+        VENUE_KUCOIN: (
+            TRADE_TYPE_KUCOIN_FUNDING_ARB,
+            TRADE_TYPE_BINANCE_KUCOIN_ARB,
+            TRADE_TYPE_IBKR_KUCOIN_ARB,
+        ),
+        VENUE_IBKR: (
+            TRADE_TYPE_IBKR_BINANCE_ARB,
+            TRADE_TYPE_IBKR_KUCOIN_ARB,
+        ),
+    }.get(venue_id, ())
+
+
 class Position(Base):
     __tablename__ = 'positions'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

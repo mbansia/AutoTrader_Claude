@@ -1315,7 +1315,16 @@ def _gather_exchange_status() -> list[dict]:
     probes: list[dict] = []
     capital_subtotal = 0.0
     capital_breakdown: list[dict] = []
+    # Skip live API calls when every strategy that touches this venue is
+    # disabled — saves rate-limit budget for venues that ARE active. The
+    # operator sees a clear "venue inactive" status instead of probe
+    # results.
+    from app.bot import venue_is_active as _venue_is_active
+    bn_active = True
     if has_creds:
+        with SessionLocal() as _db_check:
+            bn_active = _venue_is_active(_db_check, 'binance')
+    if has_creds and bn_active:
         probes.append(_probe('Spot fetch_balance()', lambda: gw.spot.fetch_balance()))
         probes.append(_probe('Futures fetch_balance()', lambda: gw.futures.fetch_balance()))
         probes.append(_probe('Earn flexible USDT position', lambda: gw._call_sapi((
@@ -1323,6 +1332,37 @@ def _gather_exchange_status() -> list[dict]:
             'sapi_v1_get_simple_earn_flexible_position',
             'sapiGetSimpleEarnFlexiblePosition',
         ), {'asset': 'USDT'})))
+        # BFUSD debug probes — surface every earn surface that COULD list
+        # BFUSD so the operator can see where it actually lives. Different
+        # product types (flexible / locked / lending-project / auto-invest
+        # target asset) live under different SAPI endpoints. Whichever
+        # one shows BFUSD is the one the bot should subscribe through.
+        probes.append(_probe('BFUSD: simple-earn flexible list', lambda: gw._call_sapi((
+            'sapiV1GetSimpleEarnFlexibleList',
+            'sapi_v1_get_simple_earn_flexible_list',
+            'sapiGetSimpleEarnFlexibleList',
+        ), {'asset': 'BFUSD'})))
+        probes.append(_probe('BFUSD: simple-earn locked list', lambda: gw._call_sapi((
+            'sapiV1GetSimpleEarnLockedList',
+            'sapi_v1_get_simple_earn_locked_list',
+            'sapiGetSimpleEarnLockedList',
+        ), {'asset': 'BFUSD'})))
+        probes.append(_probe('BFUSD: simple-earn flexible list (no asset filter, paged)', lambda: gw._call_sapi((
+            'sapiV1GetSimpleEarnFlexibleList',
+            'sapi_v1_get_simple_earn_flexible_list',
+            'sapiGetSimpleEarnFlexibleList',
+        ), {'size': 100})))
+        probes.append(_probe('BFUSD: lending daily product list (legacy)', lambda: gw._call_sapi((
+            'sapiV1GetLendingDailyProductList',
+            'sapi_v1_get_lending_daily_product_list',
+            'sapiGetLendingDailyProductList',
+        ), {'asset': 'BFUSD'})))
+        probes.append(_probe('BFUSD: auto-invest target assets', lambda: gw._call_sapi((
+            'sapiV1GetLendingAutoInvestTargetAssetList',
+            'sapi_v1_get_lending_auto_invest_target_asset_list',
+            'sapiGetLendingAutoInvestTargetAssetList',
+        ), {})))
+        probes.append(_probe('BFUSD: papi balance (current holdings)', lambda: (gw._papi(gw.spot, ('papiGetBalance', 'papi_get_balance'))({'asset': 'BFUSD'}) if gw._papi(gw.spot, ('papiGetBalance', 'papi_get_balance')) else 'papiGetBalance not in this ccxt build')))
         probes.append(_probe('Deposit history (USDT, 30d)', lambda: gw.deposit_history('USDT', lookback_days=30, ttl_seconds=0)))
         probes.append(_probe('Withdrawal history (USDT, 30d)', lambda: gw.withdrawal_history('USDT', lookback_days=30, ttl_seconds=0)))
         probes.append(_probe('Sub-account transfer in (USDT, 30d)', lambda: gw.sub_account_transfer_history('USDT', incoming=True, lookback_days=30, ttl_seconds=0)))
@@ -1371,7 +1411,7 @@ def _gather_exchange_status() -> list[dict]:
         ]
         capital_subtotal = spot_usdt + spot_assets + fut_usdt + earn_usdt
     bn_account_label = bn_account_detail = ''
-    if has_creds:
+    if has_creds and bn_active:
         try:
             bn_account_label, bn_account_detail = gw.account_type()
         except Exception as e:
@@ -1390,7 +1430,8 @@ def _gather_exchange_status() -> list[dict]:
         'last_balance_error': gw.last_balance_error,
         'capital_subtotal_usdt': capital_subtotal,
         'capital_breakdown': capital_breakdown,
-        'role': 'spot + USDM-perp arb (active)',
+        'is_active': bn_active,
+        'role': ('spot + USDM-perp arb (active)' if bn_active else 'spot + USDM-perp arb (INACTIVE — all strategies disabled)'),
     })
 
     # ---- KuCoin ----
@@ -1402,8 +1443,12 @@ def _gather_exchange_status() -> list[dict]:
     kc_capital_subtotal = 0.0
     kc_capital_breakdown: list[dict] = []
     kc_balance_err = ''
+    kc_active = True
     if kc_configured:
+        with SessionLocal() as _db_check:
+            kc_active = _venue_is_active(_db_check, 'kucoin')
         kgw = KuCoinGateway()
+    if kc_configured and kc_active:
         kc_probes.append(_probe('Spot fetch_balance(trade)', lambda: kgw.spot.fetch_balance({'type': 'trade'})))
         kc_probes.append(_probe('Spot fetch_balance(main)', lambda: kgw.spot.fetch_balance({'type': 'main'})))
         kc_probes.append(_probe('Futures fetch_balance()', lambda: kgw.futures.fetch_balance()))
@@ -1446,7 +1491,7 @@ def _gather_exchange_status() -> list[dict]:
         ]
         kc_capital_subtotal = kc_spot_usdt + kc_spot_assets + kc_fut_usdt + kc_earn_usdt
     kc_account_label = kc_account_detail = ''
-    if kc_configured:
+    if kc_configured and kc_active:
         try:
             kc_account_label, kc_account_detail = kgw.account_type()
         except Exception as e:
@@ -1466,7 +1511,11 @@ def _gather_exchange_status() -> list[dict]:
         'last_balance_error': kc_balance_err,
         'capital_subtotal_usdt': kc_capital_subtotal,
         'capital_breakdown': kc_capital_breakdown,
-        'role': 'spot + USDT-perp arb' + (' (active)' if kc_configured else ' (set credentials to activate)'),
+        'is_active': kc_active,
+        'role': ('spot + USDT-perp arb' + (
+            ' (active)' if kc_configured and kc_active else
+            (' (INACTIVE — all strategies disabled)' if kc_configured else ' (set credentials to activate)')
+        )),
     })
 
     # ---- Interactive Brokers (future — for cross-asset arb / equities) ----

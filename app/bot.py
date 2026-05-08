@@ -187,6 +187,27 @@ def get_earn_state(db, mode: str, exchange: str = 'binance') -> EarnState:
     return state
 
 
+def venue_is_active(db, venue_id: str) -> bool:
+    """True iff at least one strategy that uses ``venue_id`` as a leg has
+    ``entry_enabled=True`` in either mode. When this returns False, the
+    cycle and dashboard skip all API calls to the venue — there's no
+    work to do, and not calling preserves rate-limit budget for venues
+    that ARE active. As soon as the operator re-enables any strategy
+    on /config, the next cycle picks up immediately."""
+    from app.models import StrategyState as _SS
+    from app.models import trade_types_touching_venue as _tt
+    relevant = _tt(venue_id)
+    if not relevant:
+        return True  # unknown venue — fail-open (don't accidentally block)
+    rows = db.scalars(select(_SS).where(_SS.trade_type.in_(relevant))).all()
+    if not rows:
+        # No state rows yet (fresh install); default-enabled strategies
+        # exist conceptually, so treat as active. The first cycle will
+        # bootstrap rows via get_strategy_state.
+        return True
+    return any(r.entry_enabled for r in rows)
+
+
 def get_all_earn_states(db, mode: str) -> list[EarnState]:
     """Every venue's EarnState row for ``mode``. Used by the dashboard to
     aggregate earn balances across venues without missing any."""
@@ -800,6 +821,12 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
     paper = (mode == MODE_PAPER)
     try:
         with SessionLocal() as db:
+            # Skip the venue entirely if every strategy that touches it
+            # is disabled. Saves API calls (rate-limit budget) and log
+            # noise. Re-checked every cycle so flipping a strategy on
+            # via /config picks up on the next iteration without restart.
+            if not venue_is_active(db, gateway.venue_id):
+                return
             cfg = get_strategy_config(db)
             mstate = get_mode_state(db, mode)
             earn = get_earn_state(db, mode, exchange=gateway.venue_id)
