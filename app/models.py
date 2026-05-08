@@ -254,11 +254,17 @@ class StrategyConfig(Base):
     max_position_pct: Mapped[float] = mapped_column(Float, default=0.10)
     max_position_notional: Mapped[float] = mapped_column(Float, default=10.0)  # deprecated
     min_symbol_notional: Mapped[float] = mapped_column(Float, default=5.0)     # deprecated
-    min_24h_quote_volume: Mapped[float] = mapped_column(Float, default=100000.0)
-    # Order-book depth liquidity filter. Reject any candidate where the smaller
-    # of (spot ask depth, perp bid depth) within ±depth_band_bps of mid is below
-    # this threshold. 0 disables the filter.
-    min_order_book_depth_usdt: Mapped[float] = mapped_column(Float, default=500.0)
+    # Hard-coded liquidity filters at scan time were a heuristic
+    # proxy for "can this trade actually execute". The protected
+    # execution path (simulate_fill at the per-candidate stage) is
+    # the real liquidity check — it walks the actual order book at
+    # the actual sizing the bot will use, then the profitability gate
+    # runs against that fill's avg/worst prices. The scan-time
+    # filters are kept as cheap pre-filters in case the operator
+    # wants to skip obviously-illiquid pairs before the book walk;
+    # both default to 0 so they only apply when explicitly set.
+    min_24h_quote_volume: Mapped[float] = mapped_column(Float, default=0.0)
+    min_order_book_depth_usdt: Mapped[float] = mapped_column(Float, default=0.0)
     depth_band_bps: Mapped[float] = mapped_column(Float, default=10.0)
     stop_loss_pct: Mapped[float] = mapped_column(Float, default=-0.02)
     paper_slippage_bps: Mapped[float] = mapped_column(Float, default=5.0)
@@ -267,6 +273,29 @@ class StrategyConfig(Base):
     paper_starting_equity: Mapped[float] = mapped_column(Float, default=1000.0)
     entry_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     exit_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    # ─── Profitability gate (replaces hard-coded basis filter) ────────
+    # Round-trip taker fee per leg in bps. The bot pays this on entry
+    # spot + entry perp + exit spot + exit perp = 4× this number per
+    # complete round trip. Defaults to 5 bps which is roughly the
+    # taker-fee tier on Binance USDM and KuCoin futures with no VIP
+    # discount. Set lower if you have a fee tier; the bot conservatively
+    # uses the configured value as the actual paid fee.
+    taker_fee_bps: Mapped[float] = mapped_column(Float, default=5.0)
+    # Exit basis buffer multiple: assume worst-case exit basis is this
+    # multiple of the entry basis when projecting profitability. 3×
+    # default — i.e. if we entered with 5 bps of cross-leg basis cost,
+    # we conservatively assume exit costs 15 bps. The full round-trip
+    # basis cost the profitability gate uses is therefore
+    # ``|entry_basis_bps| × (1 + multiple)``.
+    exit_basis_buffer_multiple: Mapped[float] = mapped_column(Float, default=3.0)
+    # Minimum profit per single funding window (in bps of position
+    # notional) for the trade to be eligible. Computed at execution
+    # time using the actual ``simulate_fill`` prices:
+    #   net_bps = funding_window_bps − |entry_basis_bps| × (1 + buffer) − 4 × taker_fee_bps
+    # If net_bps < this threshold, the candidate is rejected with a
+    # detailed `insufficient_profit (...)` reason. 0 = accept any
+    # positive expected profit; raise to require a margin of safety.
+    min_window_profit_bps: Mapped[float] = mapped_column(Float, default=0.0)
     max_entry_basis_bps: Mapped[float] = mapped_column(Float, default=20.0)
     max_exit_basis_bps: Mapped[float] = mapped_column(Float, default=5.0)
     # Limit-IOC tick buffer for the protected execution path. The bot
