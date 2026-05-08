@@ -1026,14 +1026,31 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     'spot_depth': c.spot_depth_usdt,
                     'perp_depth': c.perp_depth_usdt,
                 } for c in passing[:5]]
-                # Cap raised from 20 → 60 so the top-10 below-threshold
-                # candidates per quote (USDT + USDC) survive alongside
-                # any no_spot_market / volume / depth rejections from
-                # the same scan. With ≤60 rows per cycle × 2 venues × 2
-                # modes × 7-day retention the rejected_candidates table
-                # stays well under a million rows.
-                for sym, reason, apr in rejected_scan[:60]:
+                # Per-(quote, reason-category) bucket sampling. A flat
+                # `rejected_scan[:60]` cap drowned out USDC rejections
+                # whenever 100+ above-threshold USDT pairs hit upstream
+                # filters (no_spot_market, volume<, depth<) on the same
+                # scan — they're appended during the main scan loop and
+                # filled the cap before the after-loop top-below USDC
+                # rejections reached it. The bucket cap of 8 per
+                # (quote, category) guarantees every reason × quote
+                # combo gets representation in /logs.
+                PER_BUCKET_CAP = 8
+                PER_SCAN_CAP = 120
+                _buckets: dict = {}
+                _saved = 0
+                for sym, reason, apr in rejected_scan:
+                    quote = 'USDC' if 'USDC' in sym else ('USDT' if 'USDT' in sym else 'OTHER')
+                    cat_full = reason.split(' (')[0]
+                    cat = cat_full.split('<')[0].strip()[:32]  # strip "<N" tail
+                    key = (quote, cat)
+                    if _buckets.get(key, 0) >= PER_BUCKET_CAP:
+                        continue
+                    _buckets[key] = _buckets.get(key, 0) + 1
                     db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=sym, reason=reason, funding_rate=apr))
+                    _saved += 1
+                    if _saved >= PER_SCAN_CAP:
+                        break
 
                 total_equity, free_by_quote = _compute_equity_and_free(db, gateway, mode, cfg)
                 # Per-quote spot/futures free for sizing. Each candidate's
