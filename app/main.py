@@ -1157,7 +1157,6 @@ def save_config(
     max_position_pct_pct: float = Form(...),
     futures_buffer_pct_pct: float = Form(...),
     # Plain integer / decimal fields below.
-    min_24h_quote_volume: float = Form(...),
     max_open_positions: int = Form(...),
     max_trades_per_day: int = Form(...),
     max_hold_hours: int = Form(...),
@@ -1172,8 +1171,6 @@ def save_config(
     delisting_check: int = Form(...),
     auto_transfer_enabled: int = Form(...),
     max_perp_leverage: int = Form(1),
-    min_order_book_depth_usdt: float = Form(500.0),
-    depth_band_bps: float = Form(10.0),
     _: None = Depends(auth),
 ):
     with SessionLocal() as db:
@@ -1186,7 +1183,6 @@ def save_config(
         cfg.max_position_pct = max_position_pct_pct / 100.0
         cfg.futures_buffer_pct = max(0.05, min(1.0, futures_buffer_pct_pct / 100.0))
         # Plain values.
-        cfg.min_24h_quote_volume = min_24h_quote_volume
         cfg.max_open_positions = max_open_positions
         cfg.max_trades_per_day = max_trades_per_day
         cfg.max_hold_hours = max_hold_hours
@@ -1203,8 +1199,11 @@ def save_config(
         new_lev = max(1, max_perp_leverage or 1)
         cfg.max_perp_leverage = new_lev
         cfg.perp_leverage = new_lev  # legacy mirror
-        cfg.min_order_book_depth_usdt = max(0.0, min_order_book_depth_usdt)
-        cfg.depth_band_bps = max(1.0, depth_band_bps)
+        # Zero-out legacy depth/volume gates so old user values stop
+        # firing. simulate_fill at the per-candidate stage is the
+        # single liquidity check now.
+        cfg.min_24h_quote_volume = 0.0
+        cfg.min_order_book_depth_usdt = 0.0
         db.commit()
     return RedirectResponse(url='/config?saved=1', status_code=303)
 
