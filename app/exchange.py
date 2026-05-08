@@ -80,8 +80,20 @@ class Candidate:
     spot_depth_usdt: float = 0.0
     perp_depth_usdt: float = 0.0
     venue_id: str = 'binance'
-    quote_currency: str = 'USDT'  # 'USDT' or 'USDC'; sizing/balance reads
-                                  # use this asset on the venue's wallet.
+    quote_currency: str = 'USDT'       # PERP quote currency. Drives perp-leg
+                                       # margin and futures wallet routing.
+    spot_quote_currency: str = 'USDT'  # SPOT quote currency. Often equal to
+                                       # quote_currency, but for a cross-
+                                       # stable arb (e.g. DOGEUSDC perp +
+                                       # DOGE/USDT spot) the two diverge —
+                                       # the spot leg consumes this quote's
+                                       # free balance, the perp leg consumes
+                                       # ``quote_currency``. The 1:1ish USDC
+                                       # ↔ USDT peg makes the resulting
+                                       # delta-neutral hedge real, with the
+                                       # tiny per-cycle depeg risk paid for
+                                       # many times over by typical
+                                       # cross-stable funding spreads.
 
     @property
     def funding_apr(self) -> float:
@@ -489,11 +501,33 @@ class VenueGateway:
                 per_quote_top_below[quote].append((symbol, apr))
                 continue
             base = symbol.split('/')[0]
-            spot_symbol = f'{base}/{quote}'
-            if spot_symbol not in self.spot.markets:
-                rejected.append((symbol, f'no_spot_market ({quote})', apr))
+            # Pair the perp with the matching-quote spot first; if that
+            # doesn't exist on this venue, fall back to the OTHER stable
+            # (USDC perp ↔ USDT spot, USDT perp ↔ USDC spot). The 1:1ish
+            # USDC↔USDT peg makes the cross-stable hedge real — basis
+            # risk per cycle is bps; typical funding spreads pay
+            # multiple percent per day. The Candidate carries
+            # ``spot_quote_currency`` separately so the bot's wallet
+            # routing knows which quote the SPOT leg consumes (vs the
+            # perp's margin which uses ``quote_currency``).
+            preferred = f'{base}/{quote}'
+            spot_symbol = None
+            spot_quote = quote
+            if preferred in self.spot.markets:
+                spot_symbol = preferred
+            else:
+                for alt_q in SUPPORTED_QUOTES:
+                    if alt_q == quote:
+                        continue
+                    cand = f'{base}/{alt_q}'
+                    if cand in self.spot.markets:
+                        spot_symbol = cand
+                        spot_quote = alt_q
+                        break
+            if spot_symbol is None:
+                rejected.append((symbol, f'no_spot_market ({"+".join(SUPPORTED_QUOTES)})', apr))
                 continue
-            prefiltered.append((symbol, spot_symbol, float(fr), interval_h, quote))
+            prefiltered.append((symbol, spot_symbol, float(fr), interval_h, quote, spot_quote))
 
         # Batch ticker fetch for everything that passed the cheap filters.
         # ccxt's spot.fetch_tickers(symbols) returns {symbol: ticker} in
@@ -514,11 +548,11 @@ class VenueGateway:
                 except Exception as e2:
                     e = e2
                     msg = str(e)[:60]
-                    for sym, _, _, _, _ in prefiltered:
+                    for sym, _, _, _, _, _ in prefiltered:
                         rejected.append((sym, f'ticker_fetch_failed: {msg}', annualize_rate(0.0, 8.0)))
                     prefiltered = []
 
-        for symbol, spot_symbol, fr_v, interval_h, quote in prefiltered:
+        for symbol, spot_symbol, fr_v, interval_h, quote, spot_quote in prefiltered:
             apr = annualize_rate(fr_v, interval_h)
             t = tickers.get(spot_symbol) or {}
             qv = float(t.get('quoteVolume') or 0)
@@ -543,6 +577,7 @@ class VenueGateway:
                 perp_depth_usdt=perp_depth,
                 venue_id=self.venue_id,
                 quote_currency=quote,
+                spot_quote_currency=spot_quote,
             ))
         # Rank by funding APY first; ties go to the deeper book.
         passing.sort(key=lambda c: (c.funding_apr, c.min_depth_usdt), reverse=True)
