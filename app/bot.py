@@ -1074,6 +1074,29 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     if _saved >= PER_SCAN_CAP:
                         break
 
+                # Sweep funding/main into the trade wallet BEFORE we read
+                # balances for sizing. Venues like KuCoin Classic split spot
+                # cash across `trade` (where orders execute) and `main`
+                # (default deposit zone) — our synthesised
+                # `spot.<asset>.free` aggregates both, but a market spot
+                # order only sees `trade`. Without this consolidation,
+                # sizing thinks we have $9.90 free, picks a $5 notional,
+                # and the order fails because trade actually only has
+                # $0.10. Other venues (Binance Classic / PM, KuCoin UTA)
+                # have a single spot wallet — their override is a no-op.
+                if mode == MODE_LIVE:
+                    try:
+                        moves = gateway.consolidate_spot_wallets(paper_mode=False)
+                        for asset, amt, err in moves:
+                            if err:
+                                log_event(db, f'Spot wallet consolidate {asset}: {err[:160]}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                            elif amt > 0:
+                                log_event(db, f'Spot wallet consolidate {asset}: {amt:.4f} main→trade (align spot.free with what spot orders can spend)', mode=mode, exchange=gateway.venue_id)
+                        if any(amt > 0 for _, amt, _ in moves):
+                            gateway.safe_balances(force_refresh=True)  # invalidate cache so post-sweep state is read
+                    except Exception as e:
+                        log_event(db, f'Spot wallet consolidate raised: {str(e)[:160]}', mode=mode, level='WARN', exchange=gateway.venue_id)
+
                 total_equity, free_by_quote = _compute_equity_and_free(db, gateway, mode, cfg)
                 # Per-quote spot/futures free for sizing. Each candidate's
                 # quote_currency selects the right pool — never cross-funded.
