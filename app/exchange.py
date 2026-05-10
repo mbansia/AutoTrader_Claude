@@ -1134,6 +1134,23 @@ class VenueGateway:
         """
         return []
 
+    def wallet_breakdown(self, assets: tuple[str, ...] = SUPPORTED_QUOTES) -> dict:
+        """Diagnostic — return every wallet-type's per-asset balance so
+        the operator can audit where funds are actually parked. Default
+        returns the venue's standard spot+futures from ``safe_balances``.
+        KuCoin Classic overrides to also probe margin / isolated / pool.
+        Called from bot.py when a sizing rejection looks suspicious."""
+        bals = self.safe_balances() or {}
+        out: dict[str, dict] = {}
+        for asset in assets:
+            spot_row = (bals.get('spot') or {}).get(asset) or {}
+            fut_row = (bals.get('futures') or {}).get(asset) or {}
+            out[asset] = {
+                'spot': {'free': float(spot_row.get('free') or 0), 'total': float(spot_row.get('total') or 0)},
+                'contract': {'free': float(fut_row.get('free') or 0), 'total': float(fut_row.get('total') or 0)},
+            }
+        return out
+
     def is_unified_margin(self) -> bool:
         """Authoritative answer to "does this venue have a single
         unified-margin pool?". Used by the rebalance step to decide
@@ -2300,17 +2317,52 @@ class KuCoinGateway(VenueGateway):
             return []
         results: list[tuple[str, float, str]] = []
         DUST = 0.01
+        # KuCoin Classic actually has MORE than just trade / main / contract
+        # — `margin` (cross-margin), `isolated` (isolated margin per-symbol),
+        # and `pool` (KuCoin Earn / Pool-X). Deposits sometimes auto-route
+        # to these depending on the user's last-used UI feature. Sweeping
+        # all of them into `trade` aligns the abstraction with what spot
+        # orders can actually spend. `pool` is excluded — Earn positions
+        # are time-locked and can't be moved without breaking the lock.
+        SOURCES = ('main', 'margin', 'isolated')
         for asset in assets:
-            try:
-                main_free = float((self.spot.fetch_balance({'type': 'main'}).get(asset) or {}).get('free') or 0)
-            except Exception as e:
-                results.append((asset, 0.0, f'fetch main balance failed: {e}'))
-                continue
-            if main_free <= DUST:
-                continue
-            ok, err = self._transfer('main', 'trade', main_free, asset=asset)
-            results.append((asset, main_free if ok else 0.0, '' if ok else err))
+            for source in SOURCES:
+                try:
+                    src_free = float((self.spot.fetch_balance({'type': source}).get(asset) or {}).get('free') or 0)
+                except Exception as e:
+                    results.append((f'{asset}@{source}', 0.0, f'fetch {source} balance failed: {e}'))
+                    continue
+                if src_free <= DUST:
+                    continue
+                ok, err = self._transfer(source, 'trade', src_free, asset=asset)
+                results.append((f'{asset}@{source}', src_free if ok else 0.0, '' if ok else err))
         return results
+
+    def wallet_breakdown(self, assets: tuple[str, ...] = SUPPORTED_QUOTES) -> dict:
+        """Diagnostic — read every KuCoin Classic wallet type per asset.
+        Used by bot.py to log a full breakdown when sizing rejections
+        fire so the operator can see exactly which wallet holds the
+        missing funds. Returns ``{asset: {wallet_type: {free, total}}}``
+        and an ``error`` key per (asset, wallet_type) on fetch failure."""
+        if self._is_uta:
+            return {'note': 'UTA: single unified pool, see safe_balances()'}
+        out: dict[str, dict] = {}
+        for asset in assets:
+            out[asset] = {}
+            for wtype in ('main', 'trade', 'margin', 'isolated', 'contract', 'pool'):
+                try:
+                    if wtype == 'contract':
+                        bal = self.futures.fetch_balance()
+                    else:
+                        bal = self.spot.fetch_balance({'type': wtype})
+                    row = bal.get(asset) or {}
+                    out[asset][wtype] = {
+                        'free': float(row.get('free') or 0),
+                        'total': float(row.get('total') or 0),
+                    }
+                except Exception as e:
+                    out[asset][wtype] = {'error': str(e)[:80]}
+        return out
 
     # ─── Capital-injection history (KuCoin) ───────────────────────────────
     # KuCoin sub-accounts: master→sub transfers come in via the
