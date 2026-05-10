@@ -55,6 +55,7 @@ from app.models import (
     ALL_MODES,
     MODE_LIVE,
     MODE_PAPER,
+    OPEN_STATUSES,
     VENUE_BINANCE,
     BalanceSnapshot,
     BotEvent,
@@ -568,6 +569,16 @@ def recover_phantom_spot(db, gateway: VenueGateway, mode: str, cfg: StrategyConf
         funding_now = gateway.funding_rates_dict() or {}
     except Exception:
         funding_now = {}
+    # Also exclude bases that already have a NAKED_SPOT record so we don't
+    # create duplicate phantom rows across cycles.
+    naked_already = {
+        p.spot_symbol.split('/')[0]: p
+        for p in db.scalars(select(Position).where(
+            Position.status == 'naked_spot',
+            Position.mode == mode,
+            Position.exchange == gateway.venue_id,
+        )).all()
+    }
     for asset, row in spot_assets.items():
         if asset in META_KEYS or asset in SUPPORTED_QUOTES or not isinstance(row, dict):
             continue
@@ -582,6 +593,48 @@ def recover_phantom_spot(db, gateway: VenueGateway, mode: str, cfg: StrategyConf
         notional = free_qty * px
         if notional < DUST_USDT:
             continue
+
+        # ─── Persist as a Position FIRST so it shows up in the dashboard
+        # ─── before we attempt any recovery action. A naked spot is still
+        # ─── a position; the portfolio view must always be complete.
+        # ─── Reuse the existing naked_spot row if there is one (likely
+        # ─── from a previous cycle's failed recovery), updating its
+        # ─── quantity to the current wallet truth.
+        if asset in naked_already:
+            pos = naked_already[asset]
+            pos.quantity = free_qty
+            db.flush()
+        else:
+            pos = Position(
+                mode=mode,
+                exchange=gateway.venue_id,
+                trade_type=venue_to_trade_type(gateway.venue_id),
+                symbol=asset,
+                spot_symbol=sym_usdt,
+                perp_symbol=f'{asset}/USDT:USDT',  # tentative; updated if hedge succeeds with a different quote
+                quote_currency='USDT',
+                spot_quote_currency='USDT',
+                quantity=free_qty,
+                status='naked_spot',
+                entry_funding_rate=0.0,
+                last_funding_rate=0.0,
+                spot_entry_price=px,  # current price as a stand-in; the true entry price is on a trade we never recorded
+                perp_entry_price=0.0,
+                last_funding_accrual_ts=datetime.utcnow(),
+            )
+            db.add(pos)
+            db.flush()
+            # Synthetic "ghost entry" Trade row so the transactions tab
+            # surfaces the original (un-recorded) buy. We don't know the
+            # exact venue-side prices/fees; the synthetic row uses the
+            # current mid as an estimate and a note flags it as a
+            # reconstruction so the operator isn't misled.
+            record_trade(
+                db, pos.id, mode, sym_usdt, 'spot', 'buy', free_qty,
+                {'price': px, 'amount': free_qty, 'filled': free_qty, 'fee': {'cost': 0.0}, '_reconstructed_from_phantom': True},
+                exchange=gateway.venue_id,
+            )
+            log_event(db, f'Naked spot recorded: {free_qty:.6f} {asset} (~${notional:.2f}) at est. ${px:.6f} — original buy unrecorded (partial fill under spot_buy_error); now visible in dashboard as a naked_spot position', mode=mode, level='ERROR', exchange=gateway.venue_id)
 
         # ─── Phase 1: try to HEDGE by shorting the matching perp ─────────
         hedged = False
@@ -638,26 +691,20 @@ def recover_phantom_spot(db, gateway: VenueGateway, mode: str, cfg: StrategyConf
             if perp_filled <= 0:
                 log_event(db, f'Phantom spot {asset}: hedge perp short zero-fill (book moved) — falling back to spot sell', mode=mode, level='WARN', exchange=gateway.venue_id)
                 break
-            # Persist as a real Position. If perp filled less than spot,
-            # we'll trim spot below.
-            pos = Position(
-                mode=mode,
-                exchange=gateway.venue_id,
-                trade_type=venue_to_trade_type(gateway.venue_id),
-                symbol=asset,
-                spot_symbol=sym_usdt,
-                perp_symbol=perp_sym,
-                quote_currency=perp_quote,
-                spot_quote_currency='USDT',
-                quantity=min(free_qty, perp_filled),
-                entry_funding_rate=float(fr),
-                last_funding_rate=float(fr),
-                funding_interval_hours=interval_h,
-                spot_entry_price=spot_now,
-                perp_entry_price=float(f.get('price') or perp_limit),
-                last_funding_accrual_ts=datetime.utcnow(),
-            )
-            db.add(pos)
+            # Promote the existing naked_spot Position to a real hedged
+            # position. Update the columns the perp leg fills in.
+            pos.perp_symbol = perp_sym
+            pos.quote_currency = perp_quote
+            pos.spot_quote_currency = 'USDT'
+            pos.quantity = min(free_qty, perp_filled)
+            pos.entry_funding_rate = float(fr)
+            pos.last_funding_rate = float(fr)
+            pos.funding_interval_hours = interval_h
+            pos.spot_entry_price = spot_now
+            pos.perp_entry_price = float(f.get('price') or perp_limit)
+            pos.last_funding_accrual_ts = datetime.utcnow()
+            pos.status = 'open'
+            pos.last_close_error = ''
             db.flush()
             record_trade(db, pos.id, mode, perp_sym, 'futures', 'sell', perp_filled, f, exchange=gateway.venue_id)
             log_event(db, f'Phantom spot RESCUED into a hedged position: shorted {perp_filled:.6f} {perp_sym} @ {(f.get("price") or perp_limit):.6f} against {free_qty:.6f} {asset} spot (forward net APY {net_apy*100:+.2f}%; phantom from earlier partial-fill is now a real Position)', mode=mode, level='ERROR', exchange=gateway.venue_id)
@@ -699,6 +746,11 @@ def recover_phantom_spot(db, gateway: VenueGateway, mode: str, cfg: StrategyConf
         if filled <= 0:
             log_event(db, f'Phantom spot recovery: {asset} limit-IOC sell zero-fill (book moved); retry next cycle', mode=mode, level='WARN', exchange=gateway.venue_id)
             continue
+        # Record the sell on the naked_spot Position and close it.
+        record_trade(db, pos.id, mode, sym_usdt, 'spot', 'sell', filled, rev, exchange=gateway.venue_id)
+        pos.status = 'closed'
+        pos.last_close_error = 'naked spot flattened to USDT (hedge not feasible)'
+        db.flush()
         log_event(db, f'Phantom spot CLOSED: sold {filled:.6f} {asset} → USDT @ {(rev.get("price") or limit_px):.6f} (hedge not feasible, flattened)', mode=mode, level='ERROR', exchange=gateway.venue_id)
 
 
@@ -1434,7 +1486,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     # though the perp symbol formally matches; a clean default for the
                     # max_open_positions > 1 case.
                     held_bases = {p.spot_symbol.split('/')[0] for p in db.scalars(
-                        select(Position).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)
+                        select(Position).where(Position.status.in_(OPEN_STATUSES), Position.mode == mode, Position.exchange == gateway.venue_id)
                     ).all()}
                     # Per-strategy gate. The candidate inherits the
                     # gateway's trade-type tag (same-venue funding arb
