@@ -1337,8 +1337,19 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             # Shrink to the smaller-fillable side and retry.
                             target_qty = min_filled
                         if target_qty <= 0 or spot_sim is None:
+                            # Surface WHY both legs read zero so we can tell
+                            # apart "fetch_order_book threw" from "empty book"
+                            # from "ccxt symbol shape mismatch / pair not
+                            # listed". Without the inner errors we can't
+                            # distinguish a venue-side outage from a wrong
+                            # symbol shape.
+                            spot_err = (spot_sim or {}).get('error', '?') if spot_sim else 'no_spot_sim'
+                            perp_err = (perp_sim or {}).get('error', '?') if perp_sim else 'no_perp_sim'
                             db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol,
-                                reason=f'no_book_depth (spot_filled={spot_sim["filled_qty"] if spot_sim else 0:.6f}, perp_filled={perp_sim["filled_qty"] if perp_sim else 0:.6f})',
+                                reason=(f'no_book_depth (spot_filled={spot_sim["filled_qty"] if spot_sim else 0:.6f}, '
+                                        f'perp_filled={perp_sim["filled_qty"] if perp_sim else 0:.6f}; '
+                                        f'spot_err={spot_err[:80]}; perp_err={perp_err[:80]}; '
+                                        f'spot_sym={c.spot_symbol}; perp_sym={c.perp_symbol})'),
                                 funding_rate=c.funding_apr))
                             scan_action = 'no_book_depth'
                             continue
