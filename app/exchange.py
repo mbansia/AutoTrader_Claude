@@ -332,7 +332,7 @@ class VenueGateway:
         target_qty: float,
         side: str,
         perp: bool = False,
-        max_levels: int = 50,
+        max_levels: int = 100,
     ) -> dict:
         """Walk the order book to simulate filling ``target_qty`` of base
         asset. Returns ``{ok, filled_qty, avg_price, worst_price, levels,
@@ -357,6 +357,12 @@ class VenueGateway:
         * ``levels`` is the count of book levels consumed (debugging).
         """
         ex = self.futures if perp else self.spot
+        # KuCoin's REST API rejects any orderbook depth other than 20 or 100
+        # ("limit argument must be 20 or 100" → fetch_order_book raises and
+        # simulate_fill returns filled_qty=0). Snap to the closest supported
+        # value so the walk doesn't fail on a venue-specific quirk.
+        if self.venue_id == 'kucoin':
+            max_levels = 100 if max_levels >= 60 else 20
         try:
             ob = ex.fetch_order_book(symbol, limit=max_levels)
         except Exception as e:

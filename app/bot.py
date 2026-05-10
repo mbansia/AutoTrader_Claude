@@ -1048,6 +1048,20 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     'spot_depth': c.spot_depth_usdt,
                     'perp_depth': c.perp_depth_usdt,
                 } for c in passing[:5]]
+                # Per-candidate diagnostic showing the EXACT inputs to the
+                # APY calc — venue's predicted next-window rate (which may
+                # differ from the rate you see in their UI; predicted is
+                # forward-looking and updates continuously) plus the funding
+                # interval the bot parsed from the contract metadata. If
+                # the venue UI shows X% per Yh but this log shows different
+                # values, it's a parser issue worth flagging.
+                for c in passing[:3]:
+                    log_event(
+                        db,
+                        f'Scan top {c.perp_symbol}: predicted rate={c.funding_rate*100:+.4f}% per {c.funding_interval_hours:.0f}h → APY={c.funding_apr*100:+.2f}%',
+                        mode=mode,
+                        exchange=gateway.venue_id,
+                    )
                 # Per-(quote, reason-category) bucket sampling. A flat
                 # `rejected_scan[:60]` cap drowned out USDC rejections
                 # whenever 100+ above-threshold USDT pairs hit upstream
@@ -1370,37 +1384,63 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         if spot_avg <= 0 or perp_avg <= 0:
                             continue
                         fill_basis_bps = (perp_avg - spot_avg) / spot_avg * 10000.0
-                        # Hard sanity bound: a basis gap that exceeds
-                        # max_entry_basis_bps indicates a market
-                        # dislocation or stale data — reject regardless
-                        # of profitability.
-                        if abs(fill_basis_bps) > cfg.max_entry_basis_bps:
+                        # Sanity bound: catch genuinely-dislocated quotes
+                        # (stale spot / wrong contract / parser bug) where
+                        # the fill prices imply something silly. Asymmetric
+                        # because the two basis directions are economically
+                        # OPPOSITE for long-spot/short-perp funding arb:
+                        #   * Positive basis (perp > spot): we sell the perp
+                        #     leg at a premium → entry kicker, profitable.
+                        #     Allow generously (max_entry_basis_bps × 5), only
+                        #     reject if it's wildly out of bounds (parser bug
+                        #     or one-off feed glitch).
+                        #   * Negative basis (perp < spot): we sell the perp
+                        #     leg at a discount → entry cost. Cap tightly at
+                        #     max_entry_basis_bps so we don't open into a
+                        #     known-losing trade hoping funding overcomes.
+                        positive_cap = float(cfg.max_entry_basis_bps) * 5.0
+                        negative_cap = float(cfg.max_entry_basis_bps)
+                        dislocated = (fill_basis_bps > positive_cap) or (fill_basis_bps < -negative_cap)
+                        if dislocated:
                             db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol,
-                                reason=f'basis_dislocated ({fill_basis_bps:+.1f}bps > ±{cfg.max_entry_basis_bps:.1f}bps sanity bound at fill prices spot={spot_avg:.6f} perp={perp_avg:.6f})',
+                                reason=(f'basis_dislocated ({fill_basis_bps:+.1f}bps outside '
+                                        f'[-{negative_cap:.1f}, +{positive_cap:.1f}] at fill prices '
+                                        f'spot={spot_avg:.6f} perp={perp_avg:.6f})'),
                                 funding_rate=c.funding_apr))
                             scan_action = 'basis_dislocated'
                             continue
-                        # Profitability gate: compute net expected
-                        # profit per single funding window using actual
-                        # API-reported taker fees, then annualize
-                        # (compounded) and compare to the operator's
-                        # entry-annualized-net-profit threshold. The
-                        # cost components subtracted from the funding
-                        # window are:
-                        #   * round-trip basis = entry_basis × (1 + exit_buffer)
-                        #     (assume worst-case exit basis is
-                        #     `exit_basis_buffer_multiple` × entry)
-                        #   * round-trip taker fees = 2 × spot_taker + 2 × perp_taker
-                        #     (entry + exit on each leg). Pulled live
-                        #     from the venue's API per symbol per hour.
+                        # Profitability gate. Compute net expected profit per
+                        # single funding window using actual API-reported
+                        # taker fees, annualize (compounded), and compare to
+                        # the operator's entry-annualized-net-profit
+                        # threshold. The components are SIGNED — positive
+                        # entry basis shows up as income, negative as cost.
+                        #
+                        # Round-trip basis P&L for long-spot/short-perp:
+                        #   = entry_basis − exit_basis  (signed bps)
+                        # We don't know exit_basis at entry, so we model
+                        # worst-case adversely: assume the exit basis swings
+                        # by exit_basis_buffer_multiple × |entry_basis| in
+                        # the direction that hurts us. For positive entry
+                        # (kicker), worst-case exit is FURTHER positive
+                        # (we'd buy back the perp at an even higher premium
+                        # than we sold it at). For negative entry (cost),
+                        # worst-case exit is FURTHER negative.
                         funding_window_bps = c.funding_rate * 10000.0
-                        entry_basis_cost_bps = abs(fill_basis_bps)
                         exit_buffer = float(cfg.exit_basis_buffer_multiple or 3.0)
-                        round_trip_basis_bps = entry_basis_cost_bps * (1.0 + exit_buffer)
+                        worst_adverse_swing_bps = abs(fill_basis_bps) * exit_buffer
+                        # Round-trip basis P&L (signed; positive = income):
+                        round_trip_basis_signed_bps = fill_basis_bps - (
+                            fill_basis_bps + worst_adverse_swing_bps  # if positive entry, worst = entry + buffer
+                            if fill_basis_bps >= 0
+                            else fill_basis_bps - worst_adverse_swing_bps  # if negative entry, worst = entry − buffer
+                        )
+                        # Simplifies to ∓worst_adverse_swing_bps; keep the
+                        # explicit form for legibility.
                         spot_fee_bps = gateway.taker_fee_bps(c.spot_symbol, perp=False)
                         perp_fee_bps = gateway.taker_fee_bps(c.perp_symbol, perp=True)
                         round_trip_fees_bps = 2.0 * (spot_fee_bps + perp_fee_bps)
-                        net_per_window_bps = funding_window_bps - round_trip_basis_bps - round_trip_fees_bps
+                        net_per_window_bps = funding_window_bps + round_trip_basis_signed_bps - round_trip_fees_bps
                         # Annualize (compounded) using each candidate's
                         # own funding-interval-derived periods/year so
                         # 4h-cycle pairs (binance-perp) and 8h-cycle
@@ -1414,8 +1454,8 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         if net_apy < cfg.entry_funding_threshold:
                             db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol,
                                 reason=(f'insufficient_annualized_profit '
-                                        f'(funding={funding_window_bps:+.1f}bps − '
-                                        f'basis={round_trip_basis_bps:.1f}bps [entry {entry_basis_cost_bps:.1f}× (1+{exit_buffer:.1f})] − '
+                                        f'(funding={funding_window_bps:+.1f}bps + '
+                                        f'basis_RT={round_trip_basis_signed_bps:+.1f}bps [entry {fill_basis_bps:+.1f} − worst-swing {worst_adverse_swing_bps:.1f} (×{exit_buffer:.1f})] − '
                                         f'fees={round_trip_fees_bps:.1f}bps [spot {spot_fee_bps:.1f} + perp {perp_fee_bps:.1f}, ×2 RT] '
                                         f'= net {net_per_window_bps:+.1f}bps/{int(interval_h)}h '
                                         f'→ {net_apy*100:+.2f}% APY < {cfg.entry_funding_threshold*100:.2f}% required)'),
