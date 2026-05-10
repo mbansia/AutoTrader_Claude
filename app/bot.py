@@ -1384,31 +1384,17 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         if spot_avg <= 0 or perp_avg <= 0:
                             continue
                         fill_basis_bps = (perp_avg - spot_avg) / spot_avg * 10000.0
-                        # Sanity bound: catch genuinely-dislocated quotes
-                        # (stale spot / wrong contract / parser bug) where
-                        # the fill prices imply something silly. Asymmetric
-                        # because the two basis directions are economically
-                        # OPPOSITE for long-spot/short-perp funding arb:
-                        #   * Positive basis (perp > spot): we sell the perp
-                        #     leg at a premium → entry kicker, profitable.
-                        #     Allow generously (max_entry_basis_bps × 5), only
-                        #     reject if it's wildly out of bounds (parser bug
-                        #     or one-off feed glitch).
-                        #   * Negative basis (perp < spot): we sell the perp
-                        #     leg at a discount → entry cost. Cap tightly at
-                        #     max_entry_basis_bps so we don't open into a
-                        #     known-losing trade hoping funding overcomes.
-                        positive_cap = float(cfg.max_entry_basis_bps) * 5.0
-                        negative_cap = float(cfg.max_entry_basis_bps)
-                        dislocated = (fill_basis_bps > positive_cap) or (fill_basis_bps < -negative_cap)
-                        if dislocated:
-                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol,
-                                reason=(f'basis_dislocated ({fill_basis_bps:+.1f}bps outside '
-                                        f'[-{negative_cap:.1f}, +{positive_cap:.1f}] at fill prices '
-                                        f'spot={spot_avg:.6f} perp={perp_avg:.6f})'),
-                                funding_rate=c.funding_apr))
-                            scan_action = 'basis_dislocated'
-                            continue
+                        # No standalone basis sanity gate — the profitability
+                        # gate immediately below incorporates fill_basis_bps
+                        # (signed) plus the worst-case adverse-exit swing
+                        # plus round-trip taker fees, then compares the
+                        # annualized net profit to entry_funding_threshold.
+                        # That single check subsumes the old "is this basis
+                        # reasonable?" question: if the basis cost overwhelms
+                        # the funding kicker the candidate fails APY, and if
+                        # it doesn't the trade IS economic. Letting one gate
+                        # decide rather than two avoids rejecting candidates
+                        # that the profitability model would have approved.
                         # Profitability gate. Compute net expected profit per
                         # single funding window using actual API-reported
                         # taker fees, annualize (compounded), and compare to
