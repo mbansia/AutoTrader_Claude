@@ -49,7 +49,7 @@ from sqlalchemy import func, select
 from app.config import settings
 from app.db import SessionLocal
 from app.events import bus
-from app.exchange import VenueGateway, _interval_hours, annualize_rate, make_gateways
+from app.exchange import SUPPORTED_QUOTES, VenueGateway, _interval_hours, annualize_rate, make_gateways
 from app.finance import position_realized_pnl, position_unrealized_pnl, total_realized_pnl
 from app.models import (
     ALL_MODES,
@@ -519,6 +519,81 @@ def manual_close(db, gateway: VenueGateway, p: Position, cfg: StrategyConfig) ->
     _force_close_both(db, gateway, p, cfg, 'manual_close')
 
 
+def recover_phantom_spot(db, gateway: VenueGateway, mode: str, cfg: StrategyConfig) -> None:
+    """Detect non-stable spot holdings that don't correspond to any DB
+    Position and sell them back to USDT. Runs every live cycle as part
+    of Phase A safety.
+
+    Background: KuCoin's spot limit-IOC can partially fill BEFORE
+    returning a `Balance insufficient! 200004` error — the venue
+    matches what it can, then trips on the remainder's reservation.
+    ccxt raises on the error, the bot logs `spot_buy_error` and skips,
+    but the partial fill sits in the spot wallet as a naked long the
+    bot doesn't know about. The hedge integrity check only iterates
+    DB-recorded positions, so it misses these.
+
+    Recovery: enumerate every non-stable spot asset with non-trivial
+    qty, check whether a DB Position exists for that base, and if not,
+    sell the holding back to its USDT pair via limit-IOC. Logs ERROR
+    so the operator can see what was recovered."""
+    if mode != MODE_LIVE:
+        return
+    try:
+        bals = gateway.safe_balances() or {}
+    except Exception:
+        return
+    spot_assets = bals.get('spot') or {}
+    META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
+    # Bases currently tracked as open positions on this venue / mode.
+    held_bases = {
+        p.spot_symbol.split('/')[0]
+        for p in db.scalars(select(Position).where(
+            Position.status == 'open',
+            Position.mode == mode,
+            Position.exchange == gateway.venue_id,
+        )).all()
+    }
+    DUST_USDT = 0.10  # below this we can't profitably sell; leave alone
+    for asset, row in spot_assets.items():
+        if asset in META_KEYS or asset in SUPPORTED_QUOTES or not isinstance(row, dict):
+            continue
+        free_qty = float(row.get('free') or 0)
+        if free_qty <= 0:
+            continue
+        if asset in held_bases:
+            continue  # legitimately part of an open arb, ignore
+        # Probe price and notional to decide if it's even worth selling.
+        sym_usdt = f'{asset}/USDT'
+        px = gateway.safe_price(sym_usdt) or 0
+        if px <= 0:
+            log_event(db, f'Phantom spot detected: {free_qty:.6f} {asset} (no USDT price; leaving as-is — manually resolve in venue UI)', mode=mode, level='ERROR', exchange=gateway.venue_id)
+            continue
+        notional = free_qty * px
+        if notional < DUST_USDT:
+            continue  # dust; leave alone
+        # Walk the sell book to set a sane limit price.
+        try:
+            sim = gateway.simulate_fill(sym_usdt, free_qty, side='sell', perp=False)
+        except Exception as e:
+            log_event(db, f'Phantom spot recovery sim failed for {asset}: {str(e)[:140]}', mode=mode, level='ERROR', exchange=gateway.venue_id)
+            continue
+        if not sim.get('worst_price'):
+            log_event(db, f'Phantom spot recovery: {asset} book unwalkable (filled={sim.get("filled_qty", 0):.6f}, err={sim.get("error", "?")[:60]}) — leaving as-is', mode=mode, level='ERROR', exchange=gateway.venue_id)
+            continue
+        tick_bps = float(cfg.exit_tick_buffer_bps or 2.0)
+        limit_px = sim['worst_price'] * (1 - tick_bps / 10000.0)
+        try:
+            rev = gateway.close_spot_limit_ioc(sym_usdt, free_qty, limit_px, paper_mode=False, slippage_bps=cfg.paper_slippage_bps, fee_bps=cfg.paper_fee_bps)
+        except Exception as e:
+            log_event(db, f'Phantom spot recovery sell raised for {asset}: {str(e)[:140]} — qty {free_qty:.6f} stays in wallet, will retry next cycle', mode=mode, level='ERROR', exchange=gateway.venue_id)
+            continue
+        filled = float((rev or {}).get('filled') or 0)
+        if filled <= 0:
+            log_event(db, f'Phantom spot recovery: {asset} limit-IOC sell got zero fill at {limit_px:.6f} (book moved); will retry next cycle', mode=mode, level='WARN', exchange=gateway.venue_id)
+            continue
+        log_event(db, f'Phantom spot recovered: sold {filled:.6f} {asset} → USDT @ {(rev.get("price") or limit_px):.6f} (was naked-long with no DB position; likely from a previous partial fill under spot_buy_error)', mode=mode, level='ERROR', exchange=gateway.venue_id)
+
+
 def reconcile_positions(gateway: VenueGateway) -> None:
     """Rehydrate any perp positions on this gateway's venue that aren't tracked locally."""
     with SessionLocal() as db:
@@ -942,6 +1017,13 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         if not hedged:
                             _close_naked_leg(db, gateway, p, cfg, surviving_leg, hedge_reason)
                 open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode, Position.exchange == gateway.venue_id)).all()
+            # Phase A-bis: naked spot recovery — catches partial fills from
+            # spot_buy_error events where KuCoin's IOC matched some quantity
+            # before the balance check tripped. Runs even when open_positions
+            # is empty, since the whole point is that the phantom holdings
+            # have no DB row.
+            if mode == MODE_LIVE:
+                recover_phantom_spot(db, gateway, mode, cfg)
 
             # Phase B: voluntary exits.
             if mstate.exit_enabled and open_positions:
@@ -1547,14 +1629,52 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                                 log_event(db, f'configure_perp_for_arb({c.perp_symbol}) warned: {cfg_err[:120]}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
                         # Place spot limit-IOC.
+                        # Snapshot the base asset's spot balance BEFORE we
+                        # place the order so that if ccxt raises (e.g.
+                        # KuCoin's `Balance insufficient! 200004`), we can
+                        # still detect whether any quantity actually filled
+                        # before the error was emitted. KuCoin's IOC
+                        # matching engine processes available depth THEN
+                        # reservation-checks the remainder — that order
+                        # means a partial fill is real and lands in the
+                        # spot wallet before the exception fires.
+                        base_asset = c.spot_symbol.split('/')[0]
+                        try:
+                            pre_bal = gateway.safe_balances(force_refresh=True) or {}
+                            pre_qty = float(((pre_bal.get('spot') or {}).get(base_asset) or {}).get('free') or 0)
+                        except Exception:
+                            pre_qty = 0.0
                         try:
                             s = gateway.create_spot_buy_limit_ioc(c.spot_symbol, target_qty, spot_limit, paper, cfg.paper_slippage_bps, cfg.paper_fee_bps)
                         except Exception as e:
                             err = str(e)[:140]
-                            log_event(db, f'Spot limit-IOC buy failed for {c.spot_symbol}: {err}', mode=mode, level='ERROR', exchange=gateway.venue_id)
-                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=f'spot_buy_error: {err[:80]}', funding_rate=c.funding_apr))
-                            scan_action = 'spot_buy_error'
-                            continue
+                            # Probe the spot wallet to see if a partial fill
+                            # slipped in before the error. If yes, treat it
+                            # as a real (smaller) spot fill and continue to
+                            # the perp leg — recovering value the previous
+                            # code path would have silently abandoned.
+                            partial_filled = 0.0
+                            try:
+                                post_bal = gateway.safe_balances(force_refresh=True) or {}
+                                post_qty = float(((post_bal.get('spot') or {}).get(base_asset) or {}).get('free') or 0)
+                                partial_filled = max(0.0, post_qty - pre_qty)
+                            except Exception:
+                                partial_filled = 0.0
+                            if partial_filled > 1e-9:
+                                log_event(db, f'Spot limit-IOC buy raised "{err[:100]}" BUT detected partial fill of {partial_filled:.6f} {base_asset} (pre_qty={pre_qty:.6f}, post_qty={pre_qty + partial_filled:.6f}). Continuing with perp leg at the smaller actual size.', mode=mode, level='WARN', exchange=gateway.venue_id)
+                                # Synthesize a fill dict shaped like ccxt's order response.
+                                s = {
+                                    'filled': partial_filled,
+                                    'amount': partial_filled,
+                                    'price': spot_limit,  # approximate; venue actual is on the order id we lost
+                                    'fee': {'cost': 0.0},
+                                    '_synthesized_from_partial_fill': True,
+                                }
+                            else:
+                                log_event(db, f'Spot limit-IOC buy failed for {c.spot_symbol}: {err}', mode=mode, level='ERROR', exchange=gateway.venue_id)
+                                db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=f'spot_buy_error: {err[:80]}', funding_rate=c.funding_apr))
+                                scan_action = 'spot_buy_error'
+                                continue
                         spot_filled_qty = float(s.get('filled') or s.get('amount') or 0)
                         if spot_filled_qty <= 0:
                             log_event(db, f'Spot limit-IOC for {c.spot_symbol} got zero fill at limit {spot_limit:.6f} (book moved); skipping', mode=mode, level='WARN', exchange=gateway.venue_id)
