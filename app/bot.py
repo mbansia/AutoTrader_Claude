@@ -202,15 +202,23 @@ def get_strategy_config(db) -> StrategyConfig:
         db.add(cfg)
         db.flush()
         return cfg
-    migrated = False
-    if 0 < cfg.entry_funding_threshold < _LEGACY_PERIOD_SENTINEL:
-        cfg.entry_funding_threshold = round(cfg.entry_funding_threshold * 1095.0, 6)
-        migrated = True
-    if 0 < cfg.exit_funding_threshold < _LEGACY_PERIOD_SENTINEL:
-        cfg.exit_funding_threshold = round(cfg.exit_funding_threshold * 1095.0, 6)
-        migrated = True
-    if migrated:
-        log_event(db, f'Migrated funding thresholds to APR: entry={cfg.entry_funding_threshold:.4f}, exit={cfg.exit_funding_threshold:.4f}', mode=MODE_PAPER, exchange='system')
+    # One-shot legacy threshold migration, gated by a PERSISTED schema
+    # version so it runs exactly once per row regardless of how many
+    # times get_strategy_config() is called and regardless of any
+    # subsequent threshold edits. Old semantic was "per-period rate"
+    # (e.g. 0.0001 = 1 bp per funding window); new semantic is
+    # "annualized compounded APR" (e.g. 0.10 = 10% APY). Runs at v0
+    # and bumps to v1.
+    if (cfg.config_schema_version or 0) < 1:
+        before_entry = cfg.entry_funding_threshold
+        before_exit = cfg.exit_funding_threshold
+        if 0 < cfg.entry_funding_threshold < _LEGACY_PERIOD_SENTINEL:
+            cfg.entry_funding_threshold = round(cfg.entry_funding_threshold * 1095.0, 6)
+        if 0 < cfg.exit_funding_threshold < _LEGACY_PERIOD_SENTINEL:
+            cfg.exit_funding_threshold = round(cfg.exit_funding_threshold * 1095.0, 6)
+        cfg.config_schema_version = 1
+        if before_entry != cfg.entry_funding_threshold or before_exit != cfg.exit_funding_threshold:
+            log_event(db, f'Migrated funding thresholds to APR (v0→v1): entry {before_entry:.6f}→{cfg.entry_funding_threshold:.4f}, exit {before_exit:.6f}→{cfg.exit_funding_threshold:.4f}', mode=MODE_PAPER, exchange='system')
         db.flush()
     return cfg
 
@@ -938,8 +946,13 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
             # Phase B: voluntary exits.
             if mstate.exit_enabled and open_positions:
                 try:
-                    current_funding = gateway.futures.fetch_funding_rates()
-                except Exception:
+                    # Use the gateway-level method so KuCoin's custom
+                    # `predictedFundingFeeRate` path is hit (raw
+                    # fetch_funding_rates either NotSupported or returns
+                    # last-settled rather than predicted on KuCoin).
+                    current_funding = gateway.funding_rates_dict() or {}
+                except Exception as e:
+                    log_event(db, f'Exit funding refresh failed: {str(e)[:160]}', mode=mode, level='WARN', exchange=gateway.venue_id)
                     current_funding = {}
                 for p in open_positions:
                     row = current_funding.get(p.perp_symbol) or {}
@@ -947,6 +960,15 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     if fr is not None:
                         p.last_funding_rate = float(fr)
                         p.funding_interval_hours = _interval_hours(row)
+                    elif current_funding:
+                        # Symbol drift between ccxt versions / venue
+                        # listing changes can leave a position with a
+                        # perp_symbol that no longer keys into the live
+                        # rates dict. Don't crash — fall back to the
+                        # entry-time funding rate — but log so the
+                        # operator can see the lookup miss instead of
+                        # silently using stale data forever.
+                        log_event(db, f'Exit funding miss for {p.perp_symbol}: not in rates dict ({len(current_funding)} symbols returned). Using stale last_funding_rate={p.last_funding_rate:+.4%}.', mode=mode, level='WARN', exchange=gateway.venue_id)
                     current_apr = annualize_rate(p.last_funding_rate, p.funding_interval_hours or 8.0)
                     age = datetime.utcnow() - p.opened_at
                     spot_now = gateway.safe_price(p.spot_symbol)
@@ -955,9 +977,11 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     mandatory = False
                     # Forward annualized net profit (the "if I were
                     # opening this fresh now, what's the rate?" check).
-                    # Same calc as the entry gate so entry/exit
-                    # thresholds are directly comparable. Below the
-                    # exit threshold → close.
+                    # Same SIGN-AWARE calc as the entry gate so the
+                    # entry / exit thresholds are directly comparable.
+                    # Positive live basis (perp > spot) is a kicker we'd
+                    # capture on entry; we model worst-case exit as the
+                    # basis swinging adversely by `exit_buffer × |basis|`.
                     interval_h = p.funding_interval_hours or 8.0
                     funding_window_bps = float(p.last_funding_rate) * 10000.0
                     if spot_now and perp_now and spot_now > 0:
@@ -965,11 +989,19 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     else:
                         live_basis_bps = 0.0
                     exit_buffer = float(cfg.exit_basis_buffer_multiple or 3.0)
-                    rt_basis_bps = abs(live_basis_bps) * (1.0 + exit_buffer)
+                    # Conservative round-trip basis: long-spot/short-perp
+                    # is hurt when basis goes MORE POSITIVE (perp gets
+                    # expensive vs spot). Worst-case exit = current +
+                    # buffer × |current|. RT = current − worst = −buffer ×
+                    # |current| regardless of current's sign — same
+                    # formula as the entry gate so the two thresholds are
+                    # directly comparable.
+                    worst_adverse_swing_bps = abs(live_basis_bps) * exit_buffer
+                    rt_basis_signed_bps = -worst_adverse_swing_bps
                     spot_fee_bps = gateway.taker_fee_bps(p.spot_symbol, perp=False)
                     perp_fee_bps = gateway.taker_fee_bps(p.perp_symbol, perp=True)
                     rt_fees_bps = 2.0 * (spot_fee_bps + perp_fee_bps)
-                    fwd_net_per_window_bps = funding_window_bps - rt_basis_bps - rt_fees_bps
+                    fwd_net_per_window_bps = funding_window_bps + rt_basis_signed_bps - rt_fees_bps
                     periods_per_year = 24.0 * 365.0 / interval_h
                     try:
                         fwd_net_apy = (1.0 + fwd_net_per_window_bps / 10000.0) ** periods_per_year - 1.0
@@ -1269,6 +1301,21 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                                 )
                                 if filled > 0:
                                     log_event(db, f'Auto-swap {surplus_q}→{short_q}: acquired {filled:.4f} {short_q} @ {swap_avg:.4f} for {c.perp_symbol} entry', mode=mode, exchange=gateway.venue_id)
+                                    # Re-consolidate spot wallets after the
+                                    # swap. KuCoin's swap_quote executes on
+                                    # the spot order book, which lands the
+                                    # filled quote in the `trade` wallet —
+                                    # already where we want it for the
+                                    # subsequent buy. Most other venues only
+                                    # have one spot wallet, so this is a
+                                    # no-op for them. We call it anyway as
+                                    # belt-and-suspenders against future
+                                    # venues whose swap might land in
+                                    # `main`/`funding`/etc.
+                                    try:
+                                        gateway.consolidate_spot_wallets(paper_mode=paper)
+                                    except Exception:
+                                        pass
                                     # Re-read live balances and equalise
                                     # the new short_q across spot/futures
                                     # wallets (Classic only — under
@@ -1324,17 +1371,20 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         if spot_px_quick <= 0:
                             continue
                         target_qty = sized_notional / spot_px_quick
-                        # Iteratively shrink to whatever the book actually
-                        # supports — at most 3 attempts so we don't loop
-                        # forever on a depth-starved name.
+                        # Iterative shrink: each pass walks the book and
+                        # shrinks for both fillable depth AND venue-side
+                        # balance reservation (limit_price × qty must fit
+                        # in each leg's free balance). Converges fast — at
+                        # most 4 iterations because each shrink reason can
+                        # only fire once cleanly. Putting the reservation
+                        # clamp INSIDE the loop means the profitability
+                        # gate downstream sees fill prices for the FINAL
+                        # post-clamp size, not pre-clamp prices that would
+                        # mis-state the actual trade economics.
+                        tick_bps = float(cfg.entry_tick_buffer_bps or 1.0)
+                        leverage = max(1.0, float(cfg.perp_leverage or 1))
                         spot_sim = perp_sim = None
-                        for _attempt in range(3):
-                            # Walk both order books concurrently — ccxt
-                            # is thread-safe for read-only requests, so
-                            # 2 parallel fetch_order_book calls cut
-                            # Tier 2 wallclock roughly in half. The
-                            # ThreadPoolExecutor context manager
-                            # blocks until both futures resolve.
+                        for _attempt in range(4):
                             with ThreadPoolExecutor(max_workers=2) as ex:
                                 spot_future = ex.submit(gateway.simulate_fill, c.spot_symbol, target_qty, side='buy', perp=False)
                                 perp_future = ex.submit(gateway.simulate_fill, c.perp_symbol, target_qty, side='sell', perp=True)
@@ -1343,13 +1393,22 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             spot_filled = spot_sim['filled_qty']
                             perp_filled = perp_sim['filled_qty']
                             min_filled = min(spot_filled, perp_filled)
-                            if min_filled >= target_qty - 1e-9:
-                                break  # both legs can fill the requested size
                             if min_filled <= 0:
                                 target_qty = 0
                                 break
-                            # Shrink to the smaller-fillable side and retry.
-                            target_qty = min_filled
+                            # Reservation clamp using the prices THIS walk
+                            # produced. Recomputed each pass because
+                            # shrinking target_qty changes worst_price.
+                            spot_worst = spot_sim['worst_price']
+                            perp_worst = perp_sim['worst_price']
+                            spot_lim_provisional = spot_worst * (1 + tick_bps / 10000.0) if spot_worst > 0 else 0.0
+                            perp_lim_provisional = perp_worst * (1 - tick_bps / 10000.0) if perp_worst > 0 else 0.0
+                            max_by_spot_bal = (spot_leg_free * 0.99) / spot_lim_provisional if spot_lim_provisional > 0 else target_qty
+                            max_by_perp_bal = (perp_leg_free * 0.99 * leverage) / perp_lim_provisional if perp_lim_provisional > 0 else target_qty
+                            target_qty_new = min(min_filled, max_by_spot_bal, max_by_perp_bal, target_qty)
+                            if target_qty_new >= target_qty - 1e-9:
+                                break  # converged: depth + reservation both fit
+                            target_qty = target_qty_new
                         if target_qty <= 0 or spot_sim is None:
                             # Surface WHY both legs read zero so we can tell
                             # apart "fetch_order_book threw" from "empty book"
@@ -1414,15 +1473,16 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         # worst-case exit is FURTHER negative.
                         funding_window_bps = c.funding_rate * 10000.0
                         exit_buffer = float(cfg.exit_basis_buffer_multiple or 3.0)
+                        # Conservative round-trip basis: long-spot/short-perp
+                        # is hurt when basis goes MORE POSITIVE (perp gets
+                        # expensive vs spot). Worst-case exit = entry + buffer
+                        # × |entry|. RT = entry − worst_exit = −buffer × |entry|
+                        # for both signs of entry. Positive entry kicker is
+                        # eaten by the worst-case adverse swing assumption —
+                        # the gate stays conservative; if real exit basis is
+                        # better, the trade outperforms the model.
                         worst_adverse_swing_bps = abs(fill_basis_bps) * exit_buffer
-                        # Round-trip basis P&L (signed; positive = income):
-                        round_trip_basis_signed_bps = fill_basis_bps - (
-                            fill_basis_bps + worst_adverse_swing_bps  # if positive entry, worst = entry + buffer
-                            if fill_basis_bps >= 0
-                            else fill_basis_bps - worst_adverse_swing_bps  # if negative entry, worst = entry − buffer
-                        )
-                        # Simplifies to ∓worst_adverse_swing_bps; keep the
-                        # explicit form for legibility.
+                        round_trip_basis_signed_bps = -worst_adverse_swing_bps
                         spot_fee_bps = gateway.taker_fee_bps(c.spot_symbol, perp=False)
                         perp_fee_bps = gateway.taker_fee_bps(c.perp_symbol, perp=True)
                         round_trip_fees_bps = 2.0 * (spot_fee_bps + perp_fee_bps)
@@ -1450,47 +1510,10 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             continue
                         # Cache the projected APY for the open log.
                         net_profit_bps = net_per_window_bps  # backwards-compat name used below
-                        # Limit prices at the worst-level + tick buffer.
-                        # Buy: pay UP TO this. Sell: accept DOWN TO this.
-                        tick_bps = float(cfg.entry_tick_buffer_bps or 1.0)
+                        # Final limit prices for placement (recomputed
+                        # outside the loop with the converged worst_price).
                         spot_limit = spot_sim['worst_price'] * (1 + tick_bps / 10000.0)
                         perp_limit = perp_sim['worst_price'] * (1 - tick_bps / 10000.0)
-
-                        # Reservation-aware sizing. KuCoin / Binance limit-IOC
-                        # buys reserve `qty × limit_price` from the trade
-                        # wallet at order placement (the worst-case spend at
-                        # the limit). Our `target_qty` was computed using
-                        # the mid-ish `spot_px_quick`; `spot_limit` is
-                        # always higher (worst_price + tick buffer). For
-                        # thinly-traded pairs the uplift can run 2–5% and
-                        # blow past the 3% wallet-cap safety buffer,
-                        # tripping `Balance insufficient! 200004`. Clamp
-                        # target_qty so the limit-price reservation fits
-                        # in each leg's actual free balance, with a small
-                        # 1% safety margin for fee accrual / rounding.
-                        leverage = max(1.0, float(cfg.perp_leverage or 1))
-                        max_qty_by_spot_bal = (spot_leg_free * 0.99) / spot_limit if spot_limit > 0 else target_qty
-                        max_qty_by_perp_bal = (perp_leg_free * 0.99 * leverage) / perp_limit if perp_limit > 0 else target_qty
-                        clamped = min(target_qty, max_qty_by_spot_bal, max_qty_by_perp_bal)
-                        if clamped < target_qty - 1e-12:
-                            log_event(db, f'Reservation clamp on {c.perp_symbol}: target_qty {target_qty:.6f} → {clamped:.6f} '
-                                          f'(spot_lim={spot_limit:.6f} → max {max_qty_by_spot_bal:.6f} from {spot_leg_free:.4f}{sq}; '
-                                          f'perp_lim={perp_limit:.6f} → max {max_qty_by_perp_bal:.6f} from {perp_leg_free:.4f}{cq} ×{leverage:.0f}x)',
-                                       mode=mode, exchange=gateway.venue_id)
-                            target_qty = clamped
-                        if target_qty <= 0:
-                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol,
-                                reason=f'reservation_clamp_zeroed (spot_free={spot_leg_free:.4f}{sq} perp_free={perp_leg_free:.4f}{cq} too small for limit prices)',
-                                funding_rate=c.funding_apr))
-                            scan_action = 'reservation_clamp_zeroed'
-                            continue
-                        # Re-check min-notional against the post-clamp size.
-                        if target_qty * spot_avg < min_notional:
-                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol,
-                                reason=f'below_min_pct_after_clamp ({target_qty * spot_avg:.4f} < {min_notional:.4f})',
-                                funding_rate=c.funding_apr))
-                            scan_action = 'below_min_pct'
-                            continue
 
                         # Configure perp cross + leverage idempotently.
                         if not paper:

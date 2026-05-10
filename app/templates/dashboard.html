@@ -334,7 +334,7 @@
   </div>
   {% endfor %}
   {% else %}
-  <div class="empty">No open positions in {{ view|upper }}. The bot will open one when funding APY exceeds {{ '%.2f%%' % (cfg.entry_funding_threshold * 100) }} and the spot/perp basis is within ±{{ '%.0f' % cfg.max_entry_basis_bps }} bps.</div>
+  <div class="empty">No open positions in {{ view|upper }}. The bot will open one when the candidate's net annualized profit (funding + signed basis − fees) clears {{ '%.2f%%' % (cfg.entry_funding_threshold * 100) }}.</div>
   {% endif %}
 </div>
 

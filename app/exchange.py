@@ -1146,6 +1146,14 @@ class VenueGateway:
         that returns True here is committing that fut.total = 0 means
         "no transfer needed", while False means fut.total = 0 is a
         funding bug we want to fix.
+
+        Default returns False (Classic split-wallet semantics).
+        **Every new gateway subclass MUST consider this method
+        explicitly.** A unified-margin venue (e.g. Binance Portfolio
+        Margin, KuCoin UTA, Bybit unified, Hyperliquid) MUST override
+        and return True, otherwise the rebalance step will repeatedly
+        attempt no-op spot↔futures transfers and log warnings every
+        cycle. A Classic split-wallet venue can omit the override.
         """
         return False
 

@@ -1164,7 +1164,7 @@ def save_config(
     paper_slippage_bps: float = Form(...),
     paper_fee_bps: float = Form(...),
     paper_starting_equity: float = Form(...),
-    max_entry_basis_bps: float = Form(...),
+    max_entry_basis_bps: float = Form(0.0),  # deprecated; basis_dislocated gate dropped, profitability gate is sole economic check. Field accepted for backward compat with old form posts but no longer applied.
     max_exit_basis_bps: float = Form(...),
     exit_basis_buffer_multiple: float = Form(3.0),
     enforce_hedge_check: int = Form(...),
@@ -1190,7 +1190,9 @@ def save_config(
         cfg.paper_slippage_bps = paper_slippage_bps
         cfg.paper_fee_bps = paper_fee_bps
         cfg.paper_starting_equity = paper_starting_equity
-        cfg.max_entry_basis_bps = max_entry_basis_bps
+        # max_entry_basis_bps is no longer applied — basis_dislocated
+        # gate was dropped in favour of letting the profitability gate
+        # decide. The DB column is retained for backward compatibility.
         cfg.max_exit_basis_bps = max_exit_basis_bps
         cfg.exit_basis_buffer_multiple = max(0.0, exit_basis_buffer_multiple)
         cfg.enforce_hedge_check = bool(enforce_hedge_check)
