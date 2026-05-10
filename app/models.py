@@ -243,6 +243,13 @@ class RuntimeState(Base):
 class StrategyConfig(Base):
     __tablename__ = 'strategy_config'
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Persisted migration cursor. Bumped each time a one-shot config
+    # value transformation runs in get_strategy_config(); the same
+    # migration won't run again on the same row. Avoids the edge case
+    # where heuristic sentinels (e.g. "value < 0.005 → migrate") could
+    # re-fire on absurdly small post-migration values under DB
+    # corruption or partial writes.
+    config_schema_version: Mapped[int] = mapped_column(Integer, default=0)
     entry_funding_threshold: Mapped[float] = mapped_column(Float, default=0.20)
     exit_funding_threshold: Mapped[float] = mapped_column(Float, default=0.05)
     max_hold_hours: Mapped[int] = mapped_column(Integer, default=72)

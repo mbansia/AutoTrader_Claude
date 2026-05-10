@@ -150,9 +150,6 @@
   <h3>Risk &amp; hedge safety</h3>
   <div class="body">
     <div class="form-grid">
-      <div class="form-row"><label>Max entry basis sanity bound (bps, ±)</label>
-        <input type="number" step="0.5" name="max_entry_basis_bps" value="{{ cfg.max_entry_basis_bps }}">
-        <span class="hint">Hard sanity bound. A basis gap exceeding this is treated as a market dislocation / stale data and rejected as <code>basis_dislocated</code> regardless of profitability. Default 20 bps.</span></div>
       <div class="form-row"><label>Max exit basis (bps)</label>
         <input type="number" step="0.5" name="max_exit_basis_bps" value="{{ cfg.max_exit_basis_bps }}">
         <span class="hint">Defer voluntary exits (funding decay, max hold) until basis ≤ this. Stop-loss, naked-leg, delisting bypass this.</span></div>
