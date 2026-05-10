@@ -1455,6 +1455,43 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         tick_bps = float(cfg.entry_tick_buffer_bps or 1.0)
                         spot_limit = spot_sim['worst_price'] * (1 + tick_bps / 10000.0)
                         perp_limit = perp_sim['worst_price'] * (1 - tick_bps / 10000.0)
+
+                        # Reservation-aware sizing. KuCoin / Binance limit-IOC
+                        # buys reserve `qty × limit_price` from the trade
+                        # wallet at order placement (the worst-case spend at
+                        # the limit). Our `target_qty` was computed using
+                        # the mid-ish `spot_px_quick`; `spot_limit` is
+                        # always higher (worst_price + tick buffer). For
+                        # thinly-traded pairs the uplift can run 2–5% and
+                        # blow past the 3% wallet-cap safety buffer,
+                        # tripping `Balance insufficient! 200004`. Clamp
+                        # target_qty so the limit-price reservation fits
+                        # in each leg's actual free balance, with a small
+                        # 1% safety margin for fee accrual / rounding.
+                        leverage = max(1.0, float(cfg.perp_leverage or 1))
+                        max_qty_by_spot_bal = (spot_leg_free * 0.99) / spot_limit if spot_limit > 0 else target_qty
+                        max_qty_by_perp_bal = (perp_leg_free * 0.99 * leverage) / perp_limit if perp_limit > 0 else target_qty
+                        clamped = min(target_qty, max_qty_by_spot_bal, max_qty_by_perp_bal)
+                        if clamped < target_qty - 1e-12:
+                            log_event(db, f'Reservation clamp on {c.perp_symbol}: target_qty {target_qty:.6f} → {clamped:.6f} '
+                                          f'(spot_lim={spot_limit:.6f} → max {max_qty_by_spot_bal:.6f} from {spot_leg_free:.4f}{sq}; '
+                                          f'perp_lim={perp_limit:.6f} → max {max_qty_by_perp_bal:.6f} from {perp_leg_free:.4f}{cq} ×{leverage:.0f}x)',
+                                       mode=mode, exchange=gateway.venue_id)
+                            target_qty = clamped
+                        if target_qty <= 0:
+                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol,
+                                reason=f'reservation_clamp_zeroed (spot_free={spot_leg_free:.4f}{sq} perp_free={perp_leg_free:.4f}{cq} too small for limit prices)',
+                                funding_rate=c.funding_apr))
+                            scan_action = 'reservation_clamp_zeroed'
+                            continue
+                        # Re-check min-notional against the post-clamp size.
+                        if target_qty * spot_avg < min_notional:
+                            db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol,
+                                reason=f'below_min_pct_after_clamp ({target_qty * spot_avg:.4f} < {min_notional:.4f})',
+                                funding_rate=c.funding_apr))
+                            scan_action = 'below_min_pct'
+                            continue
+
                         # Configure perp cross + leverage idempotently.
                         if not paper:
                             cfg_ok, cfg_err = gateway.configure_perp_for_arb(c.perp_symbol)
