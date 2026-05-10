@@ -1452,6 +1452,11 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         base = c.spot_symbol.split('/')[0]
                         if base in held_bases:
                             continue
+                        # Track whether this candidate needed a stablecoin
+                        # swap to fund — the swap is a fee-bearing trade
+                        # that the profitability gate below adds to its
+                        # cost basis (entry swap + exit swap-back).
+                        swap_needed_for_this_c = False
                         # Per-quote sizing. Spot leg consumes the spot
                         # quote's free balance; perp leg consumes the
                         # perp quote's free balance. For same-stable arbs
@@ -1490,6 +1495,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                                     surplus_q, short_q, target_swap, paper, slippage_bps=cfg.paper_slippage_bps,
                                 )
                                 if filled > 0:
+                                    swap_needed_for_this_c = True
                                     log_event(db, f'Auto-swap {surplus_q}→{short_q}: acquired {filled:.4f} {short_q} @ {swap_avg:.4f} for {c.perp_symbol} entry', mode=mode, exchange=gateway.venue_id)
                                     # Re-consolidate spot wallets after the
                                     # swap. KuCoin's swap_quote executes on
@@ -1701,6 +1707,20 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         spot_fee_bps = gateway.taker_fee_bps(c.spot_symbol, perp=False)
                         perp_fee_bps = gateway.taker_fee_bps(c.perp_symbol, perp=True)
                         round_trip_fees_bps = 2.0 * (spot_fee_bps + perp_fee_bps)
+                        # If we burned a stablecoin swap to fund this leg,
+                        # charge the swap round-trip (entry swap to acquire
+                        # the right stable; exit swap to return it to the
+                        # natural balance). Each leg of the swap is itself
+                        # a spot taker order on USDC/USDT, so it carries
+                        # one full spot-taker fee per direction. Plus a
+                        # nominal 5 bps for the typical USDC/USDT spot
+                        # basis at entry (it's never exactly 1.0000). The
+                        # swap-back at exit is symmetric.
+                        swap_fee_bps = 0.0
+                        if swap_needed_for_this_c:
+                            usdc_basis_bps = 5.0
+                            swap_fee_bps = 2.0 * (spot_fee_bps + usdc_basis_bps)
+                            round_trip_fees_bps += swap_fee_bps
                         net_per_window_bps = funding_window_bps + round_trip_basis_signed_bps - round_trip_fees_bps
                         # Annualize (compounded) using each candidate's
                         # own funding-interval-derived periods/year so
@@ -1713,11 +1733,12 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         except OverflowError:
                             net_apy = float('inf') if net_per_window_bps > 0 else -1.0
                         if net_apy < cfg.entry_funding_threshold:
+                            swap_note = f' + swap_RT={swap_fee_bps:.1f}bps' if swap_fee_bps > 0 else ''
                             db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol,
                                 reason=(f'insufficient_annualized_profit '
                                         f'(funding={funding_window_bps:+.1f}bps + '
                                         f'basis_RT={round_trip_basis_signed_bps:+.1f}bps [entry {fill_basis_bps:+.1f} − worst-swing {worst_adverse_swing_bps:.1f} (×{exit_buffer:.1f})] − '
-                                        f'fees={round_trip_fees_bps:.1f}bps [spot {spot_fee_bps:.1f} + perp {perp_fee_bps:.1f}, ×2 RT] '
+                                        f'fees={round_trip_fees_bps:.1f}bps [spot {spot_fee_bps:.1f} + perp {perp_fee_bps:.1f}, ×2 RT{swap_note}] '
                                         f'= net {net_per_window_bps:+.1f}bps/{int(interval_h)}h '
                                         f'→ {net_apy*100:+.2f}% APY < {cfg.entry_funding_threshold*100:.2f}% required)'),
                                 funding_rate=c.funding_apr))
