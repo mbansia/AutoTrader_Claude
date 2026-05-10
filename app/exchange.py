@@ -2168,9 +2168,34 @@ class KuCoinGateway(VenueGateway):
                 spot['free'][asset] = spot['free'].get(asset, 0.0) + free_amt
                 spot['used'][asset] = spot['used'].get(asset, 0.0) + used_amt
                 spot['total'][asset] = spot['total'].get(asset, 0.0) + total_amt
+        # KuCoin Futures' fetch_balance() defaults to USDT-only — calling it
+        # without a `currency` param returns ONLY the USDT margin wallet, so
+        # any USDC sitting in the futures contract account is invisible to
+        # the rest of the bot (sizing, equity, dashboard). The futures API
+        # is per-currency: one call per supported stable, results merged
+        # into the same shape ccxt's fetch_balance returns. Without this,
+        # a $7.50 USDC futures balance is silently lost — confirmed in
+        # production when a user reported their KuCoin USDC futures wallet
+        # never appearing in /dashboard.
+        futures: dict = {'free': {}, 'used': {}, 'total': {}}
+        for cur in SUPPORTED_QUOTES:
+            try:
+                cur_bal = self.futures.fetch_balance({'currency': cur})
+            except Exception:
+                # If a currency call fails (e.g. KuCoin returns no rows
+                # for an unfunded currency), skip and continue.
+                continue
+            row = cur_bal.get(cur) or {}
+            free_amt = float(row.get('free') or 0)
+            used_amt = float(row.get('used') or 0)
+            total_amt = float(row.get('total') or 0)
+            futures[cur] = {'free': free_amt, 'used': used_amt, 'total': total_amt}
+            futures['free'][cur] = free_amt
+            futures['used'][cur] = used_amt
+            futures['total'][cur] = total_amt
         return {
             'spot': spot,
-            'futures': self.futures.fetch_balance(),
+            'futures': futures,
         }
 
     def is_unified_margin(self) -> bool:
