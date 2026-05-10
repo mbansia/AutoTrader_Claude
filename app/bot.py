@@ -1151,12 +1151,21 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     # synthesised futures.<asset>.total is 0 by
                     # convention — we skip in that case since the
                     # buckets aren't actually separate wallets.
-                    if mode == MODE_LIVE and cfg.auto_transfer_enabled:
-                        bals_for_rebal = gateway.safe_balances() or {}
+                    if mode == MODE_LIVE and not cfg.auto_transfer_enabled:
+                        # Operator has explicitly disabled wallet rebalancing
+                        # on /config. With this off the bot will under-size
+                        # to whichever leg is smallest. Surface it once per
+                        # cycle so the symptom isn't silent.
+                        log_event(db, 'Pre-trade rebalance skipped: auto_transfer_enabled=False on /config (under-sizing to smaller leg)', mode=mode, level='WARN', exchange=gateway.venue_id)
+                    if mode == MODE_LIVE and cfg.auto_transfer_enabled and gateway.is_unified_margin():
+                        # Authoritative unified-margin check — replaces the old
+                        # `fut.total <= 0.001` heuristic which mis-classified an
+                        # EMPTY contract wallet as unified, silently skipping
+                        # the rebalance on a KuCoin Classic account where all
+                        # the cash sat on the spot side.
+                        log_event(db, f'Pre-trade rebalance skipped: {gateway.name} reports unified margin (no spot↔futures transfer meaningful)', mode=mode, exchange=gateway.venue_id)
+                    elif mode == MODE_LIVE and cfg.auto_transfer_enabled:
                         for q in ('USDT', 'USDC'):
-                            fut_total_native = float((bals_for_rebal.get('futures', {}).get(q) or {}).get('total') or 0)
-                            if fut_total_native <= 0.001:
-                                continue  # unified margin
                             sf = spot_free_by_q.get(q, 0.0)
                             ff = fut_free_by_q.get(q, 0.0)
                             imbalance = abs(sf - ff)
@@ -1173,7 +1182,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                                     fut_free_by_q[q] = ff - move
                                     log_event(db, f'Pre-trade rebalance: {move:.2f} {q} futures→spot (equalize wallets so both legs can fund)', mode=mode, exchange=gateway.venue_id)
                                 else:
-                                    log_event(db, f'Pre-trade futures→spot {q} rebalance failed: {err[:120]}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                                    log_event(db, f'Pre-trade futures→spot {q} rebalance failed: {err[:200]}', mode=mode, level='WARN', exchange=gateway.venue_id)
                             else:
                                 move = sf - midpoint
                                 ok, err = gateway.transfer_spot_to_futures(move, paper, asset=q)
@@ -1182,7 +1191,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                                     fut_free_by_q[q] = ff + move
                                     log_event(db, f'Pre-trade rebalance: {move:.2f} {q} spot→futures (equalize wallets so both legs can fund)', mode=mode, exchange=gateway.venue_id)
                                 else:
-                                    log_event(db, f'Pre-trade spot→futures {q} rebalance failed: {err[:120]}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                                    log_event(db, f'Pre-trade spot→futures {q} rebalance failed: {err[:200]}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
                     # Diversity: skip any candidate whose base asset we already hold open
                     # in this mode. Avoids piling more capital into the same name even

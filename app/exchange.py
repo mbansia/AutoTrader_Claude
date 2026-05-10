@@ -1112,6 +1112,21 @@ class VenueGateway:
         """
         return []
 
+    def is_unified_margin(self) -> bool:
+        """Authoritative answer to "does this venue have a single
+        unified-margin pool?". Used by the rebalance step to decide
+        whether spot↔futures transfers are even meaningful.
+
+        Crucial because the synthesised ``futures.<asset>.total = 0``
+        marker that bot.py used as a proxy for "unified" is ambiguous —
+        it ALSO equals zero when the user's contract wallet is just
+        empty (the case the rebalance is supposed to fix). A subclass
+        that returns True here is committing that fut.total = 0 means
+        "no transfer needed", while False means fut.total = 0 is a
+        funding bug we want to fix.
+        """
+        return False
+
     def net_injected_capital_usdt(self, lookback_days: int = 30) -> tuple[float | None, dict]:
         """Returns ``(net, meta)`` where ``net`` is in USDT and ``meta`` carries
         a per-component breakdown for the UI. ``None`` signals the caller to
@@ -1673,6 +1688,12 @@ class BinanceGateway(VenueGateway):
     def transfer_futures_to_spot(self, amount: float, paper_mode: bool, asset: str = 'USDT') -> tuple[bool, str]:
         return True, 'PM mode: unified margin (no spot↔futures transfer needed)'
 
+    def is_unified_margin(self) -> bool:
+        # This bot's BinanceGateway treats every Binance account as PM —
+        # the transfer/balance/order paths above are PM-specific. So the
+        # answer is unconditionally True; rebalance is a no-op for us.
+        return True
+
     def open_perp_positions_raw(self) -> list[dict]:
         """Replace the Classic ``futures.fetch_positions()`` (which hits
         /fapi/v2/positionRisk and returns -2015 under PM) with the PM
@@ -2104,6 +2125,14 @@ class KuCoinGateway(VenueGateway):
             'spot': spot,
             'futures': self.futures.fetch_balance(),
         }
+
+    def is_unified_margin(self) -> bool:
+        # UTA pools spot + futures into a single collateral pool, so
+        # `transfer_spot_to_futures` is a no-op there. Classic keeps
+        # trade / main / contract as physically separate wallets, so
+        # rebalance MUST run even when the contract wallet reads as 0
+        # (that's the bug the rebalance is supposed to fix).
+        return self._is_uta
 
     def account_type(self) -> tuple[str, str]:
         """Read KuCoin's account mode live. Calls ccxt's ``is_uta_enabled``
