@@ -727,7 +727,14 @@ class VenueGateway:
                 approx_net_apy = float('inf') if approx_net_window_bps > 0 else -1.0
             if approx_net_apy < entry_apr_threshold:
                 per_quote_below_threshold[quote] += 1
-                per_quote_top_below[quote].append((symbol, apr))
+                # Carry both numbers — the gross funding APY (so the
+                # operator sees what the venue advertises) and the
+                # approximate net APY (what the gate actually
+                # compared against). Without the net number the
+                # rejection looks like "11.57% < 10.00%" which is
+                # mathematically false; the real comparison is net,
+                # which is below threshold once fees are subtracted.
+                per_quote_top_below[quote].append((symbol, apr, approx_net_apy, fee_bps_est))
                 continue
             base = symbol.split('/')[0]
             # Spot-leg pairing: spot is just spot — the stablecoin
@@ -841,9 +848,18 @@ class VenueGateway:
         TOP_BELOW_PER_QUOTE = 10
         thresh_pct = entry_apr_threshold * 100.0
         for q, rows in per_quote_top_below.items():
-            rows.sort(key=lambda r: r[1], reverse=True)
-            for sym, apr_val in rows[:TOP_BELOW_PER_QUOTE]:
-                rejected.append((sym, f'below_threshold ({apr_val*100:.2f}% APY < {thresh_pct:.2f}%)', apr_val))
+            # Rank by NET APY (what the gate actually compared) so the
+            # closest-to-passing candidates surface first, not the ones
+            # with the highest gross funding rate (which may all be far
+            # from net-passing once fees are subtracted).
+            rows.sort(key=lambda r: r[2], reverse=True)
+            for sym, apr_val, net_apr, fee_est in rows[:TOP_BELOW_PER_QUOTE]:
+                rejected.append((
+                    sym,
+                    (f'below_threshold (net {net_apr*100:+.2f}% APY < {thresh_pct:.2f}% required; '
+                     f'gross funding {apr_val*100:+.2f}% − approx fees {fee_est:.1f}bps/window)'),
+                    apr_val,
+                ))
         return passing, total, rejected
 
     # ─── Order placement (ccxt-uniform) ───────────────────────────────────
