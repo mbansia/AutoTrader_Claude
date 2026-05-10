@@ -254,7 +254,8 @@
       <tr class="position-row {{ 'position-stuck' if r.last_close_error }}" data-pos-id="{{ r.id }}" {% if r.last_close_error %}title="Close blocked: {{ r.last_close_error }}"{% endif %}>
         <td><button type="button" class="row-toggle" aria-expanded="false" aria-controls="detail-{{ r.id }}" onclick="togglePositionDetail({{ r.id }}, this)">▶</button></td>
         <td class="mono">{{ r.symbol }}
-          {% if r.last_close_error %}<span class="tag bad" style="font-size:10px;margin-left:4px;">CLOSE BLOCKED</span>
+          {% if r.status == 'naked_spot' %}<span class="tag bad" style="font-size:10px;margin-left:4px;" title="Naked spot position — partial fill under spot_buy_error left the spot leg orphaned; bot will try to hedge with perp or sell back next cycle.">NAKED SPOT</span>
+          {% elif r.last_close_error %}<span class="tag bad" style="font-size:10px;margin-left:4px;">CLOSE BLOCKED</span>
           {% elif r.spot_alive and r.perp_alive %}<span class="tag good" style="font-size:10px;margin-left:4px;">BOTH LEGS</span>
           {% elif r.spot_alive %}<span class="tag warn" style="font-size:10px;margin-left:4px;">SPOT ONLY (naked long)</span>
           {% elif r.perp_alive %}<span class="tag warn" style="font-size:10px;margin-left:4px;">PERP ONLY (naked short)</span>

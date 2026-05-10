@@ -27,6 +27,15 @@ MODE_LIVE = 'live'
 ALL_MODES = (MODE_PAPER, MODE_LIVE)
 
 
+# Position status values that represent a CURRENT exposure on the books —
+# either a normal hedged position ('open') or a naked spot leg whose
+# matching perp leg never made it on ('naked_spot', created by the
+# phantom-spot recovery path when a partial fill under spot_buy_error
+# left a leg orphaned). Every "show me what's exposed" query should use
+# this tuple so naked legs never disappear from the portfolio view.
+OPEN_STATUSES = ('open', 'naked_spot')
+
+
 # Venue tag — which exchange / broker the row lives on. The system treats the
 # entire portfolio as a single pool of capital distributed across venues. Today
 # Binance is the only live venue; KuCoin and Interactive Brokers will be added

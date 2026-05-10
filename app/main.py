@@ -73,6 +73,7 @@ from app.models import (
     ALL_MODES,
     MODE_LIVE,
     MODE_PAPER,
+    OPEN_STATUSES,
     BalanceSnapshot,
     BotEvent,
     CapitalFlow,
@@ -276,7 +277,7 @@ def _unrealized_for_open(db, gateways, mode: str) -> float:
     if not gateways:
         return 0.0
     gw_by_venue = {g.venue_id: g for g in gateways}
-    open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == mode)).all()
+    open_positions = db.scalars(select(Position).where(Position.status.in_(OPEN_STATUSES), Position.mode == mode)).all()
     total = 0.0
     for p in open_positions:
         pgw = gw_by_venue.get(p.exchange, gateways[0])
@@ -609,7 +610,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
         net_capital, net_capital_meta = net_capital_in(db, mode=v, gateways=gateways)
         flow_count_n = db.scalar(select(func.count(CapitalFlow.id)).where(CapitalFlow.mode == v)) or 0
         xirr_value = portfolio_xirr(db, current_equity, mode=v)
-        open_count = db.scalar(select(func.count(Position.id)).where(Position.status == 'open', Position.mode == v)) or 0
+        open_count = db.scalar(select(func.count(Position.id)).where(Position.status.in_(OPEN_STATUSES), Position.mode == v)) or 0
         today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         trades_today_n = db.scalar(select(func.count(Trade.id)).where(Trade.ts >= today_start, Trade.mode == v)) or 0
 
@@ -641,7 +642,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
                          (max(p.ts for p in all_pts) if all_pts else None))
         last_cycle_age = _fmt_age(datetime.utcnow() - last_cycle_ts) if last_cycle_ts else None
 
-        stuck_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == v, Position.last_close_error != '')).all()
+        stuck_positions = db.scalars(select(Position).where(Position.status.in_(OPEN_STATUSES), Position.mode == v, Position.last_close_error != '')).all()
         ctx['stuck_positions'] = [{'symbol': p.symbol, 'err': p.last_close_error[:160]} for p in stuck_positions]
 
         # Fees paid across every trade in this mode. Avg fee % = total fees
@@ -749,7 +750,7 @@ def dashboard(request: Request, view: str | None = None, view_cookie: str | None
             ctx['free_deployable_breakdown'] = []
 
         # Open positions rows + leg detail (formerly /positions).
-        open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == v)).all()
+        open_positions = db.scalars(select(Position).where(Position.status.in_(OPEN_STATUSES), Position.mode == v)).all()
         gw_by_venue = {g.venue_id: g for g in gateways}
         rows = []
         for p in open_positions:
@@ -1133,10 +1134,10 @@ def config_page(request: Request, saved: int = 0, view: str | None = None, view_
                 # exit-all-stop so the operator knows what's about to
                 # close.
                 paper_open = db.scalar(select(func.count(Position.id)).where(
-                    Position.status == 'open', Position.mode == 'paper', Position.trade_type == tt,
+                    Position.status.in_(OPEN_STATUSES), Position.mode == 'paper', Position.trade_type == tt,
                 )) or 0
                 live_open = db.scalar(select(func.count(Position.id)).where(
-                    Position.status == 'open', Position.mode == 'live', Position.trade_type == tt,
+                    Position.status.in_(OPEN_STATUSES), Position.mode == 'live', Position.trade_type == tt,
                 )) or 0
                 row['paper'] = {'entry_enabled': ps.entry_enabled, 'exit_all_pending': ps.exit_all_pending, 'open_count': paper_open}
                 row['live'] = {'entry_enabled': ls.entry_enabled, 'exit_all_pending': ls.exit_all_pending, 'open_count': live_open}
@@ -1616,7 +1617,7 @@ def _render_export_md(v: str) -> str:
             parts.append(_md_table(['bucket', 'value_usdt'], [[b['label'], b['value']] for b in breakdown]))
 
         # ---- Open positions with leg states ----
-        open_positions = db.scalars(select(Position).where(Position.status == 'open', Position.mode == v)).all()
+        open_positions = db.scalars(select(Position).where(Position.status.in_(OPEN_STATUSES), Position.mode == v)).all()
         parts.append(f'\n## Open positions ({v}) — {len(open_positions)} row(s)\n')
         gateways_by_venue = {g.venue_id: g for g in gateways}
         op_rows = []
