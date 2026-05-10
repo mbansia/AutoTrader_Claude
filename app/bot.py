@@ -1358,6 +1358,31 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                                       f'max_pct={desired_notional:.4f} '
                                       f'min_pct={min_notional:.4f})')
                             db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol, reason=reason, funding_rate=c.funding_apr))
+                            # First below-min rejection in this cycle —
+                            # log a full wallet-type breakdown so the
+                            # operator can see whether funds are parked
+                            # somewhere we don't sweep (margin, isolated,
+                            # pool, pending orders). Only emit once per
+                            # cycle (gated on a local flag) so we don't
+                            # repeat the same dump for every candidate.
+                            if not locals().get('_wallet_dump_done', False):
+                                try:
+                                    breakdown = gateway.wallet_breakdown()
+                                    for asset, wallets in breakdown.items():
+                                        if not isinstance(wallets, dict):
+                                            continue
+                                        parts = []
+                                        for wtype, val in wallets.items():
+                                            if isinstance(val, dict) and 'error' not in val:
+                                                if val.get('total', 0) > 0.01 or val.get('free', 0) > 0.01:
+                                                    parts.append(f'{wtype}=({val.get("free", 0):.4f}/{val.get("total", 0):.4f})')
+                                            elif isinstance(val, dict):
+                                                parts.append(f'{wtype}=err:{val.get("error", "?")[:40]}')
+                                        if parts:
+                                            log_event(db, f'Wallet breakdown {asset}: ' + '; '.join(parts) + ' [free/total per wallet-type]', mode=mode, exchange=gateway.venue_id)
+                                except Exception as e:
+                                    log_event(db, f'Wallet breakdown probe failed: {str(e)[:160]}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                                _wallet_dump_done = True
                             scan_action = 'below_min_pct'
                             continue
                         # Protected-execution path: walk both order books
