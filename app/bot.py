@@ -521,8 +521,7 @@ def manual_close(db, gateway: VenueGateway, p: Position, cfg: StrategyConfig) ->
 
 def recover_phantom_spot(db, gateway: VenueGateway, mode: str, cfg: StrategyConfig) -> None:
     """Detect non-stable spot holdings that don't correspond to any DB
-    Position and sell them back to USDT. Runs every live cycle as part
-    of Phase A safety.
+    Position and resolve them. Runs every live cycle in Phase A safety.
 
     Background: KuCoin's spot limit-IOC can partially fill BEFORE
     returning a `Balance insufficient! 200004` error — the venue
@@ -532,10 +531,21 @@ def recover_phantom_spot(db, gateway: VenueGateway, mode: str, cfg: StrategyConf
     bot doesn't know about. The hedge integrity check only iterates
     DB-recorded positions, so it misses these.
 
-    Recovery: enumerate every non-stable spot asset with non-trivial
-    qty, check whether a DB Position exists for that base, and if not,
-    sell the holding back to its USDT pair via limit-IOC. Logs ERROR
-    so the operator can see what was recovered."""
+    Resolution policy (in order):
+      1. **Try to hedge** — if the matching perp can be shorted at the
+         phantom qty AND the forward profitability gate passes at
+         today's funding rate, short the perp and persist a DB
+         Position. The phantom becomes a real, supervised position.
+      2. **Sell back** — if the hedge isn't feasible (no perp listing,
+         no perp depth, or net APY below threshold), sell the spot
+         holding to its USDT pair via limit-IOC. Flattens the
+         exposure cleanly.
+      3. **Leave as-is** — if the spot sell book is also unwalkable
+         (dust below KuCoin's min order), log an ERROR with the
+         details so the operator can resolve manually in the UI.
+
+    Every branch logs at ERROR level so the operator sees what
+    happened to each phantom."""
     if mode != MODE_LIVE:
         return
     try:
@@ -544,7 +554,6 @@ def recover_phantom_spot(db, gateway: VenueGateway, mode: str, cfg: StrategyConf
         return
     spot_assets = bals.get('spot') or {}
     META_KEYS = {'info', 'free', 'used', 'total', 'timestamp', 'datetime'}
-    # Bases currently tracked as open positions on this venue / mode.
     held_bases = {
         p.spot_symbol.split('/')[0]
         for p in db.scalars(select(Position).where(
@@ -553,45 +562,144 @@ def recover_phantom_spot(db, gateway: VenueGateway, mode: str, cfg: StrategyConf
             Position.exchange == gateway.venue_id,
         )).all()
     }
-    DUST_USDT = 0.10  # below this we can't profitably sell; leave alone
+    DUST_USDT = 0.10
+    # Pull current funding rates once so hedge-feasibility check is cheap.
+    try:
+        funding_now = gateway.funding_rates_dict() or {}
+    except Exception:
+        funding_now = {}
     for asset, row in spot_assets.items():
         if asset in META_KEYS or asset in SUPPORTED_QUOTES or not isinstance(row, dict):
             continue
         free_qty = float(row.get('free') or 0)
-        if free_qty <= 0:
+        if free_qty <= 0 or asset in held_bases:
             continue
-        if asset in held_bases:
-            continue  # legitimately part of an open arb, ignore
-        # Probe price and notional to decide if it's even worth selling.
         sym_usdt = f'{asset}/USDT'
         px = gateway.safe_price(sym_usdt) or 0
         if px <= 0:
-            log_event(db, f'Phantom spot detected: {free_qty:.6f} {asset} (no USDT price; leaving as-is — manually resolve in venue UI)', mode=mode, level='ERROR', exchange=gateway.venue_id)
+            log_event(db, f'Phantom spot detected: {free_qty:.6f} {asset} (no USDT spot price; leave for manual resolution)', mode=mode, level='ERROR', exchange=gateway.venue_id)
             continue
         notional = free_qty * px
         if notional < DUST_USDT:
-            continue  # dust; leave alone
-        # Walk the sell book to set a sane limit price.
+            continue
+
+        # ─── Phase 1: try to HEDGE by shorting the matching perp ─────────
+        hedged = False
+        for perp_quote in ('USDT', 'USDC'):
+            perp_sym = f'{asset}/{perp_quote}:{perp_quote}'
+            if perp_sym not in funding_now:
+                continue
+            f_row = funding_now.get(perp_sym) or {}
+            fr = f_row.get('fundingRate')
+            if fr is None:
+                continue
+            interval_h = _interval_hours(f_row)
+            # Profitability gate: funding minus worst-case adverse exit basis
+            # minus round-trip fees. Same model as the entry gate.
+            spot_now = gateway.safe_price(sym_usdt) or 0
+            perp_now = gateway.safe_price(perp_sym, perp=True) or 0
+            if spot_now <= 0 or perp_now <= 0:
+                continue
+            live_basis_bps = (perp_now - spot_now) / spot_now * 10000.0
+            exit_buffer = float(cfg.exit_basis_buffer_multiple or 3.0)
+            spot_fee_bps = gateway.taker_fee_bps(sym_usdt, perp=False)
+            perp_fee_bps = gateway.taker_fee_bps(perp_sym, perp=True)
+            rt_fees = 2.0 * (spot_fee_bps + perp_fee_bps)
+            funding_bps = float(fr) * 10000.0
+            net_per_window = funding_bps - abs(live_basis_bps) * exit_buffer - rt_fees
+            try:
+                net_apy = (1.0 + net_per_window / 10000.0) ** (24.0 * 365.0 / interval_h) - 1.0
+            except OverflowError:
+                net_apy = float('inf') if net_per_window > 0 else -1.0
+            if net_apy < cfg.entry_funding_threshold:
+                log_event(db, f'Phantom spot {asset}: hedge via {perp_sym} skipped (forward net APY {net_apy*100:+.2f}% < {cfg.entry_funding_threshold*100:.2f}% threshold)', mode=mode, exchange=gateway.venue_id)
+                continue
+            # Confirm perp book has depth for the phantom qty.
+            try:
+                perp_sim = gateway.simulate_fill(perp_sym, free_qty, side='sell', perp=True)
+            except Exception as e:
+                log_event(db, f'Phantom spot {asset}: hedge perp walk failed: {str(e)[:120]}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                continue
+            if not perp_sim.get('ok'):
+                log_event(db, f'Phantom spot {asset}: hedge {perp_sym} insufficient depth (filled={perp_sim.get("filled_qty", 0):.6f}/{free_qty:.6f})', mode=mode, exchange=gateway.venue_id)
+                continue
+            tick_bps = float(cfg.entry_tick_buffer_bps or 1.0)
+            perp_limit = perp_sim['worst_price'] * (1 - tick_bps / 10000.0)
+            try:
+                gateway.configure_perp_for_arb(perp_sym)
+            except Exception:
+                pass
+            try:
+                f = gateway.create_perp_short_limit_ioc(perp_sym, free_qty, perp_limit, paper_mode=False, slippage_bps=cfg.paper_slippage_bps, fee_bps=cfg.paper_fee_bps)
+            except Exception as e:
+                log_event(db, f'Phantom spot {asset}: hedge perp short raised: {str(e)[:140]} — falling back to spot sell', mode=mode, level='WARN', exchange=gateway.venue_id)
+                break  # don't try other quote, fall through to sell
+            perp_filled = float((f or {}).get('filled') or 0)
+            if perp_filled <= 0:
+                log_event(db, f'Phantom spot {asset}: hedge perp short zero-fill (book moved) — falling back to spot sell', mode=mode, level='WARN', exchange=gateway.venue_id)
+                break
+            # Persist as a real Position. If perp filled less than spot,
+            # we'll trim spot below.
+            pos = Position(
+                mode=mode,
+                exchange=gateway.venue_id,
+                trade_type=venue_to_trade_type(gateway.venue_id),
+                symbol=asset,
+                spot_symbol=sym_usdt,
+                perp_symbol=perp_sym,
+                quote_currency=perp_quote,
+                spot_quote_currency='USDT',
+                quantity=min(free_qty, perp_filled),
+                entry_funding_rate=float(fr),
+                last_funding_rate=float(fr),
+                funding_interval_hours=interval_h,
+                spot_entry_price=spot_now,
+                perp_entry_price=float(f.get('price') or perp_limit),
+                last_funding_accrual_ts=datetime.utcnow(),
+            )
+            db.add(pos)
+            db.flush()
+            record_trade(db, pos.id, mode, perp_sym, 'futures', 'sell', perp_filled, f, exchange=gateway.venue_id)
+            log_event(db, f'Phantom spot RESCUED into a hedged position: shorted {perp_filled:.6f} {perp_sym} @ {(f.get("price") or perp_limit):.6f} against {free_qty:.6f} {asset} spot (forward net APY {net_apy*100:+.2f}%; phantom from earlier partial-fill is now a real Position)', mode=mode, level='ERROR', exchange=gateway.venue_id)
+            # Trim spot if perp filled less than spot qty.
+            if perp_filled + 1e-9 < free_qty:
+                trim_qty = free_qty - perp_filled
+                try:
+                    trim_sim = gateway.simulate_fill(sym_usdt, trim_qty, side='sell', perp=False)
+                    trim_limit = trim_sim['worst_price'] * (1 - float(cfg.exit_tick_buffer_bps or 2.0) / 10000.0) if trim_sim.get('worst_price') else px * 0.999
+                    rev = gateway.close_spot_limit_ioc(sym_usdt, trim_qty, trim_limit, paper_mode=False, slippage_bps=cfg.paper_slippage_bps, fee_bps=cfg.paper_fee_bps)
+                    trimmed = float((rev or {}).get('filled') or 0)
+                    if trimmed > 0:
+                        record_trade(db, pos.id, mode, sym_usdt, 'spot', 'sell', trimmed, rev, exchange=gateway.venue_id)
+                        log_event(db, f'Trimmed {trimmed:.6f} {asset} spot to match perp fill', mode=mode, exchange=gateway.venue_id)
+                except Exception as e:
+                    log_event(db, f'Spot trim after hedge failed: {str(e)[:120]} — hedge check will repair next cycle', mode=mode, level='WARN', exchange=gateway.venue_id)
+            hedged = True
+            break
+        if hedged:
+            continue
+
+        # ─── Phase 2: hedge not feasible, sell spot back to USDT ──────────
         try:
             sim = gateway.simulate_fill(sym_usdt, free_qty, side='sell', perp=False)
         except Exception as e:
             log_event(db, f'Phantom spot recovery sim failed for {asset}: {str(e)[:140]}', mode=mode, level='ERROR', exchange=gateway.venue_id)
             continue
         if not sim.get('worst_price'):
-            log_event(db, f'Phantom spot recovery: {asset} book unwalkable (filled={sim.get("filled_qty", 0):.6f}, err={sim.get("error", "?")[:60]}) — leaving as-is', mode=mode, level='ERROR', exchange=gateway.venue_id)
+            log_event(db, f'Phantom spot recovery: {asset} sell book unwalkable (err={sim.get("error", "?")[:60]}) — leave for manual resolution', mode=mode, level='ERROR', exchange=gateway.venue_id)
             continue
         tick_bps = float(cfg.exit_tick_buffer_bps or 2.0)
         limit_px = sim['worst_price'] * (1 - tick_bps / 10000.0)
         try:
             rev = gateway.close_spot_limit_ioc(sym_usdt, free_qty, limit_px, paper_mode=False, slippage_bps=cfg.paper_slippage_bps, fee_bps=cfg.paper_fee_bps)
         except Exception as e:
-            log_event(db, f'Phantom spot recovery sell raised for {asset}: {str(e)[:140]} — qty {free_qty:.6f} stays in wallet, will retry next cycle', mode=mode, level='ERROR', exchange=gateway.venue_id)
+            log_event(db, f'Phantom spot recovery sell raised for {asset}: {str(e)[:140]} — qty stays in wallet, retry next cycle', mode=mode, level='ERROR', exchange=gateway.venue_id)
             continue
         filled = float((rev or {}).get('filled') or 0)
         if filled <= 0:
-            log_event(db, f'Phantom spot recovery: {asset} limit-IOC sell got zero fill at {limit_px:.6f} (book moved); will retry next cycle', mode=mode, level='WARN', exchange=gateway.venue_id)
+            log_event(db, f'Phantom spot recovery: {asset} limit-IOC sell zero-fill (book moved); retry next cycle', mode=mode, level='WARN', exchange=gateway.venue_id)
             continue
-        log_event(db, f'Phantom spot recovered: sold {filled:.6f} {asset} → USDT @ {(rev.get("price") or limit_px):.6f} (was naked-long with no DB position; likely from a previous partial fill under spot_buy_error)', mode=mode, level='ERROR', exchange=gateway.venue_id)
+        log_event(db, f'Phantom spot CLOSED: sold {filled:.6f} {asset} → USDT @ {(rev.get("price") or limit_px):.6f} (hedge not feasible, flattened)', mode=mode, level='ERROR', exchange=gateway.venue_id)
 
 
 def reconcile_positions(gateway: VenueGateway) -> None:
