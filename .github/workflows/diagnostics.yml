@@ -1,0 +1,68 @@
+name: Bot diagnostics
+
+# Polls the bot's /api/diagnostics endpoint on a schedule. If the response
+# carries any anomalies, opens / updates a tracker issue with the JSON so
+# the operator (or Claude via subscribe_pr_activity) sees what's wrong.
+#
+# REQUIRED REPO SECRETS:
+#   BOT_URL              — base URL of the bot, e.g. http://...sslip.io
+#   DIAGNOSTICS_TOKEN    — same value as the bot's DIAGNOSTICS_TOKEN env var
+#
+# The workflow needs `issues: write` to file/update the tracker. No other
+# permissions required.
+
+on:
+  schedule:
+    # Every 3 hours.
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
+    inputs:
+      hours_window:
+        description: 'Lookback window (hours) for recent_events / rejections / trades'
+        required: false
+        default: '24'
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: bot-diagnostics
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch diagnostics
+        id: fetch
+        env:
+          BOT_URL: ${{ secrets.BOT_URL }}
+          DIAGNOSTICS_TOKEN: ${{ secrets.DIAGNOSTICS_TOKEN }}
+          HOURS: ${{ github.event.inputs.hours_window || '24' }}
+        run: |
+          set -eu
+          if [ -z "${BOT_URL:-}" ] || [ -z "${DIAGNOSTICS_TOKEN:-}" ]; then
+            echo "::error::BOT_URL or DIAGNOSTICS_TOKEN secret missing"
+            exit 1
+          fi
+          # ----fail-with-body=false → save the body even on non-200 so we can
+          # surface the error in the issue. -w prints status to stderr.
+          http_code=$(curl -sS -o response.json -w '%{http_code}' --max-time 25 \
+            "${BOT_URL%/}/api/diagnostics?token=${DIAGNOSTICS_TOKEN}&hours=${HOURS}" || echo "000")
+          echo "status=${http_code}" >> "$GITHUB_OUTPUT"
+          echo "--- response.json (first 4 KB) ---"
+          head -c 4096 response.json || true
+          echo
+          echo "----------------------------------"
+
+      - name: Evaluate + post tracker issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          STATUS: ${{ steps.fetch.outputs.status }}
+        run: |
+          python .github/scripts/diagnostics_post.py
