@@ -132,14 +132,14 @@ def render_body(payload: dict, status: int) -> str:
         lines.append(f'- `{key}`: {cats_str}')
 
     lines += ['', '## Recent events (WARN/ERROR)', '', '```']
-    for e in (payload.get('recent_events') or [])[:30]:
+    for e in (payload.get('recent_events') or [])[:10]:
         lines.append(f'{e.get("ts", "")} [{e.get("level", "")}/{e.get("exchange", "")}] {e.get("msg", "")[:240]}')
     lines.append('```')
 
     lines += [
         '', '## Full payload', '',
         '<details><summary>Click to expand</summary>', '', '```json',
-        json.dumps(payload, indent=2, default=str)[:60000],
+        json.dumps(payload, indent=2, default=str)[:15000],
         '```', '', '</details>',
     ]
     return '\n'.join(lines)
@@ -235,12 +235,27 @@ def main() -> int:
         # no separate comment on the first run.
         return 0
 
-    # Tracker exists — reopen if someone closed it, update body, post comment.
-    run_gh(['issue', 'edit', str(existing), '--repo', repo, '--body', body])
-    # Reopen if needed (the comment will still fire the webhook either
-    # way, but we want the heartbeat issue to stay open).
+    # Tracker exists. Order of operations matters: the COMMENT is what fires
+    # the webhook to the monitor chat, so it must always land — even if the
+    # body edit times out (GitHub's GraphQL mutation has 504'd on us when the
+    # body grows past ~30KB with full payload + recent_events spam). Reopen
+    # first (no-op if already open) so the comment definitely fires on an
+    # open issue, then post the comment, then try the body update last.
     run_gh(['issue', 'reopen', str(existing), '--repo', repo], check=False)
     run_gh(['issue', 'comment', str(existing), '--repo', repo, '--body', comment])
+    edit_result = subprocess.run(
+        ['gh', 'issue', 'edit', str(existing), '--repo', repo, '--body', body],
+        capture_output=True, text=True,
+    )
+    if edit_result.returncode != 0:
+        # Comment already posted, so the webhook fired and the monitor chat
+        # has the status. The body just wasn't updated to the latest full
+        # snapshot — surface the failure but don't crash the workflow.
+        print(
+            f'Body edit failed (comment was already posted, monitor chat is woken): '
+            f'{edit_result.stderr.strip()[:400]}',
+            file=sys.stderr,
+        )
     print(f'Heartbeat posted on tracker issue #{existing}')
     return 0
 
