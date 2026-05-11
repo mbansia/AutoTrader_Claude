@@ -1,8 +1,24 @@
 #!/usr/bin/env python3
-"""Read the diagnostics JSON saved by the workflow, evaluate anomalies,
-and open OR update a single tracker issue on GitHub. Idempotent —
-the same issue is updated each run so the operator's notifications
-aren't spammed."""
+"""Read the diagnostics JSON saved by the workflow, summarise the run,
+and post to a single persistent tracker issue so the monitor chat
+gets a webhook event EVERY run, anomalies or not.
+
+Design (heartbeat model, post-2026-05-11):
+  * One persistent open issue titled `[bot-diagnostics] Tracker`.
+  * Created on first run if it doesn't exist.
+  * Body is always the latest full state (anomalies + cycle health +
+    positions + rejections + recent events + full JSON).
+  * Each cron run posts a one-line comment with status — anomalies if
+    any, "all clear" otherwise. This is what fires the webhook to
+    monitor-chat subscribers.
+
+Why a comment EVERY run (not just on anomalies):
+  the original design (open issue on anomalies, close on all-clear)
+  meant the monitor chat got nothing on healthy cycles and couldn't
+  even confirm the workflow was still running. The heartbeat model
+  trades a small amount of comment-noise for unambiguous "the cron
+  ran and here's what it found" visibility.
+"""
 
 from __future__ import annotations
 
@@ -13,13 +29,12 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-TRACKER_TITLE = '[bot-diagnostics] Anomaly tracker'
+TRACKER_TITLE = '[bot-diagnostics] Tracker'
 TRACKER_LABEL = 'bot-diagnostics'
 RESPONSE_PATH = Path('response.json')
 
 
 def run_gh(args: list[str], check: bool = True) -> str:
-    """Wrap `gh` calls so we get useful errors."""
     result = subprocess.run(['gh', *args], capture_output=True, text=True)
     if check and result.returncode != 0:
         print(f'gh {" ".join(args)} failed: {result.stderr}', file=sys.stderr)
@@ -28,22 +43,17 @@ def run_gh(args: list[str], check: bool = True) -> str:
 
 
 def ensure_label(repo: str) -> bool:
-    """Create the tracker label if it doesn't exist. Returns True on success
-    so the caller knows whether to pass --label to `issue create`. Failures
-    are non-fatal — we'd rather file an unlabeled tracker than no tracker."""
-    # Check by name. `gh api repos/X/labels/<name>` returns 200 if exists.
     result = subprocess.run(
         ['gh', 'api', f'repos/{repo}/labels/{TRACKER_LABEL}'],
         capture_output=True, text=True,
     )
     if result.returncode == 0:
         return True
-    # Create. POST /repos/{owner}/{repo}/labels with name + color.
     create = subprocess.run(
         ['gh', 'api', '--method', 'POST', f'repos/{repo}/labels',
          '-f', f'name={TRACKER_LABEL}',
          '-f', 'color=d73a4a',
-         '-f', 'description=Auto-filed by the diagnostics cron when anomalies fire.'],
+         '-f', 'description=Auto-managed by the diagnostics cron heartbeat.'],
         capture_output=True, text=True,
     )
     if create.returncode == 0:
@@ -52,22 +62,22 @@ def ensure_label(repo: str) -> bool:
     return False
 
 
-def find_open_tracker(repo: str) -> int | None:
-    """Locate the tracker issue by exact title match. We search the whole
-    open-issue list rather than filtering by label so it still works when
-    the label couldn't be created (e.g., insufficient permissions on the
-    repo's default GITHUB_TOKEN)."""
-    out = run_gh([
-        'issue', 'list', '--repo', repo,
-        '--state', 'open', '--limit', '100', '--json', 'number,title',
-    ])
-    try:
-        rows = json.loads(out or '[]')
-    except json.JSONDecodeError:
-        return None
-    for row in rows:
-        if row.get('title') == TRACKER_TITLE:
-            return int(row['number'])
+def find_tracker(repo: str) -> int | None:
+    """Locate the tracker issue by title. Heartbeat model keeps it open
+    indefinitely, but search both states in case someone manually closed
+    it — we'll reopen below."""
+    for state in ('open', 'closed'):
+        out = run_gh([
+            'issue', 'list', '--repo', repo,
+            '--state', state, '--limit', '100', '--json', 'number,title,state',
+        ])
+        try:
+            rows = json.loads(out or '[]')
+        except json.JSONDecodeError:
+            continue
+        for row in rows:
+            if row.get('title') == TRACKER_TITLE:
+                return int(row['number'])
     return None
 
 
@@ -80,23 +90,29 @@ def short_anomaly_lines(anomalies: list[dict]) -> list[str]:
 
 
 def render_body(payload: dict, status: int) -> str:
+    """Full state for the issue body. Updated on every run regardless of
+    whether anomalies are present, so the latest state is always one
+    click away on the issue."""
     ts = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+    anomalies = payload.get('anomalies') or []
     lines: list[str] = [
-        f'_Last scan: **{ts}** • diagnostics endpoint returned HTTP **{status}**_',
+        f'_Last scan: **{ts}** • endpoint returned HTTP **{status}**_',
         '',
-        '## Anomalies',
+        '## Status',
+        '',
+        '✅ **All clear** — no anomalies detected.' if not anomalies else f'⚠️ **{len(anomalies)} anomaly/anomalies** in latest scan:',
         '',
     ]
-    anomalies = payload.get('anomalies') or []
-    if not anomalies:
-        lines.append('_No anomalies in this scan — closing the tracker._')
-    else:
+    if anomalies:
         lines.extend(short_anomaly_lines(anomalies))
-    lines += ['', '## Cycle health', '']
+        lines.append('')
+
+    lines += ['## Cycle health', '']
     ch = payload.get('cycle_health') or {}
     lines.append(f'- last event: `{ch.get("last_event_ts")}` ({ch.get("seconds_since_last_event", "?")}s ago)')
     lines.append(f'- errors in window: `{ch.get("error_count", "?")}` · warns: `{ch.get("warn_count", "?")}`')
     lines.append(f'- last event msg: `{(ch.get("last_event_msg") or "")[:200]}`')
+
     lines += ['', '## Positions', '']
     pos = payload.get('positions') or {}
     lines.append(f'- by status: `{pos.get("by_status", {})}`')
@@ -104,18 +120,60 @@ def render_body(payload: dict, status: int) -> str:
         lines.append('- naked spot positions:')
         for n in pos['naked']:
             lines.append(f'  - {n.get("symbol")} qty {n.get("quantity"):.6f} ~${n.get("notional_est"):.2f}, age {n.get("age_minutes"):.1f}m')
+
+    lines += ['', '## Recent trades', '']
+    lines.append(f'- count in window: `{payload.get("recent_trades_count", 0)}`')
+
     lines += ['', '## Rejections (grouped)', '']
     lines.append(f'- total in window: `{payload.get("rejections_total", "?")}`')
     rej = payload.get('rejections_grouped') or {}
     for key, cats in rej.items():
         cats_str = ', '.join(f'{c}={n}' for c, n in sorted(cats.items(), key=lambda x: -x[1])[:8])
         lines.append(f'- `{key}`: {cats_str}')
+
     lines += ['', '## Recent events (WARN/ERROR)', '', '```']
     for e in (payload.get('recent_events') or [])[:30]:
         lines.append(f'{e.get("ts", "")} [{e.get("level", "")}/{e.get("exchange", "")}] {e.get("msg", "")[:240]}')
     lines.append('```')
-    lines += ['', '## Full payload', '', '<details><summary>Click to expand</summary>', '', '```json',
-              json.dumps(payload, indent=2, default=str)[:60000], '```', '', '</details>']
+
+    lines += [
+        '', '## Full payload', '',
+        '<details><summary>Click to expand</summary>', '', '```json',
+        json.dumps(payload, indent=2, default=str)[:60000],
+        '```', '', '</details>',
+    ]
+    return '\n'.join(lines)
+
+
+def render_heartbeat_comment(payload: dict, status: int) -> str:
+    """One-line-ish status comment posted EVERY run. This is what fires the
+    webhook to the monitor chat. Keep it terse — the issue body has the
+    full state."""
+    ts = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+    anomalies = payload.get('anomalies') or []
+    ch = payload.get('cycle_health') or {}
+    pos = payload.get('positions') or {}
+    rt = payload.get('recent_trades_count', 0)
+    rj = payload.get('rejections_total', 0)
+    err = ch.get('error_count', '?')
+    warn = ch.get('warn_count', '?')
+    by_status = pos.get('by_status', {})
+    if not anomalies:
+        head = '✅ **Heartbeat — all clear**'
+    else:
+        sev_critical = sum(1 for a in anomalies if a.get('severity') == 'critical')
+        sev_warn = sum(1 for a in anomalies if a.get('severity') == 'warn')
+        head = f'⚠️ **Heartbeat — {sev_critical} critical, {sev_warn} warn** anomaly/anomalies'
+    lines = [
+        f'{head} @ {ts} (HTTP {status})',
+        f'- positions: `{by_status}` · trades in window: `{rt}` · rejections: `{rj}` · errors/warns: `{err}/{warn}`',
+    ]
+    if anomalies:
+        lines.append('- top:')
+        for a in anomalies[:3]:
+            lines.append(f'  - **[{a.get("severity", "?").upper()}]** {a.get("rule", "?")} — {a.get("detail", "")[:160]}')
+    lines.append('')
+    lines.append('_See the issue body above for the full state including the JSON payload._')
     return '\n'.join(lines)
 
 
@@ -125,11 +183,17 @@ def main() -> int:
         status = int(os.environ.get('STATUS') or '0')
     except ValueError:
         status = 0
+
     if not RESPONSE_PATH.exists():
         print('No response.json — workflow fetch failed.', file=sys.stderr)
-        payload: dict = {'anomalies': [{'severity': 'critical', 'rule': 'workflow_fetch_failed', 'detail': 'No response from /api/diagnostics'}]}
+        payload: dict = {
+            'anomalies': [{
+                'severity': 'critical',
+                'rule': 'workflow_fetch_failed',
+                'detail': 'No response from /api/diagnostics — endpoint unreachable or workflow step crashed before saving the body.',
+            }],
+        }
     elif status >= 400:
-        # The endpoint returned non-2xx. Treat as critical anomaly.
         try:
             raw = RESPONSE_PATH.read_text()[:1000]
         except Exception:
@@ -145,34 +209,39 @@ def main() -> int:
         try:
             payload = json.loads(RESPONSE_PATH.read_text())
         except json.JSONDecodeError as e:
-            payload = {'anomalies': [{'severity': 'critical', 'rule': 'invalid_json', 'detail': str(e)[:200]}]}
+            payload = {
+                'anomalies': [{
+                    'severity': 'critical',
+                    'rule': 'invalid_json',
+                    'detail': str(e)[:200],
+                }],
+            }
 
-    has_anomalies = bool(payload.get('anomalies'))
     label_ok = ensure_label(repo)
-    existing = find_open_tracker(repo)
+    existing = find_tracker(repo)
     body = render_body(payload, status)
+    comment = render_heartbeat_comment(payload, status)
 
-    if has_anomalies:
-        if existing:
-            # Update body + add a fresh comment so each cron run is timestamped.
-            run_gh(['issue', 'edit', str(existing), '--repo', repo, '--body', body])
-            comment_body = f'Diagnostics cron @ {datetime.utcnow().isoformat(timespec="seconds")}Z — see issue body for current state.'
-            run_gh(['issue', 'comment', str(existing), '--repo', repo, '--body', comment_body])
-            print(f'Updated tracker issue #{existing}')
-        else:
-            create_args = ['issue', 'create', '--repo', repo, '--title', TRACKER_TITLE, '--body', body]
-            if label_ok:
-                create_args += ['--label', TRACKER_LABEL]
-            out = run_gh(create_args)
-            print(f'Opened tracker issue: {out.strip()}')
-    else:
-        # No anomalies. Close the tracker if open; otherwise nothing to do.
-        if existing:
-            run_gh(['issue', 'edit', str(existing), '--repo', repo, '--body', body])
-            run_gh(['issue', 'close', str(existing), '--repo', repo, '--comment', f'All clear at {datetime.utcnow().isoformat(timespec="seconds")}Z.'])
-            print(f'Closed tracker issue #{existing} (all clear)')
-        else:
-            print('No anomalies and no open tracker — nothing to do.')
+    if existing is None:
+        # First run — create the persistent tracker.
+        create_args = ['issue', 'create', '--repo', repo,
+                       '--title', TRACKER_TITLE, '--body', body]
+        if label_ok:
+            create_args += ['--label', TRACKER_LABEL]
+        out = run_gh(create_args)
+        url = out.strip()
+        print(f'Opened persistent tracker: {url}')
+        # The issue body already carries the first heartbeat header, so
+        # no separate comment on the first run.
+        return 0
+
+    # Tracker exists — reopen if someone closed it, update body, post comment.
+    run_gh(['issue', 'edit', str(existing), '--repo', repo, '--body', body])
+    # Reopen if needed (the comment will still fire the webhook either
+    # way, but we want the heartbeat issue to stay open).
+    run_gh(['issue', 'reopen', str(existing), '--repo', repo], check=False)
+    run_gh(['issue', 'comment', str(existing), '--repo', repo, '--body', comment])
+    print(f'Heartbeat posted on tracker issue #{existing}')
     return 0
 
 
