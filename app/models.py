@@ -259,8 +259,15 @@ class StrategyConfig(Base):
     # re-fire on absurdly small post-migration values under DB
     # corruption or partial writes.
     config_schema_version: Mapped[int] = mapped_column(Integer, default=0)
-    entry_funding_threshold: Mapped[float] = mapped_column(Float, default=0.20)
-    exit_funding_threshold: Mapped[float] = mapped_column(Float, default=0.05)
+    entry_funding_threshold: Mapped[float] = mapped_column(Float, default=0.20)  # legacy alias; renamed → entry_min_net_apy in schema v2. Kept for back-compat reads; not written.
+    exit_funding_threshold: Mapped[float] = mapped_column(Float, default=0.05)   # legacy alias; renamed → exit_min_net_apy in schema v2. Kept for back-compat reads; not written.
+    # Net-APY thresholds the entry / exit gates compare against. AFTER worst-case
+    # basis cost and round-trip fees — NOT raw funding APY. See SYSTEM.md §3.1
+    # math. Renamed from entry_funding_threshold / exit_funding_threshold in
+    # config_schema_version v1 → v2 because the old names misled operators into
+    # thinking they were raw-funding thresholds.
+    entry_min_net_apy: Mapped[float] = mapped_column(Float, default=0.20)
+    exit_min_net_apy: Mapped[float] = mapped_column(Float, default=0.05)
     max_hold_hours: Mapped[int] = mapped_column(Integer, default=72)
     max_open_positions: Mapped[int] = mapped_column(Integer, default=1)
     max_trades_per_day: Mapped[int] = mapped_column(Integer, default=8)

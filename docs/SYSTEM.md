@@ -240,7 +240,7 @@ A loop crash inside any phase is caught by the outer `try/except` in `run_one_cy
 
 #### Math
 
-**Important up front**: the bot's entry and exit thresholds (`entry_funding_threshold`, `exit_funding_threshold` in `StrategyConfig`) compare against **net APY** — the annualized profit AFTER worst-case basis cost and round-trip fees — **NOT** raw funding APY. A pair with 80% gross funding APY can still be rejected. The variable names are historical; treat them as `entry_min_net_apy` / `exit_min_net_apy`.
+**Important up front**: the bot's entry and exit thresholds (`entry_min_net_apy`, `exit_min_net_apy` in `StrategyConfig`) compare against **net APY** — the annualized profit AFTER worst-case basis cost and round-trip fees — **NOT** raw funding APY. A pair with 80% gross funding APY can still be rejected. (The columns `entry_funding_threshold` / `exit_funding_threshold` are kept in the schema for back-compat but are no longer read; renamed in `config_schema_version` v1 → v2.)
 
 All formulas use the same primitives. **Variables are defined once here.**
 
@@ -254,8 +254,8 @@ All formulas use the same primitives. **Variables are defined once here.**
 | `b_l` | Live basis in bps (signed) | `b_l = (perp_mark − spot_mark) / spot_mark × 10⁴` at exit-decision time |
 | `m` | Exit-basis buffer multiplier | `cfg.exit_basis_buffer_multiple` (default 3.0) |
 | `s_f` / `p_f` | Spot / perp taker fee in bps | Live from the venue's fee API per symbol (cached 1h) |
-| `T_in` | Entry threshold (net APY, decimal) | `cfg.entry_funding_threshold` (default 0.20 = 20%) |
-| `T_out` | Exit threshold (net APY, decimal) | `cfg.exit_funding_threshold` (default 0.05 = 5%) |
+| `T_in` | Entry threshold (net APY, decimal) | `cfg.entry_min_net_apy` (default 0.20 = 20%) |
+| `T_out` | Exit threshold (net APY, decimal) | `cfg.exit_min_net_apy` (default 0.05 = 5%) |
 
 **APY compounding (the only annualization the bot uses):**
 
@@ -415,8 +415,8 @@ A single row in the `strategy_config` table. Edited via the `/config` page.
 
 | Field | Default | Type | Purpose |
 |---|---|---|---|
-| `entry_funding_threshold` | 0.20 | float (decimal APY) | Minimum **net APY** to open. Gate at §3.1 entry. |
-| `exit_funding_threshold` | 0.05 | float (decimal APY) | Forward net APY below this → close. Gate at §3.1 exit. |
+| `entry_min_net_apy` | 0.20 | float (decimal APY) | Minimum **net APY** to open. Gate at §3.1 entry. (Migrated from `entry_funding_threshold` in v1 → v2.) |
+| `exit_min_net_apy` | 0.05 | float (decimal APY) | Forward net APY below this → close. Gate at §3.1 exit. (Migrated from `exit_funding_threshold` in v1 → v2.) |
 | `exit_basis_buffer_multiple` | 3.0 | float | `m` in the basis P&L formula. Worst-case exit basis multiplier. |
 | `max_exit_basis_bps` | 5.0 | float (bps) | Defer voluntary exits until live basis ≤ this. Stop-loss bypasses. |
 | `stop_loss_pct` | -0.02 | float (decimal) | Mandatory exit if `unrealized_PnL / notional ≤` this. |
@@ -459,6 +459,7 @@ The following are still in the DB and on the `/config` form for back-compat but 
 | `strategy_config.entry_enabled` / `exit_enabled` | Superseded by `ModeState`. |
 | `taker_fee_bps` (if present in older DBs) | Live per-symbol fee from the venue's fee API is used instead. |
 | `min_window_profit_bps` (if present in older DBs) | Old gate replaced by the annualized net APY threshold. |
+| `entry_funding_threshold` / `exit_funding_threshold` | Renamed in v2 → `entry_min_net_apy` / `exit_min_net_apy`. Columns kept in schema but no longer read. The legacy names misled operators into thinking they were raw-funding thresholds; they were always NET APY. |
 
 Deprecated fields are kept in the schema (additive-only migration policy) but should be removed from the `/config` form on a future tidy-up PR. Until then they're cosmetic noise.
 
@@ -736,7 +737,7 @@ Reviewers reject PRs that change behavior without updating this doc. When in dou
 
 - **Vultr Auto Backups are NOT enabled.** Single-instance SQLite DB on local NVMe. Loss = entire trade / position / event history. Enable Vultr backups (~$1/mo) or run an off-host backup cron.
 - **Per-strategy config split** — today one `StrategyConfig` row serves the one active strategy. When cross-venue / onchain lands, this needs to split into per-strategy rows (or per-trade-type joined config).
-- **Naming**: `entry_funding_threshold` / `exit_funding_threshold` are misleading — they're net APY thresholds, not raw funding rate thresholds. Rename queued; aliasing in code today.
+- ~~**Naming**: `entry_funding_threshold` / `exit_funding_threshold` are misleading~~ — renamed in PR #32 to `entry_min_net_apy` / `exit_min_net_apy`. Legacy form names still accepted as aliases for one release cycle.
 - **Deprecated config fields** (§4) are still on the `/config` form for back-compat. Tidy-up PR pending.
 - **Maker-on-exit fee optimization** not implemented. ~30% of exit fees could be saved with post-only-with-timeout-fallback.
 - **Symbol mapping drift** across ccxt versions could leave open positions un-lookupable for exit funding refresh. Currently logs a WARN and falls back to stale `last_funding_rate`.
@@ -751,10 +752,11 @@ Append-only. Format: `YYYY-MM-DD · PR# · §sections touched · summary`.
 
 | Date | PR | Sections | Summary |
 |---|---|---|---|
+| 2026-05-11 | #34 | §0, §3.1 math, §4, §13 | Renamed `entry/exit_funding_threshold` → `entry/exit_min_net_apy` (config_schema_version v1→v2 migration). Removed deprecated form fields (`max_entry_basis_bps`, `min_24h_quote_volume`, `min_order_book_depth_usdt`, `depth_band_bps`). Form accepts both new and legacy field names for one release cycle. |
 | 2026-05-11 | #33 | §3.1, §5.2, §9, §13 | Break KuCoin drain↔rebalance oscillation. (1) Gate pre-trade rebalance on `candidates_passing > 0` (no point equalising wallets when there's no trade to fund). (2) `transfer_futures_to_spot` is now a two-hop: futures `CONTRACT → MAIN` via `transferOut`, then spot `MAIN → TRADE` via inner-transfer. Funds land where the spot order book can spend them without waiting a cycle for `consolidate_spot_wallets`. |
 | 2026-05-11 | #32 | tooling | `diagnostics_post.py`: post heartbeat comment **before** body edit, make body edit non-fatal, trim payload. Body-too-large 504s no longer block the comment, which is what fires the monitor chat webhook. |
 | 2026-05-11 | #31 | rewrite | SYSTEM.md v1.0 — full rewrite after operator audit. Definitions upfront, per-strategy SOP + math, config layers explained, deprecated fields called out, exit-logic regression `rt_basis_bps` → `rt_basis_signed_bps` fixed alongside. |
-| 2026-05-11 | #29 | §5.2, §9, §13 | KuCoin futures→spot drain uses the futures-side `transferOut` endpoint (legacy `/api/v1/transfer-out`) instead of the spot-side universal-transfer (which can't see the futures wallet). `wallet_breakdown` USDC contract under-report fixed. Identical-error dedup via `_TRANSFER_ERROR_CACHE`. Resolved the 112002 deferred item. *(The v1.0 rewrite's first draft mis-credited this as "PR #22" — corrected here.)* |
+| 2026-05-11 | #29 | §5.2, §9, §13 | KuCoin futures→spot drain uses the futures-side `transferOut` endpoint (legacy `/api/v1/transfer-out`) instead of the spot-side universal-transfer (which can't see the futures wallet). `wallet_breakdown` USDC contract under-report fixed. Identical-error dedup via `_TRANSFER_ERROR_CACHE`. Resolved the 112002 deferred item. |
 | 2026-05-11 | #30 | §6.2, §9 | Don't render fake perp leg for `naked_spot`; auto-close stale naked rows. |
 | 2026-05-11 | #27 | §7, §10, §11 | Heartbeat-model diagnostics tracker. Monitor always knows the cron ran. |
 | 2026-05-11 | #26 | §2 | Vultr specs + KuCoin permissions clarification + backup-risk callout. |

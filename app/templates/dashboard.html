@@ -267,7 +267,7 @@
           {% if r.trade_type_label %}<span class="tag muted" style="font-size:9px;margin-left:4px;" title="{{ r.trade_type_label }}">{{ r.trade_type|replace('_funding_arb','')|replace('_same_venue','')|replace('_cross','×')|replace('_arb','') }}</span>{% endif %}
         </td>
         <td class="num">{{ ('%.2f' % r.notional_now) if r.notional_now else ('%.2f' % r.notional_entry) }}</td>
-        <td class="num {{ 'good' if r.last_funding_apy >= cfg.exit_funding_threshold else 'warn' }}">{{ '%.2f' % (r.last_funding_apy * 100) }} <span class="muted" style="font-size:11px;">({{ '%dh' % r.interval_hours }})</span></td>
+        <td class="num {{ 'good' if r.last_funding_apy >= cfg.exit_min_net_apy else 'warn' }}">{{ '%.2f' % (r.last_funding_apy * 100) }} <span class="muted" style="font-size:11px;">({{ '%dh' % r.interval_hours }})</span></td>
         <td class="num">{{ '%.2f' % (r.effective_apy * 100) }}</td>
         <td class="num {{ 'good' if r.basis_now_bps <= cfg.max_exit_basis_bps else 'warn' }}">{{ '%+.1f' % r.basis_now_bps }}</td>
         <td class="num">{{ r.age }}</td>
@@ -345,7 +345,7 @@
   </div>
   {% endfor %}
   {% else %}
-  <div class="empty">No open positions in {{ view|upper }}. The bot will open one when the candidate's net annualized profit (funding + signed basis − fees) clears {{ '%.2f%%' % (cfg.entry_funding_threshold * 100) }}.</div>
+  <div class="empty">No open positions in {{ view|upper }}. The bot will open one when the candidate's net annualized profit (funding + signed basis − fees) clears {{ '%.2f%%' % (cfg.entry_min_net_apy * 100) }}.</div>
   {% endif %}
 </div>
 

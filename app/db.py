@@ -112,6 +112,12 @@ def run_schema_migrations() -> None:
     # APR migration in bot.py runs once on the first cycle after deploy
     # and bumps the row to 1.
     _add_column_if_missing('strategy_config', 'config_schema_version', 'INTEGER NOT NULL DEFAULT 0')
+    # Net-APY threshold rename (config_schema_version v1→v2). New columns get
+    # the same defaults as the legacy entry/exit_funding_threshold so a fresh
+    # DB starts in a sane state. The value-copy migration runs once per row in
+    # bot.py get_strategy_config().
+    _add_column_if_missing('strategy_config', 'entry_min_net_apy', 'FLOAT NOT NULL DEFAULT 0.20')
+    _add_column_if_missing('strategy_config', 'exit_min_net_apy', 'FLOAT NOT NULL DEFAULT 0.05')
     # Cross-venue tag — every per-row table carries an ``exchange`` column so
     # the dashboard, logs, scans, and exports can break down state by venue
     # without ambiguity. Default 'binance' on every existing row guarantees

@@ -83,12 +83,12 @@
   <h3>Strategy thresholds</h3>
   <div class="body">
     <div class="form-grid">
-      <div class="form-row"><label>Entry annualized net profit threshold (% APY)</label>
-        <input type="number" step="0.01" name="entry_funding_threshold_pct" value="{{ '%.2f' % (cfg.entry_funding_threshold * 100) }}">
-        <span class="hint">Open only when projected single-window net profit (funding − basis − fees), compounded to annual, exceeds this. <strong>40</strong> = require 40% net APY. The bot also uses this as a cheap funding-only pre-filter at scan time, then re-checks the full net calc at execution time.</span></div>
-      <div class="form-row"><label>Exit annualized net profit threshold (% APY)</label>
-        <input type="number" step="0.01" name="exit_funding_threshold_pct" value="{{ '%.2f' % (cfg.exit_funding_threshold * 100) }}">
-        <span class="hint">Close when forward annualized net profit (live funding − live basis − fees, compounded) falls below this. Same maths as entry; treats the position as "would I open this fresh now?".</span></div>
+      <div class="form-row"><label>Entry minimum net APY (% — annualized net profit)</label>
+        <input type="number" step="0.01" name="entry_min_net_apy_pct" value="{{ '%.2f' % (cfg.entry_min_net_apy * 100) }}">
+        <span class="hint">Open only when projected single-window net profit (funding + signed basis − worst-case adverse swing − round-trip fees), compounded to annual APY, ≥ this. <strong>40</strong> = require 40% net APY. NET means after fees and worst-case basis, NOT raw funding APY — a pair with 80% gross funding can still be rejected. The bot also uses this as a cheap pre-filter at scan time, then re-checks the full net calc at fill time.</span></div>
+      <div class="form-row"><label>Exit minimum net APY (% — annualized net profit)</label>
+        <input type="number" step="0.01" name="exit_min_net_apy_pct" value="{{ '%.2f' % (cfg.exit_min_net_apy * 100) }}">
+        <span class="hint">Close when forward annualized net profit (live funding + live basis − worst-case adverse swing − fees, compounded) falls below this. Same maths as entry; the check is "would I open this fresh right now at the more lenient exit threshold?".</span></div>
       <div class="form-row"><label>Stop-loss (% of entry notional, negative)</label>
         <input type="number" step="0.01" name="stop_loss_pct_pct" value="{{ '%.2f' % (cfg.stop_loss_pct * 100) }}">
         <span class="hint">Close when MTM PnL ÷ notional ≤ this. <strong>-2</strong> = -2%. Set 0 to disable.</span></div>
