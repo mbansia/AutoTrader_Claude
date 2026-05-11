@@ -1134,6 +1134,20 @@ class VenueGateway:
         """
         return []
 
+    def convert_dust_to_native(self, assets: list[str], paper_mode: bool = False) -> tuple[float, str]:
+        """Convert sub-min-order dust holdings to the venue's native fee
+        token (BNB on Binance, KCS on KuCoin). Lets the bot clean up
+        naked-spot positions whose notional is below MIN_NOTIONAL — the
+        regular sell path can't move them.
+
+        Both venues expose dedicated dust-conversion endpoints with no
+        per-asset minimum; the rate is set by the venue (small spread).
+        Returns ``(total_native_received, err_or_empty)``. Default is
+        a no-op; subclasses override when supported."""
+        if paper_mode:
+            return 0.0, 'paper'
+        return 0.0, f'dust conversion not wired on {self.name}'
+
     def wallet_breakdown(self, assets: tuple[str, ...] = SUPPORTED_QUOTES) -> dict:
         """Diagnostic — return every wallet-type's per-asset balance so
         the operator can audit where funds are actually parked. Default
@@ -1302,6 +1316,41 @@ class BinanceGateway(VenueGateway):
         if amount <= 0:
             return True, 'noop'
         return self._universal_transfer('UMFUTURE_MAIN', amount, asset=asset)
+
+    def convert_dust_to_native(self, assets: list[str], paper_mode: bool = False) -> tuple[float, str]:
+        """Convert eligible dust on Binance to BNB via /sapi/v1/asset/dust.
+        Works below MIN_NOTIONAL — the right endpoint for sub-$5 sweep.
+        The endpoint accepts a list of assets; we pass ``assets`` in
+        whichever ccxt-naming variant is bound by the current build."""
+        if paper_mode:
+            return 0.0, 'paper'
+        if not assets:
+            return 0.0, 'no assets passed'
+        # ccxt naming drift: older builds expose `sapi_post_asset_dust`,
+        # newer builds expose `sapiPostAssetDust`.
+        for name in ('sapiPostAssetDust', 'sapi_post_asset_dust'):
+            fn = getattr(self.spot, name, None)
+            if not callable(fn):
+                continue
+            # Binance wants a flat list of asset codes; ccxt passes them
+            # under `asset` (repeated) or as a comma-joined string in
+            # `assets`. Try both shapes — the working one returns a JSON
+            # body containing `totalTransfered` and `totalServiceCharge`.
+            for params in ({'asset': assets}, {'asset': ','.join(assets)}, {'assets': ','.join(assets)}):
+                try:
+                    resp = fn(params)
+                except Exception as e:
+                    last_err = str(e)[:160]
+                    continue
+                try:
+                    total_native = float(resp.get('totalTransfered') or resp.get('total_transferred') or 0)
+                except (TypeError, ValueError):
+                    total_native = 0.0
+                if total_native > 0:
+                    return total_native, ''
+                # No transfer — body returned but nothing converted.
+                return 0.0, str(resp)[:160]
+        return 0.0, 'sapiPostAssetDust not available in this ccxt build'
 
     # ─── Deposit / withdrawal / sub-transfer history ──────────────────────
     # Binance returns up to 90 days per call on deposit/withdrawal endpoints
@@ -2362,6 +2411,38 @@ class KuCoinGateway(VenueGateway):
                 ok, err = self._transfer(source, 'trade', src_free, asset=asset)
                 results.append((f'{asset}@{source}', src_free if ok else 0.0, '' if ok else err))
         return results
+
+    def convert_dust_to_native(self, assets: list[str], paper_mode: bool = False) -> tuple[float, str]:
+        """Convert eligible dust on KuCoin to KCS via the dust collection
+        endpoint. ccxt's binding for this varies by version; we probe a
+        few candidate method names. Returns (kcs_received, err)."""
+        if paper_mode:
+            return 0.0, 'paper'
+        if not assets:
+            return 0.0, 'no assets passed'
+        for name in (
+            'privatePostApiV3DustConvert', 'private_post_api_v3_dust_convert',
+            'privatePostAccountsTransferOut', 'private_post_accounts_transfer_out',
+            'privatePostAccountsKcsConvert', 'private_post_accounts_kcs_convert',
+        ):
+            fn = getattr(self.spot, name, None)
+            if not callable(fn):
+                continue
+            try:
+                resp = fn({'currency': ','.join(assets)})
+            except Exception as e:
+                last_err = str(e)[:160]
+                continue
+            try:
+                total = float((resp or {}).get('totalKcsAmount') or (resp or {}).get('totalAmount') or 0)
+            except (TypeError, ValueError):
+                total = 0.0
+            return total, '' if total > 0 else str(resp)[:160]
+        # Fallback: explicit per-asset inner-transfer-then-market-sell can
+        # work for some KuCoin dust but the dedicated endpoint is the
+        # right path. Surface the missing-endpoint error so the operator
+        # knows to update ccxt rather than expecting a silent success.
+        return 0.0, 'KuCoin dust-convert endpoint not available in this ccxt build'
 
     def wallet_breakdown(self, assets: tuple[str, ...] = SUPPORTED_QUOTES) -> dict:
         """Diagnostic — read every KuCoin Classic wallet type per asset.

@@ -819,6 +819,38 @@ def recover_phantom_spot(db, gateway: VenueGateway, mode: str, cfg: StrategyConf
         db.flush()
         log_event(db, f'Phantom spot CLOSED: sold {filled:.6f} {asset} → USDT @ {(rev.get("price") or limit_px):.6f} (hedge not feasible, flattened)', mode=mode, level='ERROR', exchange=gateway.venue_id)
 
+    # ─── Dust sweep: convert sub-min-notional naked positions to BNB/KCS ─
+    # Below-min-notional naked positions can't be sold via the normal IOC
+    # path (-1013 NOTIONAL / 400100 minimum requirement). Both Binance and
+    # KuCoin expose dust-conversion endpoints that work below those
+    # minimums by routing to the venue's native fee token. Sweep them
+    # automatically every cycle so operators don't need to log into the
+    # venue UI to clean up after partial-fill incidents.
+    dust_naked = db.scalars(select(Position).where(
+        Position.status == 'naked_spot',
+        Position.mode == mode,
+        Position.exchange == gateway.venue_id,
+        Position.last_close_error.like('dust_below_venue_min%'),
+    )).all()
+    if dust_naked:
+        dust_assets = [p.spot_symbol.split('/')[0] for p in dust_naked]
+        try:
+            native_received, conv_err = gateway.convert_dust_to_native(dust_assets, paper_mode=False)
+        except Exception as e:
+            native_received, conv_err = 0.0, f'convert_dust_to_native raised: {str(e)[:140]}'
+        if native_received > 0:
+            # Mark the converted positions as closed; the BNB/KCS lands
+            # in the spot wallet and is fungible / fee-payable.
+            for p in dust_naked:
+                p.status = 'closed'
+                p.last_close_error = f'dust_converted: swept to {"BNB" if gateway.venue_id == "binance" else "KCS"} via venue dust endpoint'
+            db.flush()
+            log_event(db, f'Dust sweep CLOSED {len(dust_naked)} naked_spot position(s): converted {", ".join(dust_assets)} → {native_received:.6f} {"BNB" if gateway.venue_id == "binance" else "KCS"} via venue dust endpoint', mode=mode, level='WARN', exchange=gateway.venue_id)
+        elif conv_err and 'not available' not in conv_err.lower():
+            # Endpoint exists but conversion didn't transfer anything —
+            # log once so the operator sees the venue response.
+            log_event(db, f'Dust sweep no-op on {gateway.name}: {conv_err[:200]} (assets tried: {", ".join(dust_assets)})', mode=mode, level='WARN', exchange=gateway.venue_id)
+
 
 def reconcile_positions(gateway: VenueGateway) -> None:
     """Rehydrate any perp positions on this gateway's venue that aren't tracked locally."""
