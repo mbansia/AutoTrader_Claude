@@ -1,679 +1,773 @@
-# AutoTrader_Codex — System Manual
+# AutoTrader_Codex — System SSOT
 
-The single living document that describes **what this bot does, how it works, and how to debug it**. Every PR that changes behavior must update the relevant section. The diagnostics-monitor chat reads this file on every wake-up before judging anomalies.
+The single living source of truth for what this bot does and how it works. Every behavior-changing PR updates the relevant section in the same commit. The diagnostics-monitor chat re-reads this on every wake-up before judging anomalies; any new dev reads it once to onboard.
 
-> Status: **v0.1** — drafted 2026-05-11. Sections marked `[NEEDS OPERATOR INPUT]` need the user (Milind) to fill in venue/host-specific details that the code doesn't capture. Everything else is sourced directly from the codebase and recent session history.
-
----
-
-## 0. What we are trying to accomplish
-
-**Generate returns from market-neutral funding-rate arbitrage** on centralized perpetual-swap venues, with execution and risk management automated end-to-end. The bot is delta-neutral by construction (long spot + short perp on the same base asset), so its P&L comes from:
-
-1. **Funding rate income** — the dominant return source on "hot" pairs (50% to 100,000%+ APY when annualized).
-2. **Signed basis P&L** — entry-time basis kicker or cost, minus a worst-case adverse-exit assumption.
-3. (Future) — cross-venue spread capture, onchain-perp / CEX-perp arb, IBKR equity / future hedges.
-
-Operator wears a hands-off hat: deposit capital, set risk thresholds via `/config`, watch `/dashboard` and the diagnostics tracker.
+> Status: **v1.0** — 2026-05-11 rewrite after operator audit.
 
 ---
 
-## 1. Setup
+## Table of contents
 
-### 1.1 Vultr (host)
+- [0. Definitions](#0-definitions)
+- [1. Purpose](#1-purpose)
+- [2. Setup](#2-setup)
+- [3. Strategies](#3-strategies)
+  - [3.1 Same-venue funding arbitrage (active)](#31-same-venue-funding-arbitrage-active)
+  - [3.2 Cross-venue funding arb (planned)](#32-cross-venue-funding-arb-planned)
+  - [3.3 Onchain (planned)](#33-onchain-planned)
+- [4. Configuration](#4-configuration)
+- [5. Wallet model per venue](#5-wallet-model-per-venue)
+- [6. Database schema](#6-database-schema)
+- [7. Monitoring & diagnostics](#7-monitoring--diagnostics)
+- [8. Logs & rejection categories](#8-logs--rejection-categories)
+- [9. Failure modes & recovery](#9-failure-modes--recovery)
+- [10. Response policy (monitor chat)](#10-response-policy-monitor-chat)
+- [11. Crons](#11-crons)
+- [12. Doc-update policy](#12-doc-update-policy)
+- [13. Known fragile / deferred](#13-known-fragile--deferred)
+- [14. Changelog](#14-changelog)
+
+---
+
+## 0. Definitions
+
+These terms appear throughout. Read them first.
+
+| Term | Definition |
+|---|---|
+| **Funding rate** | Periodic payment between perp longs and shorts. *Positive* funding = longs pay shorts. Settled at the **funding window**. |
+| **Funding window** | The interval at which funding is settled. Typically 4h or 8h, contract-specific. Read per-pair from the venue. |
+| **APR** | Annualized rate using simple (non-compounded) addition: `r × N` where N = periods/year. **Not used in this codebase.** |
+| **APY** | Annualized rate using compounding: `(1 + r)^N − 1`. **All thresholds in this codebase are APY**, even when historical variable names say "APR". |
+| **Spot** | Cash market — `BASE/QUOTE` pair, e.g. `BTC/USDT`. Buying spot = owning the base asset. |
+| **Perp** | Perpetual futures contract — `BASE/QUOTE:QUOTE`, e.g. `BTC/USDT:USDT`. No expiry; held positions accrue/pay funding. |
+| **Basis** | `(perp_price − spot_price) / spot_price`, in bps. **Positive** = perp at a premium to spot. |
+| **Long spot + short perp** | This bot's only active structure. Net price exposure = 0 (delta-neutral). Earns funding when funding rate is positive. |
+| **Entry basis** | Basis at the moment we open: `(perp_sell_fill − spot_buy_fill) / spot_buy_fill × 10⁴`. Positive = we sold the perp at a premium = entry profit. |
+| **Worst-case adverse exit basis** | Conservative assumption about the basis when we eventually close. Model: `entry_basis + buffer × |entry_basis|`, where buffer = `cfg.exit_basis_buffer_multiple` (default 3.0). |
+| **Limit-IOC** | Limit order with Immediate-Or-Cancel time-in-force. Fills against existing depth at or better than the limit, cancels any remainder. We never leave resting orders. Pays taker fee. |
+| **Reservation** | Cash a venue's matching engine sets aside when a limit-buy is placed: `qty × limit_price` from the trade wallet. If this exceeds the wallet's free balance, the venue rejects mid-fill (e.g. KuCoin `200004 Balance insufficient!`). |
+| **Naked spot** | A spot holding with no matching perp short. Created when a partial fill under `spot_buy_error` left the perp leg unfilled. Stored as `Position(status='naked_spot')`. |
+| **Phantom spot** | Same as naked spot — older terminology. We persist them so the dashboard never shows a fabricated number. |
+| **PM** | Binance **Portfolio Margin** — unified margin pool across cross-margin / USDM-futures / CM-futures. Orders route through `/papi/v1/*`. |
+| **UTA** | KuCoin **Unified Trading Account** — single unified pool across spot + futures. |
+| **Classic** (KuCoin) | The non-UTA mode. Spot funds split across `main`, `trade`, `margin`, `isolated`, `pool`; futures in `contract`. |
+| **MIN_NOTIONAL** | Venue's per-symbol minimum order notional. Binance returns `-1013 NOTIONAL` below it; KuCoin returns `400100 minimum requirement`. Roughly $5 on Binance, $1 on KuCoin. |
+| **Net APY** | Annualized profit AFTER all costs (worst-case basis, round-trip fees, swap fees if any). The gate threshold (`entry_funding_threshold` / `exit_funding_threshold`) is in this unit. **NOT the raw funding APY.** |
+| **Round-trip** | Entry + exit on both legs = 4 fee-bearing trades. If the bot needed a USDT↔USDC swap to fund the trade, +2 more swap legs. |
+| **Heartbeat tracker** | The persistent GitHub issue (`[bot-diagnostics] Tracker`) the cron updates and comments on every 3h. |
+| **Cross-stable arb** | A funding-arb candidate whose perp quote currency differs from the spot quote — e.g. spot leg on `DOGE/USDT`, perp leg on `DOGE/USDC:USDC`. Per-quote sizing reads the spot leg from the spot-quote wallet and the perp leg from the perp-quote wallet; these are independent. |
+| **Same-stable arb** | Spot and perp use the same quote (both USDT or both USDC). If the wallet for that quote is empty but the other stable has surplus, the `auto-swap` path can fund the trade. |
+| **Tier-1 / Tier-2 / Tier-3** | The three gates a candidate passes before the bot will trade it. **Tier-1**: cheap pre-filter on annualized net APY using approximate fees and zero basis (in `scan_funding`). **Tier-2**: book-walk via `simulate_fill` confirming both legs can fill at the sized qty (gives real avg/worst prices). **Tier-3**: full profitability gate using actual fill prices, live per-symbol fees, signed basis, swap-fee surcharge if needed. Only candidates that pass all three reach order placement. |
+| **Paper vs live mode** | Two parallel execution paths. **Paper** uses synthetic fills (`paper_slippage_bps`, `paper_fee_bps`) against real venue prices — no orders sent, no real money at risk. **Live** sends real orders. Both run every cycle on every gateway. Their DB rows are kept separate via the `mode` column. |
+| **Mandatory vs voluntary exit** | **Voluntary** exits (`forward_profit_below_threshold`, `max_hold`) are deferred when live basis is unfavourable — closing right now would print an extra basis cost. **Mandatory** exits (`stop_loss`, `check_hedge` naked-leg, `check_market_health` delisting) close immediately regardless of basis. |
+
+---
+
+## 1. Purpose
+
+Generate returns from **market-neutral funding-rate arbitrage** on centralized perpetual-swap venues. Operator deposits capital, sets risk thresholds via `/config`, watches `/dashboard` and the diagnostics tracker. The bot decides what to open, when to open, when to exit, and how to recover from failure modes — without human intervention in the normal case.
+
+**Active strategies:** 1 (same-venue funding arb on Binance + KuCoin). **Planned:** cross-venue arb, onchain.
+
+---
+
+## 2. Setup
+
+### 2.1 Vultr (host)
 
 | Setting | Value |
 |---|---|
 | Label | `arb-bot-tokyo` |
 | Region | Tokyo |
 | OS | Ubuntu 22.04 x64 |
-| vCPU | 1 |
-| RAM | 2048 MB (2 GB) |
-| Storage | 64 GB NVMe |
+| vCPU / RAM / disk | 1 vCPU · 2 GB · 64 GB NVMe |
 | Public IPv4 | `45.32.53.166` (reverse DNS `45.32.53.166.vultrusercontent.com`) |
 | Public IPv6 | `2001:8f8:1165:1275:5cd8:e3ba:9660:e28e` |
-| Subnet mask | `255.255.252.0` |
-| Default gateway | `45.32.52.1` |
-| SSH username | `linuxuser` |
-| Auto Backups | **NOT ENABLED** ⚠ |
+| SSH | `ssh linuxuser@45.32.53.166` (password in Vultr UI) |
+| Auto Backups | **NOT ENABLED** ⚠ (see §13) |
 
-- **SSH access**: `ssh linuxuser@45.32.53.166` (password is in the Vultr UI; rotate to key-based auth as a hardening step).
-- Both Vultr IPs are whitelisted on the KuCoin API key's IP restriction list, so re-imaging the host or moving to a new instance will require re-whitelisting on KuCoin (and likely Binance too) before the bot can call them.
-- OS: Linux (CVE-2026-31431 "Copy Fail" patched / `algif_aead` module disabled — see session memory 2026-05-10).
-- **Risk: Auto Backups are not enabled.** The bot's SQLite DB (`bot.db`) lives on the local NVMe. If the instance dies, every trade record, naked_spot reconstruction, capital flow row, and equity-curve point is gone. Either enable Vultr Auto Backups for ~$1/mo, or run a cron that `scp`s the DB to a second host. Worth fixing before the bot accumulates a long P&L history.
-- **Capacity note**: 1 vCPU was running at 41% under the pre-PR-20 paper-loop crash (every 30s loop iteration crashed with a NameError and burned CPU on exception handling + DB write). After PR #20 + #21 the load should drop substantially. If it stays above 50% sustained, consider bumping to 2 vCPU before adding more strategies.
+Both IPs are whitelisted on KuCoin's API key. Re-imaging or migrating instances requires re-whitelisting on KuCoin (and Binance if IP-restriction is enabled there).
 
-### 1.2 Coolify (container deployment)
+OS-level CVE-2026-31431 ("Copy Fail") patched / `algif_aead` disabled — session memory 2026-05-10.
 
-- Bot is deployed as a Coolify-managed service exposed at the public URL set by the sslip.io wildcard DNS (`http://m1348vwvjs47x081vz06b141.45.32.53.166.sslip.io`).
-- Coolify auto-deploys on push to `main` via a GitHub webhook. ~1-2 minutes from `merge → live`.
-- Build pipeline: **Nixpacks**. The `NIXPACKS_NODE_VERSION` env var (see below) is set even though the bot is Python-only; this is a Coolify default that lets Nixpacks build any optional frontend assets. Currently a no-op because the repo only contains `app/static/tables.js` (vanilla JS, no Node build step).
-- Service-level env vars (set in Coolify UI, not in repo) — current state confirmed by operator 2026-05-11:
-  - `BINANCE_API_KEY`, `BINANCE_API_SECRET`
-  - `KUCOIN_API_KEY`, `KUCOIN_API_SECRET`, `KUCOIN_API_PASSPHRASE`
-  - `DASHBOARD_USER`, `DASHBOARD_PASSWORD`
-  - `DATABASE_URL`
-  - `DIAGNOSTICS_TOKEN`
-  - `NIXPACKS_NODE_VERSION` (build-time only; not read by app code)
-- When you rename the GitHub repo, **re-confirm the Coolify webhook** in repo Settings → Webhooks. We've hit this before.
+### 2.2 Coolify
 
-### 1.3 GitHub (source + CI + monitoring tracker)
+Deploys via Nixpacks on push to `main`. Webhook is the only deploy trigger. ~1-2 min from merge → live container.
 
-- Repo: **`mbansia/AutoTrader_Codex`** (only repo accessible via the MCP allowlist).
-- Branch protection on `main`: **none today** (operator-confirmed 2026-05-11). Merges to `main` happen via PR purely as a workflow convention (direct `git push origin main` is also blocked by an HTTP proxy, so PR-via-MCP is the only path that works). If you ever add protections (e.g. require status checks), update §11 of this doc — the monitor chat may need to wait on CI before merging.
-- Dev branch convention: `claude/<short-kebab-description>`. We typically reuse a single long-lived dev branch (`claude/understand-repo-IeAcM`) and merge into `main` via PR.
-- Required repo secrets (Actions → Secrets and variables → Repository secrets):
-  - `BOT_URL` — bot's public URL (no trailing slash)
-  - `DIAGNOSTICS_TOKEN` — same value as the bot's env var
-- The cron workflow `.github/workflows/diagnostics.yml` runs every 3h.
+**Environment variables** (set in the Coolify service UI):
 
-### 1.4 Monitoring (diagnostics flow)
-
-- `/api/diagnostics?token=...` on the bot returns a structured JSON snapshot (cycle health, positions, wallets, rejections grouped, recent events, anomalies).
-- The cron workflow calls this endpoint and runs `.github/scripts/diagnostics_post.py` against the response.
-- The script posts a comment to a single persistent tracker issue titled **`[bot-diagnostics] Tracker`** on every run, regardless of whether anomalies are present (heartbeat model). The issue body is updated to the latest full state. The comment is the webhook-firing event that wakes the monitor chat.
-- A dedicated Claude monitoring chat subscribes to the tracker via `subscribe_pr_activity`, reads `docs/SYSTEM.md` (this file) on first wake, and responds inline. Response policy is in §11 — TL;DR briefly acknowledge "all clear" comments, react fully when anomalies are present.
-
-### 1.5 Binance
-
-- **Account**: `autotradercodex_virtual@yh0d2v3tnoemail.com` sub-account (per the operator's API Management screen).
-- **Account type**: **Portfolio Margin (PM)** — visible in the sub-account API list as the "Portfolio ..." label and confirmed live in production via `/papi/v1/account` probes. All order routing goes through `/papi/v1/*`; Classic `/api/v3/*` and `/fapi/v1/*` calls return -2015 on a PM account.
-- **API key**: `CTCDgU***` (HMAC type). Permissions granted (operator-confirmed 2026-05-11):
-  - Spot trading
-  - Margin trading
-  - Futures trading
-  - IP restriction enabled (only `45.32.53.166` whitelisted on Binance's side — confirm in the API key edit screen if you re-image the host)
-- The bot's `BinanceGateway.is_unified_margin()` returns `True` unconditionally — this codebase treats every Binance account as PM. If you switch off PM, the bot will misbehave.
-- **Universal transfer permission** isn't a separate Binance toggle on the screen the operator showed — it's implicit when Spot + Futures trading are both enabled on a PM account. If a transfer call ever returns -2014 / -1022, recheck the key.
-
-### 1.6 KuCoin
-
-- **Sub-account name**: `AutoTraderv2` (per the operator's API edit screen).
-- **API key**: `69f88ba0b70d0a0001cf9523`.
-- **Account mode**: **Classic** today (confirmed via `account_type()` probe at startup). The "Unified Account" toggle on the key permits UTA when the account is in UTA mode, but the master-account-side mode flip didn't take in this session; would require a master-account API call. Until UTA is enabled, the bot exercises the Classic-wallet code paths.
-- Permissions granted (operator-confirmed 2026-05-11):
-  - **General** — ticked and greyed-out (KuCoin baseline; cannot be disabled). Powers every read call (`fetch_balance`, `fetch_funding_rates`, `fetch_order_book`, …).
-  - **Spot Trading** — required for spot leg order placement and dust conversion.
-  - **Margin Trading** — required only if cross/isolated margin is used; harmless to leave on.
-  - **Futures Trading** — required for the perp leg.
-  - **Unified Account** — enables UTA mode when the account-side mode flip allows it. Today the sub-account is in Classic mode, so this permission is dormant.
-  - **Allow Flexible Transfers** — REQUIRED for `consolidate_spot_wallets` and `transfer_*` calls (main↔trade↔contract↔margin↔isolated hops). If this is unticked, every wallet rebalance returns a permission error.
-- **IP restriction**: `45.32.53.166` (IPv4) AND `2001:8f8:1165:1275:5cd8:e3ba:9660:e28e` (IPv6). Both Vultr IPs whitelisted. If the IP changes, KuCoin will silently 401 every call.
-- KuCoin Classic has three+ spot wallets the bot interacts with:
-  - `main` — Funding Account (default deposit destination)
-  - `trade` — Trading Account (spot orders execute here)
-  - `contract` — Futures wallet
-  - `margin`, `isolated`, `pool` — also probed by `consolidate_spot_wallets` and `wallet_breakdown`. `pool` (KuCoin Earn) is excluded from sweeps because it's time-locked.
-
-### 1.7 Onchain venues  `[NOT IMPLEMENTED — roadmap target still TBD]`
-
-- Operator hasn't picked a chain/protocol yet. Candidates implied by `TRADE_TYPE_LABELS` in `app/models.py` include `<chain>_onchain_funding_arb` and `<venue>_cex_to_dex_funding_spread`.
-- Will land as new `Gateway` subclasses in `app/exchange.py` (likely thin wrappers over a separate `app/onchain/<venue>.py` module that handles RPCs, wallets, and signing).
-
----
-
-## 2. Variables / configuration
-
-Three layers, in order of who edits them:
-
-### 2.1 Environment variables (operator, set in Coolify)
-
-Reference: `app/config.py` — `Settings` class.
-
-| Var | Default | Used by |
-|---|---|---|
-| `BINANCE_API_KEY` / `_SECRET` | empty | Binance gateway init |
-| `KUCOIN_API_KEY` / `_SECRET` / `_PASSPHRASE` | empty | KuCoin gateway init |
-| `DASHBOARD_USER` | `admin` | HTTP Basic auth on `/dashboard`, `/config`, `/logs`, etc. |
-| `DASHBOARD_PASSWORD` | `change-me` | same — operator must set a strong value |
-| `DIAGNOSTICS_TOKEN` | empty | `/api/diagnostics?token=...` — endpoint returns 503 until set |
-| `DATABASE_URL` | `sqlite:///./bot.db` | SQLAlchemy engine; mount on a persistent Coolify volume |
-| `NIXPACKS_NODE_VERSION` | — | Coolify build pipeline (Nixpacks). Not read by Python app code; currently a no-op since the repo has no Node build step. |
-
-### 2.2 StrategyConfig (operator-tuned, edited via `/config` UI, stored in DB)
-
-Reference: `app/models.py` — `StrategyConfig` class.
-
-| Field | Default | Meaning |
-|---|---|---|
-| `entry_funding_threshold` | 0.20 (=20% APY) | Minimum **net** annualized profit required to open a position. |
-| `exit_funding_threshold` | 0.05 (=5% APY) | If a position's forward net APY drops below this, close it. |
-| `max_hold_hours` | 72 | Hard time-based exit. |
-| `max_open_positions` | 1 | Per mode, across venues. |
-| `max_trades_per_day` | 8 | Soft cap on daily entries. |
-| `min_position_pct` | 0.005 (0.5%) | Floor for sizing as % of equity. |
-| `max_position_pct` | 0.10 (10%) | Ceiling for sizing as % of equity. |
-| `enforce_hedge_check` | true | Verify both legs exist on the venue every cycle. |
-| `delisting_check` | true | Force-close on market unhealthy. |
-| `auto_transfer_enabled` | true | Pre-trade spot↔futures rebalance for Classic accounts. |
-| `auto_quote_swap_enabled` | true | Auto-swap USDT↔USDC pre-trade when one quote is starved. |
-| `auto_rebalance_threshold` | 1.0 | Imbalance bar (USDT) above which rebalance fires. |
-| `futures_buffer_pct` | 0.20 | Margin buffer kept on the futures wallet during post-cycle drain. |
-| `perp_leverage` | 1 | The only safe value for delta-neutral. |
-| `max_perp_leverage` | 1 | Hard cap. |
-| `max_entry_basis_bps` | (deprecated) | Field retained for back-compat; basis_dislocated gate was retired in favour of the profitability gate alone. |
-| `max_exit_basis_bps` | 5.0 | Defer voluntary exits until basis is favourable. |
-| `exit_basis_buffer_multiple` | 3.0 | Worst-case adverse-exit basis assumption: `worst_exit = entry + buffer × |entry|`. |
-| `entry_tick_buffer_bps` | 1.0 | Limit-price padding above worst-walked-price for entry IOC. |
-| `exit_tick_buffer_bps` | 2.0 | Same on exit. |
-| `min_order_book_depth_usdt` | (defanged) | Legacy depth gate — the live book walk is the real check now. |
-| `depth_band_bps` | (defanged) | Same. |
-| `paper_starting_equity` | 1000 | Paper-mode virtual capital. |
-| `paper_slippage_bps` / `paper_fee_bps` | 5 / 4 | Paper-mode synthetic fill costs. |
-| `taker_fee_bps` | 5.0 | Fallback when venue fee API returns nothing. |
-| `config_schema_version` | 1 (after migration) | Persisted migration cursor for one-shot config-value transforms. |
-
-### 2.3 Module-level constants
-
-Reference: `app/config.py` — defaults written into a fresh `StrategyConfig` row on first run.
-
-| Constant | Default |
+| Var | Purpose |
 |---|---|
-| `ENTRY_FUNDING_APR` | 0.20 |
-| `EXIT_FUNDING_APR` | 0.05 |
-| `MAX_HOLD_HOURS` | 72 |
-| `LOOP_SECONDS` | 30 |
-| `STOP_LOSS_PCT` | -0.02 |
-| `PAPER_SLIPPAGE_BPS` | 5 |
-| `PAPER_FEE_BPS` | 4 |
+| `BINANCE_API_KEY` / `BINANCE_API_SECRET` | Binance API auth |
+| `KUCOIN_API_KEY` / `KUCOIN_API_SECRET` / `KUCOIN_API_PASSPHRASE` | KuCoin API auth |
+| `DASHBOARD_USER` / `DASHBOARD_PASSWORD` | HTTP Basic auth on every UI route except `/health` and `/api/diagnostics` |
+| `DIAGNOSTICS_TOKEN` | Token for `/api/diagnostics?token=...`. Endpoint returns `503` if unset. |
+| `DATABASE_URL` | SQLAlchemy connection (defaults to `sqlite:///./bot.db`) |
+| `NIXPACKS_NODE_VERSION` | Coolify build pipeline; not read by application code. |
+
+### 2.3 GitHub
+
+- Repo: **`mbansia/AutoTrader_Codex`** (only repo accessible via the GitHub MCP allowlist).
+- Branch protection on `main`: **none**. All merges via PR are workflow convention (a proxy blocks direct `git push origin main`).
+- Dev branch: `claude/<short-kebab>` (reuse `claude/understand-repo-IeAcM`).
+- Required repo secrets (Settings → Secrets and variables → Actions → Repository secrets):
+  - `BOT_URL` — `http://m1348vwvjs47x081vz06b141.45.32.53.166.sslip.io` (no trailing slash)
+  - `DIAGNOSTICS_TOKEN` — matches the bot's env var
+- Workflow: `.github/workflows/diagnostics.yml`, cron `0 */3 * * *`.
+
+### 2.4 Binance
+
+- **Account**: `autotradercodex_virtual@…` sub-account.
+- **Type**: **Portfolio Margin** (PM). Confirmed at runtime via `/papi/v1/account`. Bot routes through `/papi/v1/*` — Classic endpoints return `-2015` on this account.
+- **API key**: `CTCDgU***` (HMAC), IP-restricted to `45.32.53.166`.
+- **Permissions enabled**: Spot trading · Margin trading · Futures trading.
+- The bot's `BinanceGateway.is_unified_margin()` returns `True` unconditionally — this codebase assumes PM. Switching the account off PM mode will break sizing / transfer paths.
+
+### 2.5 KuCoin
+
+- **Sub-account**: `AutoTraderv2`.
+- **Account mode**: **Classic** (confirmed via `account_type()` probe at startup). UTA-enabling didn't take from the sub-account UI; would need a master-account API call.
+- **API key**: `69f88ba0b70d0a0001cf9523`. IP-restricted to both Vultr IPs (v4 + v6).
+- **Permissions enabled**:
+  - General (read-only baseline; locked-on, can't be disabled)
+  - Spot Trading · Margin Trading · Futures Trading
+  - Unified Account (dormant until account-mode flips to UTA)
+  - Allow Flexible Transfers — **required** for `consolidate_spot_wallets` and all `transfer_*` calls
+
+### 2.6 Onchain — `TBD`
+
+Roadmap target. No code yet. Will land as new `Gateway` subclasses in `app/exchange.py`.
 
 ---
 
 ## 3. Strategies
 
-### 3.1 Same-venue funding arb (`binance_same_venue_funding_arb`, `kucoin_same_venue_funding_arb`) — **ACTIVE**
+This codebase is multi-strategy by design — each strategy has its own SOP and (eventually) its own config. **Today only same-venue funding arb is active**, so the shared `StrategyConfig` row is effectively the funding-arb config. When additional strategies land, expect this section to grow and the configuration model in §4 to split.
 
-**The bet**: when a perp's funding rate is positive (longs pay shorts), the bot opens long-spot + short-perp on that base. Funding settlements (every 4h or 8h) pay the short leg from the long leg's pocket — but our long-spot leg is on the SPOT market, not the perp's long leg, so we collect the funding without paying the funding (we hedge against price moves with spot, not with the perp's long side).
+### 3.1 Same-venue funding arbitrage [ACTIVE]
 
-**Profit drivers**:
-- **Funding income** = `funding_rate × notional × periods_held`. Dominant. Annualized via `(1+r)^N` compounding.
-- **Signed basis P&L at entry** = `(perp_sell_price − spot_buy_price)`. Positive = kicker (perp at premium), negative = cost.
-- **Round-trip basis P&L over the trade** = `entry_basis − exit_basis`. Modeled conservatively: worst-case exit = `entry + buffer × |entry|` (adverse direction is "more positive basis"), so round-trip = `−buffer × |entry|` for both signs of entry.
-- **Fees**: 2 × spot taker + 2 × perp taker (entry + exit on each leg). Plus 2 × spot taker + 5 bps USDC/USDT basis when an auto-swap is needed.
+**Trade-type tags:** `binance_same_venue_funding_arb`, `kucoin_same_venue_funding_arb`.
 
-**Exit conditions**:
-- Forward net APY drops below `exit_funding_threshold`.
-- `max_hold_hours` reached.
-- Stop-loss: unrealized PnL / notional < `STOP_LOSS_PCT`.
-- Naked leg detected (hedge integrity check) → close the surviving leg.
-- Market unhealthy (delisting).
-- Maintenance mode flipped on.
+#### Thesis
 
-### 3.2 Cross-venue funding arb — **PLANNED**
+When a perp pays positive funding (longs pay shorts), the bot opens a delta-neutral structure on that base asset:
 
-Trade type tag: `cross_venue_funding_arb` (reserved in `TRADE_TYPE_LABELS`). Long perp on cheap-funding venue + short perp on expensive-funding venue. Not active yet.
+```
+LONG spot   (own the base asset)
+SHORT perp  (hedge price + collect funding from longs)
+```
 
-### 3.3 Onchain — **PLANNED**
+Net price exposure ≈ 0. Returns come from:
+1. **Funding income** every funding window (dominant on hot pairs).
+2. **Entry basis kicker** if we sell the perp at a premium to where we buy the spot.
+3. (Negative) **Worst-case adverse basis swing** between entry and exit.
+4. (Negative) **Round-trip taker fees** (2 spot legs + 2 perp legs + optionally 2 USDC↔USDT swap legs).
 
-Trade type tag: TBD. Likely `<chain>_onchain_funding_arb`. Not active yet.
+#### SOP per loop iteration
+
+Loop period: `cfg.loop_seconds` (default 30s). Runs separately for paper and live mode, on each gateway (Binance, KuCoin).
+
+```
+Phase A — Safety (live only)
+   For each open Position:
+      check_market_health → force_close_both if delisted/halted
+      check_hedge          → close_naked_leg if one leg disappeared
+   recover_phantom_spot
+      ① Stale reconciliation: any naked_spot Position whose spot wallet
+         balance is gone → mark closed
+      ② For each non-stable spot asset with notional ≥ $0.10:
+         - if notional < venue MIN_NOTIONAL → persist as
+           naked_spot(dust), skip recovery
+         - else: persist as naked_spot, try hedge (Phase 1) or sell (Phase 2)
+      ③ Dust sweep: batch convert_dust_to_native for all
+         naked_spot(dust) positions → BNB / KCS via venue dust endpoint;
+         on success, mark them closed
+
+Phase B — Exits (when exit_enabled)
+   gateway.funding_rates_dict() — fresh predicted rates per venue
+   For each open Position:
+      update p.last_funding_rate, p.funding_interval_hours
+      compute forward-looking net APY at LIVE funding + basis (math below)
+      exit_reason set if:
+         forward_profit_below_threshold  (forward net APY < exit threshold)
+         max_hold                        (age > cfg.max_hold_hours)
+         stop_loss                       (unrealized PnL / notional ≤ cfg.stop_loss_pct) [mandatory]
+      Non-mandatory exits deferred when basis is unfavourable
+      Mandatory: force_close_both regardless
+
+Phase C — Entries (when entry_enabled, not at max_open_positions)
+   scan_funding (per gateway)
+      fetch perp funding rates
+      Tier-1 pre-filter (cheap, per-pair):
+         approx_net_apy = annualize(funding - approx_fees)
+         REJECT below_threshold if approx_net_apy < entry_funding_threshold
+      spot-pair existence check (reload markets if missing)
+      rank passing candidates by funding APY desc
+   Wallet prep (live only):
+      consolidate_spot_wallets (KuCoin Classic: main/margin/isolated → trade)
+      pre-trade rebalance     (split-wallet venues: equalize spot ↔ futures)
+      auto-swap USDT↔USDC      (if a same-stable arb is starved)
+   For each top-5 candidate:
+      skip if base already held (incl. naked_spot)
+      iterative walk loop (≤4 passes):
+         parallel simulate_fill on spot (buy) + perp (sell)
+         compute provisional limit prices
+         clamp target_qty by min(filled, spot reservation, perp reservation)
+         break when converged
+      Tier-3 profitability gate (math below)
+         REJECT insufficient_annualized_profit if net_apy < entry_funding_threshold
+      Place spot limit-IOC (pre-snapshot wallet for partial-fill detection)
+         on exception with non-zero balance delta → synthesize partial fill,
+         continue at smaller qty
+      Persist Position(status='open'), record spot Trade
+      Place perp limit-IOC short for the spot-filled qty
+         on failure → rollback spot via close_spot_limit_ioc
+      Reconcile leg sizes (trim spot if perp filled less)
+      BREAK (max 1 open per cycle per gateway)
+
+Post-cycle
+   ingest_capital_flows  (deposits/withdrawals from venue history)
+   prune old rejected_candidates
+   futures→spot drain    (keep margin buffer; no-op on unified margin)
+   balance snapshot → EquityCurve
+```
+
+A loop crash inside any phase is caught by the outer `try/except` in `run_one_cycle`, logged as `Loop iteration error (<mode>): <repr>`, and the cycle moves on.
+
+#### Math
+
+**Important up front**: the bot's entry and exit thresholds (`entry_funding_threshold`, `exit_funding_threshold` in `StrategyConfig`) compare against **net APY** — the annualized profit AFTER worst-case basis cost and round-trip fees — **NOT** raw funding APY. A pair with 80% gross funding APY can still be rejected. The variable names are historical; treat them as `entry_min_net_apy` / `exit_min_net_apy`.
+
+All formulas use the same primitives. **Variables are defined once here.**
+
+| Symbol | Meaning | Source |
+|---|---|---|
+| `r` | Funding rate as a decimal (e.g. `0.001 = 0.1% per window`) | Predicted next-window rate from `gateway.funding_rates_dict()` |
+| `i_h` | Funding interval in hours (4 or 8 typically) | Parsed from the contract metadata |
+| `N` | Funding windows per year | `N = 24 × 365 / i_h` |
+| `f_w` | Funding window in bps | `f_w = r × 10⁴` |
+| `b_e` | Entry basis in bps (signed) | `b_e = (perp_avg − spot_avg) / spot_avg × 10⁴` at the simulated fill |
+| `b_l` | Live basis in bps (signed) | `b_l = (perp_mark − spot_mark) / spot_mark × 10⁴` at exit-decision time |
+| `m` | Exit-basis buffer multiplier | `cfg.exit_basis_buffer_multiple` (default 3.0) |
+| `s_f` / `p_f` | Spot / perp taker fee in bps | Live from the venue's fee API per symbol (cached 1h) |
+| `T_in` | Entry threshold (net APY, decimal) | `cfg.entry_funding_threshold` (default 0.20 = 20%) |
+| `T_out` | Exit threshold (net APY, decimal) | `cfg.exit_funding_threshold` (default 0.05 = 5%) |
+
+**APY compounding (the only annualization the bot uses):**
+
+```
+APY(per_window_bps, i_h) = (1 + per_window_bps / 10⁴)^(24 × 365 / i_h) − 1
+```
+
+**Round-trip basis P&L per cycle (always a cost, both signs of entry):**
+
+The worst-case adverse exit assumption is: at exit, the basis has moved further positive by `m × |b_e|`. For long-spot/short-perp, "more positive basis" hurts us (we sell our spot cheap relative to where we have to buy back the perp). So:
+
+```
+worst_adverse_swing_bps = m × |b_e|
+basis_RT_signed_bps     = − worst_adverse_swing_bps   ← always negative
+```
+
+For entry basis +27 bps with m=3: cost = 81 bps. For entry basis −27 with m=3: also 81 bps. The bot doesn't get *credit* for a positive entry basis in the gate — the worst-case eats it. This is conservative by design; real trades that don't hit worst-case outperform.
+
+**Round-trip fees per cycle:**
+
+```
+fees_RT_bps = 2 × (s_f + p_f)
+            + 2 × (s_f + 5 bps USDC/USDT spot basis)    [if auto-swap fired]
+```
+
+**Net profit per funding window:**
+
+```
+net_per_window_bps = f_w + basis_RT_signed_bps − fees_RT_bps
+                   = f_w − m × |b_e| − fees_RT_bps
+```
+
+**Net annualized profit (the actual gate quantity):**
+
+```
+net_APY = (1 + net_per_window_bps / 10⁴)^N − 1
+```
+
+#### Entry gate
+
+```
+OPEN iff   net_APY ≥ T_in
+```
+
+The variable name in code is `entry_funding_threshold`, but the gate compares the **net APY** (after worst-case basis + all fees), **not** raw funding APY. A pair with 80% gross funding APY can still fail if fees+basis eat more than 60%.
+
+The Tier-1 pre-filter (in the scan) uses an approximate fee estimate (~5 bps/leg) and assumes zero basis, then compares the same way. It's a cheap eliminator before the book walk; Tier-3 (using live fees + real fill basis) is the real check.
+
+#### Exit gate
+
+Same math as entry, with `b_l` (live basis) instead of `b_e` (fill basis):
+
+```
+fwd_net_APY = APY( f_w − m × |b_l| − fees_RT_bps , i_h )
+EXIT iff    fwd_net_APY < T_out
+```
+
+Interpretation: "If I were opening this trade fresh **right now** at the current funding rate and current basis, would my entry gate approve it at the more lenient `T_out` threshold? If no → close." Symmetric with entry; thresholds are directly comparable.
+
+Two additional exit triggers, evaluated alongside:
+
+- **max_hold**: position age > `cfg.max_hold_hours` (default 72) → exit.
+- **stop_loss**: `unrealized_PnL / spot_entry_notional ≤ cfg.stop_loss_pct` (default −0.02 = −2%) → mandatory exit (not deferrable on adverse basis).
+
+Voluntary exits (forward profit, max hold) are **deferred** when live basis exceeds `cfg.max_exit_basis_bps` (default 5.0) — i.e. closing right now would print a basis cost we don't want to lock in. The deferred exit retries every cycle until basis becomes favourable. `stop_loss` and `check_hedge`/`check_market_health` close paths are NOT deferrable.
+
+#### Reservation-aware sizing (inside the walk loop)
+
+Limit-buy reservations on both venues equal `qty × limit_price`. The limit price is `worst_price × (1 + tick_buffer/10⁴)` from the walk, always strictly above the average fill. Sizing `target_qty` purely against `sized_notional / mid_price` overflows reservations on thin books → mid-fill `Balance insufficient! 200004` and partial-fill exposure.
+
+The walk loop converges by clamping `target_qty` on every pass:
+
+```
+spot_limit  = spot_worst × (1 + tick_buffer_bps / 10⁴)
+perp_limit  = perp_worst × (1 − tick_buffer_bps / 10⁴)
+
+max_qty_by_spot_balance = (spot_leg_free × 0.99) / spot_limit
+max_qty_by_perp_balance = (perp_leg_free × 0.99 × leverage) / perp_limit
+
+target_qty = min(target_qty, spot_filled, perp_filled,
+                 max_qty_by_spot_balance, max_qty_by_perp_balance)
+```
+
+The 0.99 absorbs fee accrual / rounding. Up to 4 passes. Walks re-execute when target_qty shrinks so the profitability gate downstream sees fill prices for the *final* (post-clamp) size, not pre-clamp.
+
+#### Config that applies to this strategy
+
+See [§4 Configuration](#4-configuration) for the full breakdown. The fields used by this strategy:
+
+- Thresholds: `entry_funding_threshold`, `exit_funding_threshold`, `exit_basis_buffer_multiple`, `max_exit_basis_bps`, `stop_loss_pct`
+- Sizing: `min_position_pct`, `max_position_pct`, `max_open_positions`, `max_trades_per_day`
+- Timing: `max_hold_hours`, `loop_seconds`
+- Execution: `entry_tick_buffer_bps`, `exit_tick_buffer_bps`, `perp_leverage` (must be 1)
+- Wallet: `auto_transfer_enabled`, `auto_quote_swap_enabled`, `auto_rebalance_threshold`, `futures_buffer_pct`
+- Safety: `enforce_hedge_check`, `delisting_check`
+- Paper mode: `paper_starting_equity`, `paper_slippage_bps`, `paper_fee_bps`
+
+### 3.2 Cross-venue funding arb [PLANNED]
+
+Trade-type tags reserved in `app/models.py`:
+- `binance_kucoin_cross_funding_arb` — spot on one venue, perp on the other
+- `ibkr_binance_funding_arb`, `ibkr_kucoin_funding_arb` — IBKR equity / option hedge against a CEX perp
+
+Thesis (when implemented): when two venues have meaningfully different funding rates for the same perp, take the cheap one as the long-funding side and the expensive one as the short-funding side. SOP and math TBD; will require a new wallet model since balances live on different venues, plus venue-vs-venue basis modelling.
+
+### 3.3 Onchain [PLANNED]
+
+Trade-type tag reserved: `onchain_binance_funding_arb` (DEX perp + CEX spot). Chain / protocol still TBD per operator. Will land as a new `Gateway` subclass plus an `app/onchain/<venue>.py` module for RPC / wallet / signing concerns.
 
 ---
 
-## 4. Cycle flow — what happens every loop iteration
+## 4. Configuration
 
-Reference: `app/bot.py:run_one_cycle` (function name verbose, end of the file). Loop period = `cfg.loop_seconds` (default 30s).
+The bot has **three layers** of configuration. Each layer answers a different question.
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│ For each mode in (paper, live):                                       │
-│   For each gateway in (binance, kucoin):                              │
-│     ── Phase A: Safety (live mode only) ──                            │
-│     ─ Per open position:                                              │
-│       · check_market_health      → force_close_both if unhealthy      │
-│       · check_hedge              → close_naked_leg if asymmetric      │
-│     ─ recover_phantom_spot       → hedge-or-sell naked spot, +        │
-│                                    persist as Position(naked_spot),   │
-│                                    then dust-sweep at the end         │
-│                                                                       │
-│     ── Phase B: Exits ──                                              │
-│     ─ funding_rates_dict (venue-aware override)                       │
-│     ─ For each open position:                                         │
-│       · update last_funding_rate                                      │
-│       · forward profitability gate (same math as entry)               │
-│       · if APY < exit_threshold OR age > max_hold OR stop-loss        │
-│         → close (deferred when basis unfavourable, unless mandatory)  │
-│                                                                       │
-│     ── Phase C: Entries ──                                            │
-│     ─ scan_funding                                                    │
-│       · fetch_funding_rates → per-quote candidates                    │
-│       · Tier-1: approx_net_apy = (1 + (funding − approx_fees)/1e4)^N  │
-│         compare vs entry_funding_threshold                            │
-│       · spot-pair existence check (forced markets reload if missing)  │
-│       · rank by funding APY, ties broken by depth                     │
-│       · log top-3 candidates' raw rate + interval + APY               │
-│     ─ wallet prep:                                                    │
-│       · consolidate_spot_wallets (KuCoin Classic: main/margin/        │
-│         isolated → trade)                                             │
-│       · wallet snapshot log                                           │
-│       · pre-trade rebalance (if not unified margin)                   │
-│     ─ For top-5 candidates:                                           │
-│       · skip if base in held_bases (incl. naked_spot)                 │
-│       · auto-swap USDT↔USDC if same-stable arb is starved             │
-│         (charges swap_RT in gate)                                     │
-│       · iterative walk loop (≤4 passes):                              │
-│         ── parallel simulate_fill (spot buy + perp sell)              │
-│         ── compute provisional limit prices                           │
-│         ── clamp target_qty by min(filled, reservation per leg)       │
-│         ── repeat if shrinkage forced; break when converged           │
-│       · profitability gate (full Tier-3 math, signed basis,           │
-│         exit buffer, real venue fees from cache, +swap if any)        │
-│       · place spot limit-IOC at worst_price + tick_buffer             │
-│         ── pre-snapshot base balance for partial-fill detection       │
-│         ── on exception: re-read balance, synthesize partial fill if  │
-│           any quantity actually filled, continue at smaller qty       │
-│       · persist Position(status='open') + spot Trade row              │
-│       · place perp limit-IOC short at spot_filled_qty                 │
-│         ── on failure: rollback spot via close_spot_limit_ioc         │
-│       · reconcile leg sizes (trim spot if perp filled less)           │
-│       · BREAK (max 1 open per cycle)                                  │
-│                                                                       │
-│     ── Post-cycle ──                                                  │
-│     ─ ingest_capital_flows (deposits/withdrawals/sub-transfers)       │
-│     ─ prune old rejected_candidates                                   │
-│     ─ futures→spot drain (keep margin buffer; skip on unified)        │
-│     ─ balance snapshot → EquityCurve                                  │
-│                                                                       │
-│   Crash handling: outer try/except logs                              │
-│   `Loop iteration error (<mode>): <repr>` at ERROR and continues.    │
-└──────────────────────────────────────────────────────────────────────┘
-```
+| Layer | Who edits | Where | Lifetime |
+|---|---|---|---|
+| **A. Environment variables** | Operator (one-time) | Coolify env vars | Restart of container |
+| **B. Module-level constants** | Developer (in code) | `app/config.py` | Code release |
+| **C. `StrategyConfig` row** | Operator (via `/config` UI) | SQLite DB | Edited live, persists across restarts |
 
----
+### Why all three?
 
-## 5. Math — the gates in detail
+- **A (env vars)** holds secrets (API keys, DB URL, dashboard password, diagnostics token). These can never live in code or DB.
+- **B (module constants)** holds **defaults** used to **seed a fresh `StrategyConfig` row** on first run. They are NOT read at runtime after that. They exist so a brand-new deployment with an empty DB starts with sensible thresholds without operator intervention.
+- **C (StrategyConfig)** is the **live source of truth** at runtime. Once the row exists, every threshold the bot reads comes from C. Edits on `/config` write to C immediately. Module constants in B are no longer consulted.
 
-### 5.1 Funding APY annualization
+This means: **changing values in `app/config.py` does NOT change running-bot behavior** unless you also wipe the `StrategyConfig` row (or change the matching field via `/config`). The constants only set the *initial* default.
 
-`annualize_rate(period_rate, interval_hours)` returns `(1 + r)^N − 1` where `N = 24 × 365 / interval_hours`.
+### A. Environment variables
 
-```
-8h funding,   1.0 bp / window   → APY ≈ (1.0001)^1095 − 1 ≈ 11.6%
-8h funding,  10.0 bp / window   → APY ≈ 197%
-4h funding,  62.0 bp / window   → APY ≈ 88,000%
-```
+See §2.2 for the full list. These are read by `app/config.py`'s `Settings(BaseSettings)` at process start.
 
-Implemented in `app/exchange.py:annualize_rate`.
+### B. Module constants (in `app/config.py`)
 
-### 5.2 Tier-1 pre-filter (cheap)
-
-For every perp returned by `funding_rates_dict`:
-```
-approx_fee_bps        = _approx_round_trip_fee_bps(symbol)   # 4 legs × cached
-                                                                  per-symbol fee
-approx_net_window_bps = funding_window_bps − approx_fee_bps
-approx_net_apy        = (1 + approx_net_window_bps/1e4)^(24*365/interval_h) − 1
-```
-If `approx_net_apy < entry_funding_threshold` → bucket as `below_threshold` and skip Tier-2.
-
-### 5.3 Tier-2 book walk
-
-`simulate_fill(symbol, target_qty, side, perp)`:
-- Calls `fetch_order_book(symbol, limit=K)` where K∈{20,100} (KuCoin REST restriction snapped automatically).
-- Walks the asks (`buy`) or bids (`sell`) up to `target_qty`.
-- Returns `{ok, filled_qty, avg_price, worst_price, levels, notional, error}`.
-
-The bot runs spot and perp walks in parallel via `ThreadPoolExecutor` (ccxt is thread-safe for reads).
-
-### 5.4 Tier-3 profitability gate (the real gate)
-
-After the walk converges:
+Only the seed defaults — none of these are read after the first `StrategyConfig` row is created:
 
 ```python
-fill_basis_bps           = (perp_avg − spot_avg) / spot_avg × 10_000
-funding_window_bps       = candidate.funding_rate × 10_000
-exit_buffer              = cfg.exit_basis_buffer_multiple             # default 3.0
-worst_adverse_swing_bps  = abs(fill_basis_bps) × exit_buffer
-rt_basis_signed_bps      = − worst_adverse_swing_bps                  # cost for both signs
-
-spot_fee_bps             = gateway.taker_fee_bps(spot_symbol, perp=False)
-perp_fee_bps             = gateway.taker_fee_bps(perp_symbol, perp=True)
-round_trip_fees_bps      = 2 × (spot_fee_bps + perp_fee_bps)
-if auto_swap_was_needed:
-    swap_fee_bps         = 2 × (spot_fee_bps + 5)                     # 5 = USDC/USDT basis
-    round_trip_fees_bps += swap_fee_bps
-
-net_per_window_bps       = funding_window_bps + rt_basis_signed_bps − round_trip_fees_bps
-periods_per_year         = 24 × 365 / interval_h
-net_apy                  = (1 + net_per_window_bps/10_000)^periods_per_year − 1
-
-if net_apy < cfg.entry_funding_threshold:
-    REJECT as insufficient_annualized_profit
-else:
-    PROCEED
+ENTRY_FUNDING_APR    = 0.20    # → cfg.entry_funding_threshold (NET APY threshold)
+EXIT_FUNDING_APR     = 0.05    # → cfg.exit_funding_threshold
+MAX_HOLD_HOURS       = 72
+MAX_OPEN_POSITIONS   = 1
+MAX_TRADES_PER_DAY   = 8
+LOOP_SECONDS         = 30
+STOP_LOSS_PCT        = -0.02
+PAPER_SLIPPAGE_BPS   = 5
+PAPER_FEE_BPS        = 4
 ```
 
-### 5.5 Reservation clamp (inside the walk loop)
+The naming `ENTRY_FUNDING_APR` is historical — the value is actually a **net APY** threshold, not a raw funding APR. Renaming the variable is queued; for now treat it as an alias.
 
-Pre-PR-#10 bug: `target_qty = sized_notional / mid_price`, but the venue reserves at `qty × limit_price` (worst + tick), so for thin books the reservation could overflow the wallet by 2-5% and KuCoin would return `200004 Balance insufficient!` mid-fill (with a real partial fill landing).
+### C. `StrategyConfig` (the live runtime config)
 
-Fix (since 2026-05 PR #20):
+A single row in the `strategy_config` table. Edited via the `/config` page.
 
-```python
-for attempt in range(4):
-    walk spot + perp in parallel
-    spot_lim = spot_worst × (1 + tick/1e4)
-    perp_lim = perp_worst × (1 − tick/1e4)
-    max_by_spot  = (spot_leg_free × 0.99) / spot_lim
-    max_by_perp  = (perp_leg_free × 0.99 × leverage) / perp_lim
-    new_target   = min(spot_filled, perp_filled, max_by_spot, max_by_perp, target_qty)
-    if new_target >= target_qty − 1e-9:   break    # converged
-    target_qty = new_target
-```
+#### Active fields (currently read by the bot)
 
-This guarantees `target_qty × limit_price ≤ leg_free × 0.99` (1% safety margin for fee accrual / rounding).
+| Field | Default | Type | Purpose |
+|---|---|---|---|
+| `entry_funding_threshold` | 0.20 | float (decimal APY) | Minimum **net APY** to open. Gate at §3.1 entry. |
+| `exit_funding_threshold` | 0.05 | float (decimal APY) | Forward net APY below this → close. Gate at §3.1 exit. |
+| `exit_basis_buffer_multiple` | 3.0 | float | `m` in the basis P&L formula. Worst-case exit basis multiplier. |
+| `max_exit_basis_bps` | 5.0 | float (bps) | Defer voluntary exits until live basis ≤ this. Stop-loss bypasses. |
+| `stop_loss_pct` | -0.02 | float (decimal) | Mandatory exit if `unrealized_PnL / notional ≤` this. |
+| `max_hold_hours` | 72 | int | Time-based exit. |
+| `max_open_positions` | 1 | int | Across both venues, per mode. |
+| `max_trades_per_day` | 8 | int | Soft entry cap per mode. |
+| `min_position_pct` | 0.005 | float | Sizing floor as % of equity (0.5%). |
+| `max_position_pct` | 0.10 | float | Sizing ceiling (10%). |
+| `loop_seconds` | 30 | int | Cycle period. |
+| `entry_tick_buffer_bps` | 1.0 | float | Limit-IOC entry price padding above worst-walked-price. |
+| `exit_tick_buffer_bps` | 2.0 | float | Same on exit. |
+| `perp_leverage` | 1 | int | The only safe value for delta-neutral. |
+| `max_perp_leverage` | 1 | int | Hard cap. |
+| `auto_transfer_enabled` | true | bool | Pre-trade spot↔futures rebalance for Classic accounts. |
+| `auto_quote_swap_enabled` | true | bool | Auto-swap USDT↔USDC pre-trade when a quote wallet is starved. |
+| `futures_buffer_pct` | 0.20 | float | Margin buffer kept on futures wallet during post-cycle drain. |
+| `enforce_hedge_check` | true | bool | Verify both legs exist on the venue every cycle. |
+| `delisting_check` | true | bool | Force-close on market unhealthy. |
+| `paper_starting_equity` | 1000 | float (USDT) | Paper virtual capital. |
+| `paper_slippage_bps` / `paper_fee_bps` | 5 / 4 | float | Paper synthetic fill costs. |
+| `config_schema_version` | 1 | int | Persisted migration cursor; do not edit. |
 
-### 5.6 Exit-side mirror
+`max_perp_leverage` is also on the row but is consumed only by `app/main.py` for the "effective APY" display calculation — it doesn't change trading behavior. The actual leverage applied at entry comes from `perp_leverage`.
 
-Same formula, with `live_basis_bps` instead of `fill_basis_bps`. Sign-aware (`rt_basis_signed = −worst_adverse_swing`). If forward net APY < `exit_funding_threshold` → close.
+Master entry/exit toggles per mode live on the `ModeState` table (`mode_state.entry_enabled`, `mode_state.exit_enabled`), **not** on `StrategyConfig`. The DB has `strategy_config.entry_enabled` / `exit_enabled` columns from an earlier design; they're no longer read.
+
+#### Deprecated fields (kept in schema, no longer read)
+
+The following are still in the DB and on the `/config` form for back-compat but are **not** consulted by any decision path:
+
+| Field | Why deprecated |
+|---|---|
+| `max_entry_basis_bps` | The standalone `basis_dislocated` gate was retired (PR #9). The profitability gate now is the sole economic check. |
+| `min_24h_quote_volume` | Scan-time liquidity heuristic. The book walk at sizing-time is the real check (PR earlier in session). |
+| `min_order_book_depth_usdt` | Same reason. |
+| `depth_band_bps` | Same. |
+| `max_position_notional` / `min_symbol_notional` | Replaced by `min_position_pct` / `max_position_pct`. |
+
+| `auto_rebalance_threshold` | Field exists but the pre-trade rebalance logic uses a hardcoded 0.20 USDT threshold. Effectively dead. |
+| `strategy_config.entry_enabled` / `exit_enabled` | Superseded by `ModeState`. |
+| `taker_fee_bps` (if present in older DBs) | Live per-symbol fee from the venue's fee API is used instead. |
+| `min_window_profit_bps` (if present in older DBs) | Old gate replaced by the annualized net APY threshold. |
+
+Deprecated fields are kept in the schema (additive-only migration policy) but should be removed from the `/config` form on a future tidy-up PR. Until then they're cosmetic noise.
 
 ---
 
-## 6. Wallet model per venue
+## 5. Wallet model per venue
 
-### 6.1 Binance Portfolio Margin (active)
+### 5.1 Binance Portfolio Margin (active)
 - Unified pool: one balance per asset, used for both spot and perp.
 - Synthesised `futures.<asset>.free` mirrors `spot.<asset>.free`; `futures.<asset>.total = 0` by convention to avoid double-counting in equity sums.
 - `is_unified_margin() → True`.
-- `transfer_*_to_spot` and `_to_futures` are no-ops (return `'PM mode: unified margin'`).
-- Balance fetch: `/papi/v1/balance` (free = `crossMarginFree + umWalletBalance + cmWalletBalance`).
+- `transfer_*_to_spot` / `_to_futures` are no-ops on PM (return early).
+- Balance fetch: `/papi/v1/balance` → free = `crossMarginFree + umWalletBalance + cmWalletBalance`.
 
-### 6.2 KuCoin Classic (active)
-- Three+ separate spot wallets: `main`, `trade`, `contract`, `margin`, `isolated`, `pool`.
+### 5.2 KuCoin Classic (active)
+- Three+ spot wallets: `main`, `trade`, `contract`, `margin`, `isolated`, `pool`.
 - `is_unified_margin() → False` (returns `self._is_uta`).
-- Synthesised `spot.<asset>.free = main + trade` (aggregated). The actual spot order matching only touches `trade` — so we run `consolidate_spot_wallets` at the top of every cycle to sweep `main`/`margin`/`isolated` → `trade`, making the abstraction honest.
-- `futures.fetch_balance({'currency': cur})` must be called per-currency (default returns USDT only). Implemented since PR #15. `wallet_breakdown` was missing this — fixed in PR #22 so `/api/diagnostics` reports the real USDC contract balance instead of always 0.
-- **Transfer routing — futures→spot must go through the FUTURES client.** `self.spot.transfer('contract','trade',…)` routes to `/api/v3/accounts/universal-transfer`, which on a KuCoin Classic account returns code `112002 "Balance insufficient"` even when the futures `availableBalance` is positive — the spot-side "CONTRACT" account-type doesn't see the futures wallet. Use `self.futures.transfer(asset, amt, 'CONTRACT', 'TRADE')` (legacy `/api/v1/transfer-out`) for draining futures. `transfer_spot_to_futures` (IN direction) keeps using universal-transfer; that path works. Fixed in PR #22.
-- `pool` (KuCoin Earn) is time-locked, never swept.
+- Synthesised `spot.<asset>.free = main + trade` (aggregated). Spot orders only execute against `trade`.
+- `consolidate_spot_wallets` sweeps `main` / `margin` / `isolated` → `trade` at the top of every cycle so the abstraction matches reality.
+- `futures.fetch_balance({'currency': cur})` called **per-currency** (default returns USDT only). Fixed in PR #15. `wallet_breakdown` had the same bug — fixed in PR #22 so `/api/diagnostics` reports real USDC futures balance instead of always 0.
+- **Transfer routing — futures→spot must go through the FUTURES client, not the spot client.** `self.spot.transfer('contract','trade',…)` routes to `/api/v3/accounts/universal-transfer`, which on a KuCoin Classic account returns `112002 "Balance insufficient"` even when the futures `availableBalance` is positive — the spot-side "CONTRACT" account-type doesn't see the futures wallet. Use `self.futures.transfer(asset, amt, 'CONTRACT', 'TRADE')` (legacy `/api/v1/transfer-out`) for draining. `transfer_spot_to_futures` (IN direction) keeps using universal-transfer; that path works. Fixed in PR #22.
+- Identical-error dedup: repeated transfer failures with the same message are throttled via `_TRANSFER_ERROR_CACHE` (same pattern as `_CLOSE_ERROR_CACHE`) so the log doesn't flood when a venue-side issue persists.
+- `pool` (KuCoin Earn) is time-locked; never swept.
 
-### 6.3 KuCoin UTA (not active for the operator's sub-account)
-- Single unified pool via `/api/v3/uta/account/balance`.
-- `is_unified_margin() → True` (read live via `is_uta_enabled()` at gateway init).
-- Same no-op transfer semantics as Binance PM.
+### 5.3 KuCoin UTA (not active today)
+- Single unified pool. `is_unified_margin() → True`. Transfer methods are no-ops.
 
-### 6.4 Cross-stable USDT ↔ USDC
-- Per-quote sizing: `spot_leg_free = spot_free_by_q[sq]`, `perp_leg_free = fut_free_by_q[cq]`. For cross-stable arbs `sq != cq`.
+### 5.4 Cross-stable USDT ↔ USDC
+- Per-quote sizing reads `spot_free_by_q[sq]` and `fut_free_by_q[cq]`. For cross-stable arbs `sq ≠ cq`.
 - Auto-swap fires only for same-stable arbs (`sq == cq`) when the relevant pool is below `min_notional` and the other stable has surplus.
-- Swap path: `swap_quote(from, to, target, paper_mode)` walks USDC/USDT spot book, places limit-IOC at worst + tick, with a ±50 bps de-peg guard.
+- Swap path: `swap_quote(from, to, target)` walks USDC/USDT book, places limit-IOC at worst + tick, with a ±50 bps de-peg guard. Cost is charged to the profitability gate.
 
 ---
 
-## 7. Database
+## 6. Database schema
 
-SQLite by default (`bot.db`). Schema is defined in `app/models.py`; lightweight additive migrations (`ALTER TABLE ADD COLUMN`) run at startup via `app/db.py:run_schema_migrations`.
+SQLite default (`bot.db`). Schema in `app/models.py`. Migrations are additive-only `ALTER TABLE ADD COLUMN` calls run at startup (`app/db.py`).
 
-### 7.1 Tables
+### 6.1 Tables
 
-| Table | Purpose | Key columns |
-|---|---|---|
-| `strategy_config` | Singleton, operator-tuned. | All cfg.* fields. `config_schema_version` for one-shot migrations. |
-| `mode_state` | Per-mode (paper/live) toggles. | `entry_enabled`, `exit_enabled`, `maintenance_mode`. |
-| `strategy_state` | Per-(mode, trade_type) toggles. | `entry_enabled`, `exit_all_pending`. |
-| `positions` | Lifecycle: open → naked_spot → closed. | `status`, `mode`, `exchange`, `trade_type`, `spot_symbol`, `perp_symbol`, `quantity`, `spot_entry_price`, `perp_entry_price`, `last_funding_rate`, `funding_income_accrued`, `last_close_error`. |
-| `trades` | Every fill. | `position_id`, `venue` (spot/futures), `side`, `quantity`, `price`, `fee`, `ts`. |
-| `bot_events` | Logs (INFO / WARN / ERROR). | `level`, `exchange`, `mode`, `message`, `ts`, `requires_action`. |
-| `rejected_candidates` | Scan-time rejections for the Logs tab. | `mode`, `exchange`, `symbol`, `reason`, `funding_rate`, `ts`. |
-| `balance_snapshots` | Per-cycle wallet snapshot. | `mode`, `exchange`, asset balances, totals. |
-| `equity_curve` | Per-cycle equity history. | `mode`, `exchange`, `equity_usdt`, `ts`. |
-| `capital_flows` | Deposits / withdrawals / sub-transfers (for XIRR). | `mode`, `exchange`, `amount_usdt`, `kind`, `external_id`, `detected_by`, `ts`. |
-| `scan_results` | Per-cycle scan summary (for the Logs tab). | `mode`, `exchange`, `action`, `candidates_total`, `passing_total`, etc. |
+| Table | Purpose |
+|---|---|
+| `strategy_config` | Singleton, operator-tuned config. See §4. |
+| `mode_state` | Per-mode (paper/live) toggles: `entry_enabled`, `exit_enabled`, `maintenance_mode`. |
+| `strategy_state` | Per-(mode, trade_type) toggles: `entry_enabled`, `exit_all_pending`. |
+| `positions` | Lifecycle: `open → naked_spot → closed`. Carries entry prices, funding accruals, last error. |
+| `trades` | One row per fill. Tagged to a Position. Used by P&L + transactions tab. |
+| `bot_events` | Logs at INFO / WARN / ERROR. Source of the `/logs` page and `recent_events` in diagnostics. |
+| `rejected_candidates` | Scan rejections — what failed which gate, with reason category. |
+| `balance_snapshots` | Per-cycle wallet snapshot per venue. |
+| `equity_curve` | Per-cycle equity history per venue. |
+| `capital_flows` | Deposits / withdrawals / sub-transfers, ingested from venue history for XIRR. |
+| `scan_results` | Per-cycle scan summary. |
 
-### 7.2 Position lifecycle
+### 6.2 Position lifecycle
 
 ```
-        (entry path)            (recovery path)
-            │                         │
-            ▼                         ▼
-       ┌────────┐                ┌────────────┐
-       │  open  │                │ naked_spot │   ← partial fill under
-       └────────┘                └────────────┘     spot_buy_error,
-            │                         │             persisted with
-   exit/close│                  hedge │             synthetic ghost-
-            ▼                         │             entry Trade
-       ┌────────┐                     ▼
-       │ closed │  ◄──── sell ─── (try to short
-       └────────┘   or dust-conv      matching perp)
-                                      │
-                                      ▼
-                                 (back to 'open')
+                   (entry path)                            (recovery path)
+                        │                                        │
+                        ▼                                        ▼
+                  ┌──────────┐                              ┌────────────┐
+                  │   open   │                              │ naked_spot │
+                  └──────────┘                              └────────────┘
+                        │                                        │
+                exit / close                                  hedge succeeds
+                        ▼                                        │
+                  ┌──────────┐  ◄────────────────────────────────┘
+                  │  closed  │  ◄── sell-back or dust-convert
+                  └──────────┘  ◄── stale reconciliation (spot disappeared)
 ```
 
-`OPEN_STATUSES = ('open', 'naked_spot')` is used by every "currently exposed" query so naked positions never disappear from the portfolio view.
+`OPEN_STATUSES = ('open', 'naked_spot')` is used by every "currently exposed" query.
 
-**Rendering rule for `naked_spot`**: the perp leg of a `naked_spot` Position has `perp_entry_price = 0` because no perp short was ever filled (that's what makes it naked). The dashboard suppresses the perp-leg detail card for these rows and shows a "never opened (phantom spot)" tag instead, so no fabricated entry-price / MTM-PnL numbers appear. The spot-leg detail card is real.
+**Rendering rule for `naked_spot`**: the perp leg has `perp_entry_price = 0` (placeholder; no perp short was ever filled). The dashboard suppresses the perp-leg detail table for these rows — no fabricated entry/PnL numbers. Spot leg is real.
 
-**Stale reconciliation**: `recover_phantom_spot` runs a stale-naked-spot pass at the top of every live cycle. Any `naked_spot` Position whose underlying spot balance is gone from the wallet (sold externally, dust-converted by a prior cycle, venue Earn redemption, etc.) gets marked `closed` with `last_close_error = 'spot leg disappeared from wallet …'`. This stops the row from lingering in the open table indefinitely.
+**Stale reconciliation**: any `naked_spot` Position whose spot wallet balance is gone (sold externally, dust-converted by a prior cycle, Earn redemption) is auto-closed at the top of every live cycle by `recover_phantom_spot`.
 
-### 7.3 Migration policy
+### 6.3 Migration policy
 
-- Additive only — never drop columns. Code may stop reading a column; the column stays for back-compat.
-- New columns get a sensible `DEFAULT` so existing rows remain valid.
-- Idempotent (each `_add_column_if_missing` is a no-op when the column exists).
-- One-shot value transforms (e.g. legacy per-period → APR threshold) are gated by `config_schema_version` so they run exactly once per row.
+- **Additive only.** Never drop columns. Code may stop reading a column; the column stays.
+- New columns get a sensible `DEFAULT`. Idempotent.
+- One-shot value transforms gated by `config_schema_version` so they run exactly once per row regardless of restarts.
 
 ---
 
-## 8. Monitoring & diagnostics
+## 7. Monitoring & diagnostics
 
-### 8.1 `/api/diagnostics?token=<DIAGNOSTICS_TOKEN>&hours=<1-168>`
+### 7.1 `/api/diagnostics?token=<DIAGNOSTICS_TOKEN>&hours=<1-168>`
 
-Returns JSON (see `app/main.py:api_diagnostics`):
+Reference: `app/main.py:api_diagnostics`. Auth: `?token=`. Returns `503` if the env var is unset.
+
+Returns JSON with these top-level keys:
 
 ```
-generated_at_utc, window_hours
-cycle_health         { last_event_ts, last_event_msg, seconds_since_last_event, error_count, warn_count }
-positions            { by_status, open: [...], naked: [...] }
-wallets              { <venue>: { <asset>: { <wallet_type>: { free, total } } } }
-rejections_grouped   { "<venue>/<mode>": { reason_category: count } }
-rejections_total     int
-recent_events        [{ ts, level, exchange, mode, msg }, ...]   # last 50 WARN/ERROR
-recent_trades        [{ ts, mode, exchange, symbol, venue_leg, side, qty, price, fee }, ...]
-recent_trades_count  int
-anomalies            [{ severity, rule, detail }, ...]
-anomalies_count      int
+generated_at_utc       ISO-8601 UTC timestamp
+window_hours           the lookback window the caller requested
+
+cycle_health           { last_event_ts, last_event_msg, seconds_since_last_event,
+                         error_count, warn_count }
+positions              { by_status: {open: N, naked_spot: N, closed: N},
+                         open: [...], naked: [...] }
+wallets                { <venue>: { <asset>: { <wallet_type>: { free, total } } } }
+rejections_grouped     { "<venue>/<mode>": { reason_category: count, ... } }
+rejections_total       int
+recent_events          [ {ts, level, exchange, mode, msg}, ... ]  ≤ 50 WARN/ERROR
+recent_trades          [ {ts, mode, exchange, symbol, venue_leg, side, qty, price, fee}, ... ]
+recent_trades_count    int
+anomalies              [ {severity, rule, detail}, ... ]
+anomalies_count        int
 ```
 
-Auth: `?token=` is mandatory. 503 returned when `DIAGNOSTICS_TOKEN` env is unset (endpoint refuses to be silently public).
-
-### 8.2 Anomaly rules (in `api_diagnostics` body)
+### 7.2 Anomaly rules
 
 | Rule | Severity | Trigger |
 |---|---|---|
-| `no_recent_events` | critical | no `BotEvent` in last 3600s |
-| `stale_naked_spot` | warn | a `naked_spot` Position older than 60min |
-| `no_trades_despite_scans` | warn | 0 recent trades AND >20 rejections in window |
-| `error_burst` | warn | >20 ERROR `BotEvent`s in window |
-| `close_blocked` | warn | open Position with non-empty `last_close_error` |
+| `no_recent_events` | critical | No `BotEvent` in last 3600s |
+| `stale_naked_spot` | warn | A `naked_spot` Position older than 60min |
+| `no_trades_despite_scans` | warn | 0 recent trades AND > 20 rejections in window |
+| `error_burst` | warn | > 20 ERROR events in window |
+| `close_blocked` | warn | Open Position with non-empty `last_close_error` |
 
-### 8.3 GitHub Actions cron
+### 7.3 Cron + tracker
 
-`.github/workflows/diagnostics.yml` runs every 3h. Required repo secrets:
-- `BOT_URL` — public URL (no trailing slash)
-- `DIAGNOSTICS_TOKEN` — matches bot env var
+`.github/workflows/diagnostics.yml` runs every 3h. Required repo secrets: `BOT_URL`, `DIAGNOSTICS_TOKEN`.
 
-The cron pipes the JSON into `.github/scripts/diagnostics_post.py`, which (heartbeat model):
-- Locates (or, on first run, creates) the persistent `[bot-diagnostics] Tracker` issue.
-- Updates the issue body to the latest full state (anomalies + cycle health + positions + rejections + recent events + full JSON in `<details>`).
-- Reopens the issue if someone manually closed it (the heartbeat issue stays open forever).
-- Posts a one-comment-per-run heartbeat with terse status (✅ all clear or ⚠️ N anomalies + top-3). This comment fires the webhook to the monitor chat.
-- Falls back to filing without a label if label creation fails.
+The cron pipes the JSON into `.github/scripts/diagnostics_post.py`, which uses the **heartbeat model** (PR #27):
 
-### 8.4 Monitor chat
+- Locates (or creates) a persistent issue titled `[bot-diagnostics] Tracker`.
+- Updates its body to the latest full state.
+- Reopens it if anyone closed it.
+- **Posts a one-line comment EVERY run** (✅ all-clear or ⚠️ N anomalies + top-3).
 
-Separate Claude session from dev work. Reads `docs/SYSTEM.md` (this file) on every wake-up before judging. Subscribes to the tracker via `subscribe_pr_activity`. Responds inline on the tracker with diagnosis comments, opens PRs for code fixes via `mcp__github__create_pull_request`. Never pushes directly to `main`.
+The comment fires the GitHub webhook every run — that's how the monitor chat hears about all cycles, not just bad ones.
 
----
+### 7.4 Monitor chat
 
-## 9. Logs & rejection categories — the diagnostic alphabet
-
-### 9.1 Rejection categories (from `rejections_grouped`)
-
-| Category | Source | Meaning | Action when dominant |
-|---|---|---|---|
-| `below_threshold` | Tier-1 pre-filter | Funding APY net of approx fees below entry threshold. | None — strategy designed to skip. |
-| `no_spot_market` | scan | Perp's base has no spot pair on the venue (after force-reload). | None — perp-only listing. |
-| `insufficient_annualized_profit` | Tier-3 gate | Real APY (with fill basis, real fees) below threshold. | None unless threshold mis-calibrated. |
-| `below min position pct` | sizing | Wallet too small for `min_position_pct × equity`. | Inspect `wallets` for stranded funds; consider reducing `min_position_pct`. |
-| `below_min_pct_after_clamp` | post-clamp re-check | Reservation clamp shrunk size below min. Genuinely too small. | None. |
-| `no_book_depth` | book walk | `simulate_fill` returned 0; inner err embedded. | Inspect `spot_err`/`perp_err`; usually KuCoin limit issue (fixed) or symbol shape. |
-| `reservation_clamp_zeroed` | clamp | Wallet too small even for limit-price reservation. | None. |
-| `basis_dislocated` | (deprecated) | Gate was retired. **Should be 0**. | If non-zero, code regression — open PR. |
-| `spot_buy_error: kucoin {Balance insufficient!}` | venue 200004 | Reservation overflow (pre-clamp era) or thin-book partial fill. | After PR #10/14/15 this should drop near zero. Watch for new occurrences. |
-| `spot_buy_error: ... Order size below minimum` | venue 400100 | Sizing too small after clamp. | Investigate sizing math. |
-| `spot_ioc_zero_fill` / `perp_ioc_zero_fill` | book moved during round-trip | Limit IOC didn't cross any level. | Transient; retries next cycle. |
-| `strategy_disabled:<trade_type>` | strategy_state | Operator killed this strategy on `/config`. | None unless intentional. |
-
-### 9.2 Common log patterns
-
-- **`Spot wallet consolidate <asset>: X main→trade`** — KuCoin Classic sweep working. Diagnostic, ignore.
-- **`Wallet snapshot <q> [Classic|UTA]·split|unified: spot free/total=...; fut free/total=...`** — per-cycle wallet state. Diagnostic.
-- **`Pre-trade rebalance skipped: <venue> reports unified margin`** — PM/UTA correctly detected. Diagnostic.
-- **`Pre-trade rebalance: X USDT spot→futures (equalize wallets so both legs can fund)`** — Classic-account rebalance working.
-- **`Reservation clamp on <symbol>`** — *should not appear* (clamp moved inside walk loop). If it surfaces, regression.
-- **`Scan top <symbol>: predicted rate=X% per Yh → APY=Z%`** — top-3 candidate diagnostic.
-- **`Loop iteration error (<mode>): <traceback>`** — generic loop crash. Read the exception. Past examples: missing import (`total_funding_income`).
-- **`Phantom spot RESCUED into a hedged position`** — hedge-or-sell working.
-- **`Phantom spot CLOSED: sold ... → USDT`** — sell-back working.
-- **`Dust sweep CLOSED N naked_spot position(s)`** — auto dust conversion working.
-- **`futures→spot <quote> drain failed: kucoin Balance insufficient. 112002`** — known issue under investigation.
+Separate Claude session. Reads this doc on every wake-up. Subscribes to the tracker via `subscribe_pr_activity`. Responds per the policy in §10.
 
 ---
 
-## 10. Failure modes & recovery
+## 8. Logs & rejection categories
+
+### 8.1 Rejection categories (`rejections_grouped`)
+
+| Category | Meaning | Action when dominant |
+|---|---|---|
+| `below_threshold` | Tier-1 pre-filter: approx net APY < entry threshold. | None — strategy designed to skip these. |
+| `no_spot_market` | Perp's base has no spot pair on the venue. | None — perp-only listing. |
+| `insufficient_annualized_profit` | Tier-3 gate: real net APY (after live fees + fill basis) < threshold. | None unless threshold mis-calibrated. |
+| `below min position pct` | Sized notional < `min_position_pct × equity`. Wallet starvation. | Inspect `wallets` for stranded funds. |
+| `below_min_pct_after_clamp` | Reservation clamp shrunk size below min. | None — genuinely too small. |
+| `no_book_depth` | `simulate_fill` returned 0; inner err embedded in the reason. | Inspect inner err (KuCoin limit, BadSymbol, network). |
+| `reservation_clamp_zeroed` | Wallet too small even for limit-price reservation. | None. |
+| `basis_dislocated` | **DEPRECATED** — gate retired in PR #9. Should be 0. If non-zero, regression. |
+| `spot_buy_error: ... Balance insufficient!` | Mid-fill reservation overflow (pre-PR-#10 era) or thin-book partial fill. | After PR #10/14/15 should drop near zero. |
+| `spot_buy_error: ... Order size below minimum` | Sizing dropped below venue min after clamp. | Investigate sizing math. |
+| `spot_ioc_zero_fill` / `perp_ioc_zero_fill` | Book moved during round-trip. Transient. | None — retries next cycle. |
+| `strategy_disabled:<trade_type>` | Operator killed strategy via `/config`. | None unless unintentional. |
+
+### 8.2 Common log patterns (informational)
+
+- `Spot wallet consolidate <asset>: X main→trade` — KuCoin Classic sweep working.
+- `Wallet snapshot <q> [Classic|UTA]·split|unified: spot free/total=...; fut free/total=...` — per-cycle wallet state.
+- `Pre-trade rebalance skipped: <venue> reports unified margin` — PM/UTA correctly detected.
+- `Pre-trade rebalance: X USDT spot→futures (equalize wallets so both legs can fund)` — Classic rebalance working.
+- `Scan top <symbol>: predicted rate=X% per Yh → APY=Z%` — top-3 candidate diagnostic per cycle.
+- `Phantom spot RESCUED into a hedged position` — recover_phantom_spot Phase 1 success.
+- `Phantom spot CLOSED: sold ... → USDT` — recover_phantom_spot Phase 2 sell-back success.
+- `Phantom dust detected: ... below venue min` — too small to sell, flagged for dust sweep.
+- `Dust sweep CLOSED N naked_spot position(s)` — auto-conversion to BNB/KCS succeeded.
+- `Stale naked_spot reconciled: <asset> no longer in spot wallet — marked closed` — stale cleanup fired.
+
+### 8.3 Log patterns that indicate a regression
+
+- `Loop iteration error (<mode>): name '<X>' is not defined` — Python NameError from a missing import. Open a PR. Past examples: `total_funding_income`, `rt_basis_bps`.
+- `Reservation clamp on <symbol>` — should NOT appear (clamp moved inside walk loop in PR #12). If it surfaces, regression.
+- `basis_dislocated` rejections — should be 0. Regression if non-zero.
+
+---
+
+## 9. Failure modes & recovery
 
 | Failure | Detection | Recovery |
 |---|---|---|
-| Partial fill under `spot_buy_error` | pre-/post-balance snapshot delta in entry path | Synthesize fill, continue to perp leg at smaller qty (PR #14) |
-| Naked spot left behind | `recover_phantom_spot` scans every cycle | Hedge with matching perp if profitable, else sell back, else dust-convert (PR #15/21) |
+| Partial fill under `spot_buy_error` | Pre/post-balance snapshot delta in entry path | Synthesize partial fill, continue to perp leg at smaller qty (PR #14) |
+| Naked spot left behind | `recover_phantom_spot` scans every cycle | Hedge with matching perp if profitable, else sell back, else flag as dust (PR #15) |
 | Dust below MIN_NOTIONAL | Notional check in recovery | `convert_dust_to_native` → BNB / KCS via venue dust endpoint (PR #21) |
-| Wallet starvation | Sizing reject `below min position pct` | Wallet breakdown logged; operator inspects via `wallet_breakdown` |
-| Book moves during round-trip | `spot_ioc_zero_fill` | Reject, retry next cycle |
-| KuCoin futures→spot drain 112002 | Post-cycle drain WARN | **Fixed in PR #22.** Spot-side universal-transfer can't drain the Futures wallet on a Classic account; switched to `self.futures.transfer(…, 'CONTRACT', 'TRADE')` (legacy `/api/v1/transfer-out`). Repeated identical transfer failures are now deduped via `_TRANSFER_ERROR_CACHE` (same pattern as `_CLOSE_ERROR_CACHE`). |
-| Symbol drift across ccxt versions | Exit funding miss WARN | Falls back to stale `last_funding_rate`; logged so operator sees drift |
-| Loop crash | Outer try/except in `run_one_cycle` | `Loop iteration error (<mode>): <repr>` logged at ERROR; loop continues next cycle |
+| Stale `naked_spot` (spot disappeared from wallet) | Stale reconciliation at top of recovery | Auto-mark `closed` (PR #30) |
+| Wallet starvation | `below min position pct` rejection | `wallet_breakdown` diagnostic surfaces stranded funds |
+| Book moves during round-trip | `spot_ioc_zero_fill` / `perp_ioc_zero_fill` | Reject, retry next cycle |
+| KuCoin futures→spot drain `112002` | Post-cycle drain WARN | **Fixed in PR #22.** Spot-side universal-transfer can't drain the Futures wallet on KuCoin Classic; switched to `self.futures.transfer(…, 'CONTRACT', 'TRADE')` via legacy `/api/v1/transfer-out`. Repeated identical transfer failures now deduped via `_TRANSFER_ERROR_CACHE`. |
+| Symbol drift across ccxt versions | Exit funding miss WARN | Falls back to stale `last_funding_rate`; logged. |
+| Loop crash | Outer `try/except` in `run_one_cycle` | Logged as ERROR; loop continues next cycle. |
 
 ---
 
-## 11. Response policy (for the monitor chat)
+## 10. Response policy (monitor chat)
 
-Every cron run posts a heartbeat comment to the `[bot-diagnostics] Tracker` issue — anomalies or not — so the monitor chat ALWAYS gets a webhook. The response depends on what the comment says.
+The cron posts a heartbeat comment on the tracker every run — anomalies or not.
 
-### Heartbeat "✅ all clear"
+### "✅ all clear" heartbeat
 
-Reply with a **single concise message** confirming the check happened and summarising the state. One line is enough, e.g.
+Reply with a **single concise line**: confirm the check happened, summarise state, "no action".
 
-> ✅ Cron @ 2026-05-11T18:00Z — all clear. Positions `{open: 2, closed: 14}`, 8 trades in 24h, errors/warns `0/3`. No action.
+> Cron @ 2026-05-11T18:00Z — all clear. Positions `{open:2, closed:14}`, 8 trades in 24h, errors/warns `0/3`.
 
-This is the operator's proof the chain is alive. Don't pile on detail — the issue body has the full state already.
+### "⚠️ N anomalies" heartbeat
 
-### Heartbeat "⚠️ N anomalies"
+For each anomaly, choose:
 
-For each anomaly in the comment, decide and act per this table:
-
-| Anomaly type | Action |
+| Anomaly | Action |
 |---|---|
-| Well-understood, no code change needed (e.g. dust will sweep next cycle) | **Comment** with one-line diagnosis. |
-| Known transient (book moved, network blip) | **Skip** if anomaly clears next cycle; comment otherwise. |
-| Clear code regression (NameError, broken endpoint, etc.) | **Open PR** with focused fix; mention the relevant section of this doc. |
-| New venue error code not handled | **Open PR** adding handler + reject-reason taxonomy here. |
-| Strategy / threshold change | **Ask** the operator on the tracker thread before acting. |
-| Operator-action-required (e.g. no_usdt_pair on a Binance asset) | **Comment** with the manual step. |
-| Anything ambiguous | **Ask** on the thread, don't act. |
+| Well-understood, no code change (e.g. dust will sweep next cycle) | **Comment** with one-line diagnosis. |
+| Known transient (book moved, network blip) | **Skip** if clears next cycle; comment otherwise. |
+| Clear code regression (NameError, broken endpoint, latent bug) | **Open PR**. Reference the SYSTEM.md section the fix touches. |
+| New venue error code not handled | **Open PR** adding handler + new rejection category in §8.1. |
+| Strategy / threshold change | **Ask** the operator before acting. |
+| Operator-action-required (e.g. asset with no USDT pair) | **Comment** with the manual step. |
+| Anything ambiguous | **Ask** on the thread. |
 
-Combine related anomalies in a single reply rather than one comment per anomaly. The operator wants a coherent diagnosis, not a wall of bullets.
+Combine related anomalies into one reply.
 
-**Never**: push to `main` directly, skip pre-commit hooks (`--no-verify`), force-push, run destructive shell commands, touch venue credentials.
+### Never
 
-PR workflow:
+- Push to `main` directly.
+- Skip pre-commit hooks (`--no-verify`).
+- Force-push, `git reset --hard`, run destructive shell.
+- Touch venue credentials.
+
+### PR workflow
+
 1. Branch: `claude/<short-kebab>`.
-2. Small, focused. Don't refactor unrelated code.
-3. Smoke: `python -c "import app.main"` + `curl /health` if the route surface changed.
+2. Small, focused. No drive-by refactors.
+3. Smoke: `python -c "import app.main"` + `curl /health` if route surface changed.
 4. Use `mcp__github__create_pull_request` + `mcp__github__merge_pull_request` (proxy blocks direct push).
-5. **Update the relevant section of this doc** in the same PR.
+5. **Update SYSTEM.md** in the same PR if behavior changed (§12 makes this binding).
 
 ---
 
-## 12. Crons & scheduled jobs
+## 11. Crons
 
 | Job | Schedule | Trigger | Side effects |
 |---|---|---|---|
-| Bot's own loop | every `cfg.loop_seconds` (default 30s) | in-process thread per (mode, venue) | runs the full cycle in §4 |
-| Diagnostics workflow | every 3h (`0 */3 * * *`) | GitHub Actions cron | hits `/api/diagnostics`, updates the persistent `[bot-diagnostics] Tracker` issue body, posts a heartbeat comment EVERY run (✅ all clear or ⚠️ N anomalies). Comment fires the webhook to the monitor chat. |
-| (Future) onchain settlement watcher | TBD | TBD | TBD |
+| Bot's own loop | every `cfg.loop_seconds` (default 30s) | in-process thread per (mode, gateway) | runs the full cycle in §3.1 |
+| Diagnostics workflow | `0 */3 * * *` (every 3h) | GitHub Actions cron | hits `/api/diagnostics`, updates the persistent tracker issue body, posts heartbeat comment. Comment fires the webhook to the monitor chat. |
 
-No external crons beyond these today. The bot is self-driving; the diagnostics cron exists only for human + monitor-chat oversight.
-
----
-
-## 13. Glossary
-
-- **APR**: simple-interest annualization (`r × N`). NOT what we use.
-- **APY**: compounded annualization (`(1+r)^N − 1`). All thresholds are APY.
-- **Basis** (perp − spot): perp price minus spot price, normalized; positive = perp at premium.
-- **Funding rate**: periodic payment between perp longs and shorts. Sign convention: positive = longs pay shorts.
-- **Funding window**: the interval at which funding is settled (4h or 8h on these venues).
-- **Limit-IOC**: limit order with Immediate-Or-Cancel TIF. Either fills against existing depth right now or cancels (no resting order on the book). Taker fees.
-- **Maker / taker**: maker rests on the book and gets matched; taker crosses the book and pays a higher fee.
-- **MIN_NOTIONAL**: Binance's per-symbol minimum order notional in USDT. Below it, orders are rejected with -1013.
-- **PM**: Binance Portfolio Margin — unified margin pool across cross-margin, USDM-futures, CM-futures.
-- **UTA**: KuCoin Unified Trading Account — single unified pool across spot + futures.
-- **Classic** (KuCoin): the non-UTA mode with separate `main`, `trade`, `contract`, `margin`, `isolated`, `pool` wallets.
-- **Phantom spot**: a spot holding that exists on the venue but has no corresponding DB `Position` row — created by partial fills under spot_buy_error before recovery was wired.
-- **Naked**: an unhedged leg (long-only spot or short-only perp). Bad state; recovery flattens or hedges.
-- **Reservation**: the amount the venue's matching engine sets aside at order placement; for a limit buy it's `qty × limit_price`.
+No external crons beyond these.
 
 ---
 
-## 14. Doc-update policy (this is binding)
+## 12. Doc-update policy
 
-Every PR that changes BEHAVIOR — not just refactors — must update `docs/SYSTEM.md` in the same PR. Specifically:
+**Binding.** Every PR that changes BEHAVIOR — not just refactors — must update `docs/SYSTEM.md` in the same PR. Specifically:
 
 - New strategy or trade-type → §3.
-- New phase / step in the cycle → §4.
-- Math change (gate, formula, threshold default) → §5.
-- New venue / wallet type / transfer route → §6.
-- New DB column or status value → §7.2.
-- New `/api/*` endpoint or anomaly rule → §8.
-- New rejection category or log pattern → §9.
-- New failure mode + recovery path → §10.
-- New env var → §2.1.
-- New StrategyConfig field → §2.2.
+- New phase / step in the cycle → §3.1 SOP.
+- Math change (formula, threshold default, gate logic) → §3.1 math + §0 definitions if a new term is used.
+- New venue / wallet type / transfer route → §5.
+- New DB column or status value → §6.2.
+- New env var → §2.2 + §4.
+- New `StrategyConfig` field → §4.
+- New `/api/*` endpoint or anomaly rule → §7.
+- New rejection category or log pattern → §8.
+- New failure mode + recovery → §9.
 
-Reviewers (human or monitor chat) reject PRs that change behavior without updating this doc. If unsure, add a one-line entry — better to over-document than under.
+Reviewers reject PRs that change behavior without updating this doc. When in doubt, add a one-liner — better to over-document than under.
 
 ---
 
-## 15. Known fragile / deferred work
+## 13. Known fragile / deferred
 
-- **Vultr Auto Backups are NOT enabled.** Single-instance SQLite DB on local NVMe. If `arb-bot-tokyo` dies, the entire trade / position / event history is lost. Either enable Vultr's automatic backup add-on, or run an off-host backup cron. Should be addressed before serious capital scales up.
-- ~~**KuCoin `futures→spot` drain occasionally fails with 112002** despite positive `free` balance reported by `fetch_balance`. Possibly margin/order locks the transfer endpoint sees that the balance endpoint doesn't. Not crash-inducing but noisy. Investigation pending.~~ Resolved in PR #22 — routing fix, see §6.2 and §10.
-- **Maker-on-exit fee optimization** would save ~30% of exit fees. Not implemented; needs careful timeout-fallback logic to avoid leaving resting orders that the basis can run away from.
-- **Cross-venue funding arb** strategy is tagged in `TRADE_TYPE_LABELS` but the orchestrator isn't wired.
-- **Onchain integration** is a future track. No code yet.
+- **Vultr Auto Backups are NOT enabled.** Single-instance SQLite DB on local NVMe. Loss = entire trade / position / event history. Enable Vultr backups (~$1/mo) or run an off-host backup cron.
+- **Per-strategy config split** — today one `StrategyConfig` row serves the one active strategy. When cross-venue / onchain lands, this needs to split into per-strategy rows (or per-trade-type joined config).
+- **Naming**: `entry_funding_threshold` / `exit_funding_threshold` are misleading — they're net APY thresholds, not raw funding rate thresholds. Rename queued; aliasing in code today.
+- **Deprecated config fields** (§4) are still on the `/config` form for back-compat. Tidy-up PR pending.
+- **Maker-on-exit fee optimization** not implemented. ~30% of exit fees could be saved with post-only-with-timeout-fallback.
 - **Symbol mapping drift** across ccxt versions could leave open positions un-lookupable for exit funding refresh. Currently logs a WARN and falls back to stale `last_funding_rate`.
+- **Cross-venue + onchain strategies** are roadmap, not implemented.
+- ~~KuCoin `futures→spot` drain 112002~~ **resolved in PR #22** (routing fix, see §5.2).
 
 ---
 
-## 16. Recent changes log (auto-extended on every behavior-changing PR)
+## 14. Changelog
 
-| Date (UTC) | PR | Section(s) touched | Summary |
+Append-only. Format: `YYYY-MM-DD · PR# · §sections touched · summary`.
+
+| Date | PR | Sections | Summary |
 |---|---|---|---|
-| 2026-05-11 | #21 | §10, §11 | Auto-convert dust to BNB/KCS via venue endpoints. |
-| 2026-05-11 | #20 | §9, §10, §11 | Fix `total_funding_income` NameError. Silence dust spam. Filter LDUSDT. Workflow label fallback. |
-| 2026-05-11 | #18 | §8, §11, §12 | `/api/diagnostics` endpoint + GitHub Actions cron + tracker. |
-| 2026-05-11 | #17 | §4, §7.2, §9 | Naked positions are first-class in dashboard + transactions. `OPEN_STATUSES`. |
-| 2026-05-11 | #16 | §5.4 | Charge auto-swap fees in profitability gate. |
-| 2026-05-11 | #15 | §6.1, §10 | Hedge phantom spot via perp when profitable. KuCoin futures per-currency fetch. |
-| 2026-05-11 | #14 | §4, §10 | Recover orphaned spot positions + partial-fill detection under spot_buy_error. |
-| 2026-05-11 | #13 | §6.4, §10 | KuCoin sweep margin/isolated + `wallet_breakdown` diagnostic. |
-| 2026-05-11 | #12 | §5, §6.1, §6.3, §7.2 | Audit cleanups: reservation clamp in walk loop, exit funding refresh, sign math, migration v1, dead-config purge. |
-| 2026-05-11 | #11 | §9 | Fix `below_threshold` log to show net APY. |
-| 2026-05-10 | #10 | §5.5 | Reservation-aware target_qty clamp. |
-| 2026-05-10 | #9 | §5.4 | Dropped `basis_dislocated` gate; profitability-only economic check. |
-| 2026-05-10 | #8 | §5.4, §5.5 | KuCoin book-walk limit fix, sign-aware basis, funding APY diagnostic. |
-| 2026-05-10 | #7 | §6.4 | KuCoin Classic spot-wallet consolidation. |
+| 2026-05-11 | #31 | rewrite | SYSTEM.md v1.0 — full rewrite after operator audit. Definitions upfront, per-strategy SOP + math, config layers explained, deprecated fields called out, exit-logic regression `rt_basis_bps` → `rt_basis_signed_bps` fixed alongside. Merged with PR #22's KuCoin futures→spot transfer routing fix during rebase. |
+| 2026-05-11 | #22 (parallel session) | §5.2, §9, §13 | KuCoin futures→spot drain uses `self.futures.transfer(…, 'CONTRACT', 'TRADE')` (legacy `/api/v1/transfer-out`) instead of spot-side universal-transfer. Identical-error dedup via `_TRANSFER_ERROR_CACHE`. Resolves the 112002 deferred item. |
+| 2026-05-11 | #30 | §6.2, §9 | Don't render fake perp leg for `naked_spot`; auto-close stale naked rows. |
+| 2026-05-11 | #27 | §7, §10, §11 | Heartbeat-model diagnostics tracker. Monitor always knows the cron ran. |
+| 2026-05-11 | #26 | §2 | Vultr specs + KuCoin permissions clarification + backup-risk callout. |
+| 2026-05-11 | #25 | §2, §4 | Operator-provided setup details rolled in. |
+| 2026-05-11 | #24 | new | SYSTEM.md v0.1 first cut. |
+| 2026-05-11 | #21 | §3.1, §9 | Auto-convert dust to BNB/KCS via venue dust endpoints. |
+| 2026-05-11 | #20 | §8.3, §9 | Fix `total_funding_income` NameError. Silence dust spam. LDUSDT filter. Workflow label fallback. |
+| 2026-05-11 | #18 | §7 | `/api/diagnostics` endpoint + GitHub Actions cron + tracker. |
+| 2026-05-11 | #17 | §6.2, §8 | Naked positions are first-class in dashboard + transactions. |
+| 2026-05-11 | #16 | §3.1 math | Charge auto-swap fees in profitability gate. |
+| 2026-05-11 | #15 | §5.2, §9 | Hedge phantom spot via perp when profitable. KuCoin futures per-currency fetch. |
+| 2026-05-11 | #14 | §3.1 SOP, §9 | Recover orphaned spot positions + partial-fill detection. |
+| 2026-05-11 | #13 | §5.2 | KuCoin sweep margin/isolated + `wallet_breakdown` diagnostic. |
+| 2026-05-11 | #12 | §3.1, §5, §6 | Audit cleanups: reservation clamp in walk loop, exit funding refresh, sign math, migration v1, dead-config purge. |
+| 2026-05-11 | #11 | §8 | `below_threshold` log shows net APY (the number actually compared). |
+| 2026-05-10 | #10 | §3.1 math | Reservation-aware target_qty clamp. |
+| 2026-05-10 | #9 | §3.1, §4 | Dropped `basis_dislocated` gate; profitability-only economic check. |
+| 2026-05-10 | #8 | §3.1, §8 | KuCoin book-walk limit fix, sign-aware basis, funding APY diagnostic. |
+| 2026-05-10 | #7 | §5.2 | KuCoin Classic spot-wallet consolidation. |
 
-(Older history in `git log` and the session memory.)
+(Older history in `git log`.)
 
 ---
 
-> **For the monitor chat:** Always read this doc from the latest `main` before judging anomalies. The rejection-category meanings (§9), failure-mode recovery (§10), and response policy (§11) are your operating manual.
+> **For the monitor chat:** Always read this doc from the latest `main` before judging anomalies. The definitions (§0), strategy SOP + math (§3), rejection categories (§8), failure modes (§9), and response policy (§10) are your operating manual.
