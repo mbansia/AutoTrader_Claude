@@ -77,10 +77,37 @@
 </div>
 
 <form action="/config" method="post">
+<input type="hidden" name="strategy" value="{{ selected_strategy }}">
 
-{# ============= STRATEGY THRESHOLDS ============= #}
+{# ============= STRATEGY SELECTOR ============= #}
+{# The selector tells the form which per-strategy row to write to. Global
+   fields (account-level, process, mode) on this page apply to all
+   strategies. Per-strategy fields (thresholds, sizing, execution, wallet)
+   live below and reflect ONLY the selected strategy. See SYSTEM.md §4. #}
 <div class="card">
-  <h3>Strategy thresholds</h3>
+  <h3>Editing strategy</h3>
+  <div class="body">
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;">
+      {% for tt in active_strategy_types %}
+      <a href="/config?strategy={{ tt }}"
+         class="tag {{ 'good' if tt == selected_strategy else 'muted' }}"
+         style="padding:6px 12px;font-size:13px;text-decoration:none;{% if tt == selected_strategy %}background:var(--accent);color:#fff;{% endif %}">
+        {{ tt|replace('_same_venue_funding_arb', ' · funding arb') }}
+      </a>
+      {% endfor %}
+    </div>
+    <p class="muted" style="font-size:12px;margin:0;">
+      Sections labeled <strong>(per-strategy)</strong> below apply only to <code>{{ selected_strategy }}</code>.
+      Sections labeled <strong>(global)</strong> apply to every strategy. The bot reads
+      strategy-specific fields from the row keyed by trade_type; global fields from the
+      singleton StrategyConfig. See SYSTEM.md §4.
+    </p>
+  </div>
+</div>
+
+{# ============= STRATEGY THRESHOLDS (per-strategy) ============= #}
+<div class="card">
+  <h3>Strategy thresholds <span class="tag muted" style="font-size:10px;">per-strategy · {{ selected_strategy }}</span></h3>
   <div class="body">
     <div class="form-grid">
       <div class="form-row"><label>Entry minimum net APY (% — annualized net profit)</label>

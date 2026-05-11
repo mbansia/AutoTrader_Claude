@@ -1267,13 +1267,23 @@ def logs_page(
 
 
 @app.get('/config', response_class=HTMLResponse)
-def config_page(request: Request, saved: int = 0, view: str | None = None, view_cookie: str | None = Cookie(default=None, alias='view'), _: None = Depends(auth)):
+def config_page(request: Request, saved: int = 0, view: str | None = None, strategy: str | None = None, view_cookie: str | None = Cookie(default=None, alias='view'), _: None = Depends(auth)):
     v = _resolve_view(view, view_cookie)
     from app.bot import get_strategy_state
+    # Active strategies the operator can edit config for. The form's
+    # per-strategy fields show values from THIS strategy's row; the
+    # global fields are shared across all strategies. See SYSTEM.md §4.
+    ACTIVE_STRATEGY_TYPES = ('binance_same_venue_funding_arb', 'kucoin_same_venue_funding_arb')
+    selected_strategy = strategy if strategy in ACTIVE_STRATEGY_TYPES else ACTIVE_STRATEGY_TYPES[0]
     with SessionLocal() as db:
         ctx = _shared_ctx(request, v, db)
         ctx['active'] = 'config'
-        ctx['cfg'] = get_strategy_config(db)
+        # cfg is the MergedConfig view for `selected_strategy`. The form's
+        # per-strategy inputs show that strategy's values; the global
+        # inputs come from the underlying global StrategyConfig.
+        ctx['cfg'] = get_strategy_config(db, trade_type=selected_strategy)
+        ctx['selected_strategy'] = selected_strategy
+        ctx['active_strategy_types'] = ACTIVE_STRATEGY_TYPES
         ctx['saved'] = bool(saved)
         # Per-strategy controls. We surface every trade type from the
         # taxonomy — active ones (Binance / KuCoin same-venue) get real
@@ -1312,6 +1322,11 @@ def config_page(request: Request, saved: int = 0, view: str | None = None, view_
 
 @app.post('/config')
 def save_config(
+    # Which strategy's per-strategy fields this POST updates. Global
+    # fields are written to the singleton StrategyConfig regardless;
+    # per-strategy fields go to the StrategyConfigPerStrategy row keyed
+    # by this trade_type. See SYSTEM.md §4.
+    strategy: str = Form('binance_same_venue_funding_arb'),
     # ``*_pct`` form fields are user-typed in PERCENT units (e.g. 20 for
     # 20%) and we convert to decimal here. Underlying schema fields stay
     # in decimal so legacy callers + comparisons elsewhere don't break.
@@ -1341,8 +1356,13 @@ def save_config(
     max_perp_leverage: int = Form(1),
     _: None = Depends(auth),
 ):
+    ACTIVE_STRATEGY_TYPES = ('binance_same_venue_funding_arb', 'kucoin_same_venue_funding_arb')
+    target_strategy = strategy if strategy in ACTIVE_STRATEGY_TYPES else ACTIVE_STRATEGY_TYPES[0]
     with SessionLocal() as db:
-        cfg = get_strategy_config(db)
+        # cfg is the MergedConfig view for the strategy being edited. Writes
+        # to per-strategy fields land on the StrategyConfigPerStrategy row;
+        # writes to global fields land on the singleton StrategyConfig.
+        cfg = get_strategy_config(db, trade_type=target_strategy)
         # Percent → decimal conversions.
         # Accept either the new (entry_min_net_apy_pct) or legacy
         # (entry_funding_threshold_pct) form name — whichever is non-None.
@@ -1373,7 +1393,7 @@ def save_config(
         cfg.max_perp_leverage = new_lev
         cfg.perp_leverage = new_lev  # legacy mirror
         db.commit()
-    return RedirectResponse(url='/config?saved=1', status_code=303)
+    return RedirectResponse(url=f'/config?saved=1&strategy={target_strategy}', status_code=303)
 
 
 @app.get('/monitoring', response_class=HTMLResponse)

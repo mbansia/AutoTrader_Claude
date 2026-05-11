@@ -407,7 +407,34 @@ PAPER_FEE_BPS        = 4
 
 The naming `ENTRY_FUNDING_APR` is historical — the value is actually a **net APY** threshold, not a raw funding APR. Renaming the variable is queued; for now treat it as an alias.
 
-### C. `StrategyConfig` (the live runtime config)
+### C. `StrategyConfig` (global, singleton) + `StrategyConfigPerStrategy` (per trade_type)
+
+As of PR #35 the runtime config is split into **two tables**:
+
+| Layer | Scope | Rows | Edits via |
+|---|---|---|---|
+| `StrategyConfig` | **Global** — applies across every active strategy and mode | 1 (singleton, id=1) | `/config` form, any tab |
+| `StrategyConfigPerStrategy` | **Per-strategy** — one row per `trade_type` | one per active trade_type, seeded on first read | `/config?strategy=<trade_type>` tab |
+
+The bot reads via `get_strategy_config(db, trade_type=<tt>)`, which returns a `MergedConfig` proxy: attribute access for fields in `PER_STRATEGY_FIELDS` resolves to the per-strategy row, everything else falls through to the global row. Writes follow the same routing.
+
+#### Split rationale
+
+| Field category | Per-strategy? | Why |
+|---|---|---|
+| **Thresholds** (`entry_min_net_apy`, `exit_min_net_apy`, `exit_basis_buffer_multiple`, `max_exit_basis_bps`, `stop_loss_pct`) | **Yes** | Different strategies, different risk profiles. Onchain ≠ same-venue CEX. |
+| **Sizing** (`min_position_pct`, `max_position_pct`, `max_hold_hours`) | **Yes** | Strategies size differently. Cross-venue may want shorter holds. |
+| **Execution** (`entry_tick_buffer_bps`, `exit_tick_buffer_bps`, `perp_leverage`, `max_perp_leverage`) | **Yes** | Venue tick density and leverage policy diverge. |
+| **Wallet** (`auto_transfer_enabled`, `auto_quote_swap_enabled`, `futures_buffer_pct`) | **Yes** | PM/UTA need none of these; Classic needs them. |
+| **Account-level caps** (`max_open_positions`, `max_trades_per_day`) | **No** (global) | These cap portfolio risk across the entire account. Per-strategy caps would be additional; the total cap is naturally global. |
+| **Process** (`loop_seconds`) | **No** (global) | One bot process, one loop period. |
+| **Mode** (`paper_starting_equity`, `paper_slippage_bps`, `paper_fee_bps`) | **No** (global) | Mode-level; apply to every strategy in that mode. |
+| **Safety switches** (`delisting_check`, `enforce_hedge_check`) | **No** (global) | Apply uniformly. No strategy wants these off. |
+| **Migration cursor** (`config_schema_version`) | **No** (global) | Schema-level. |
+
+#### Active fields on each table
+
+**`StrategyConfigPerStrategy`** (per-strategy):
 
 A single row in the `strategy_config` table. Edited via the `/config` page.
 
@@ -415,33 +442,48 @@ A single row in the `strategy_config` table. Edited via the `/config` page.
 
 | Field | Default | Type | Purpose |
 |---|---|---|---|
-| `entry_min_net_apy` | 0.20 | float (decimal APY) | Minimum **net APY** to open. Gate at §3.1 entry. (Migrated from `entry_funding_threshold` in v1 → v2.) |
-| `exit_min_net_apy` | 0.05 | float (decimal APY) | Forward net APY below this → close. Gate at §3.1 exit. (Migrated from `exit_funding_threshold` in v1 → v2.) |
-| `exit_basis_buffer_multiple` | 3.0 | float | `m` in the basis P&L formula. Worst-case exit basis multiplier. |
-| `max_exit_basis_bps` | 5.0 | float (bps) | Defer voluntary exits until live basis ≤ this. Stop-loss bypasses. |
+| `entry_min_net_apy` | 0.20 | float (decimal APY) | Minimum **net APY** to open. Gate at §3.1 entry. |
+| `exit_min_net_apy` | 0.05 | float (decimal APY) | Forward net APY below this → close. |
+| `exit_basis_buffer_multiple` | 3.0 | float | `m` in the basis P&L formula. |
+| `max_exit_basis_bps` | 5.0 | float (bps) | Defer voluntary exits until live basis ≤ this. |
 | `stop_loss_pct` | -0.02 | float (decimal) | Mandatory exit if `unrealized_PnL / notional ≤` this. |
 | `max_hold_hours` | 72 | int | Time-based exit. |
-| `max_open_positions` | 1 | int | Across both venues, per mode. |
-| `max_trades_per_day` | 8 | int | Soft entry cap per mode. |
 | `min_position_pct` | 0.005 | float | Sizing floor as % of equity (0.5%). |
 | `max_position_pct` | 0.10 | float | Sizing ceiling (10%). |
-| `loop_seconds` | 30 | int | Cycle period. |
-| `entry_tick_buffer_bps` | 1.0 | float | Limit-IOC entry price padding above worst-walked-price. |
+| `entry_tick_buffer_bps` | 1.0 | float | Limit-IOC entry price padding. |
 | `exit_tick_buffer_bps` | 2.0 | float | Same on exit. |
 | `perp_leverage` | 1 | int | The only safe value for delta-neutral. |
-| `max_perp_leverage` | 1 | int | Hard cap. |
+| `max_perp_leverage` | 1 | int | Hard cap (also used for /dashboard effective-APY display). |
 | `auto_transfer_enabled` | true | bool | Pre-trade spot↔futures rebalance for Classic accounts. |
 | `auto_quote_swap_enabled` | true | bool | Auto-swap USDT↔USDC pre-trade when a quote wallet is starved. |
 | `futures_buffer_pct` | 0.20 | float | Margin buffer kept on futures wallet during post-cycle drain. |
-| `enforce_hedge_check` | true | bool | Verify both legs exist on the venue every cycle. |
-| `delisting_check` | true | bool | Force-close on market unhealthy. |
+
+**`StrategyConfig`** (global):
+
+| Field | Default | Type | Purpose |
+|---|---|---|---|
+| `max_open_positions` | 1 | int | Account-level cap across all strategies / venues / per mode. |
+| `max_trades_per_day` | 8 | int | Soft entry cap per mode. |
+| `loop_seconds` | 30 | int | Cycle period. |
 | `paper_starting_equity` | 1000 | float (USDT) | Paper virtual capital. |
 | `paper_slippage_bps` / `paper_fee_bps` | 5 / 4 | float | Paper synthetic fill costs. |
-| `config_schema_version` | 1 | int | Persisted migration cursor; do not edit. |
+| `enforce_hedge_check` | true | bool | Verify both legs exist on the venue every cycle. |
+| `delisting_check` | true | bool | Force-close on market unhealthy. |
+| `config_schema_version` | 2 | int | Persisted migration cursor; do not edit. |
 
-`max_perp_leverage` is also on the row but is consumed only by `app/main.py` for the "effective APY" display calculation — it doesn't change trading behavior. The actual leverage applied at entry comes from `perp_leverage`.
+Master entry/exit toggles per mode live on the `ModeState` table (`mode_state.entry_enabled`, `mode_state.exit_enabled`), **not** on `StrategyConfig`.
 
-Master entry/exit toggles per mode live on the `ModeState` table (`mode_state.entry_enabled`, `mode_state.exit_enabled`), **not** on `StrategyConfig`. The DB has `strategy_config.entry_enabled` / `exit_enabled` columns from an earlier design; they're no longer read.
+#### How edits route
+
+- **/config GET** accepts `?strategy=<trade_type>`. Defaults to `binance_same_venue_funding_arb`. The form shows that strategy's per-strategy values + the (shared) global values.
+- **/config POST** carries a hidden `strategy` field set by the active tab. The form handler builds `MergedConfig(global, per[strategy])` and assigns into it; the proxy routes each write to the right table per `PER_STRATEGY_FIELDS`. So editing global fields from the binance tab also updates the values the kucoin tab sees; editing per-strategy fields only updates the active tab's row.
+
+#### Schema version cursor
+
+`config_schema_version` lives on the global `StrategyConfig`. Migrations gate by it:
+- v0 → v1: legacy per-period → APR semantic (one-time).
+- v1 → v2: `entry/exit_funding_threshold` → `entry/exit_min_net_apy` rename.
+- v2 + per-strategy split *(PR #35)*: no value migration. Per-strategy rows are lazily seeded by `_get_or_seed_strategy_overrides` on first read; existing operator-set thresholds remain in effect on the global row AND get copied to each strategy's row at seed time. `config_schema_version` stays at 2.
 
 #### Deprecated fields (kept in schema, no longer read)
 
@@ -736,7 +778,7 @@ Reviewers reject PRs that change behavior without updating this doc. When in dou
 ## 13. Known fragile / deferred
 
 - **Vultr Auto Backups are NOT enabled.** Single-instance SQLite DB on local NVMe. Loss = entire trade / position / event history. Enable Vultr backups (~$1/mo) or run an off-host backup cron.
-- **Per-strategy config split** — today one `StrategyConfig` row serves the one active strategy. When cross-venue / onchain lands, this needs to split into per-strategy rows (or per-trade-type joined config).
+- ~~**Per-strategy config split**~~ — shipped in PR #35. New `StrategyConfigPerStrategy` table; `MergedConfig` proxy reads global + per-strategy.
 - ~~**Naming**: `entry_funding_threshold` / `exit_funding_threshold` are misleading~~ — renamed in PR #32 to `entry_min_net_apy` / `exit_min_net_apy`. Legacy form names still accepted as aliases for one release cycle.
 - **Deprecated config fields** (§4) are still on the `/config` form for back-compat. Tidy-up PR pending.
 - **Maker-on-exit fee optimization** not implemented. ~30% of exit fees could be saved with post-only-with-timeout-fallback.
@@ -752,6 +794,7 @@ Append-only. Format: `YYYY-MM-DD · PR# · §sections touched · summary`.
 
 | Date | PR | Sections | Summary |
 |---|---|---|---|
+| 2026-05-11 | #35 | §4, §13 | Per-strategy config split: new `StrategyConfigPerStrategy` table (one row per trade_type) holds strategy-specific fields (thresholds, sizing, execution, wallet). `StrategyConfig` keeps account/process/mode-level globals. `MergedConfig` proxy lets bot.py call sites read transparently — pass `trade_type` to `get_strategy_config()`. `/config` gets a strategy tab selector; POSTs route per-strategy fields to the active tab's row, global fields to the singleton. Per-strategy rows lazily seeded from global on first read. |
 | 2026-05-11 | #34 | §0, §3.1 math, §4, §13 | Renamed `entry/exit_funding_threshold` → `entry/exit_min_net_apy` (config_schema_version v1→v2 migration). Removed deprecated form fields (`max_entry_basis_bps`, `min_24h_quote_volume`, `min_order_book_depth_usdt`, `depth_band_bps`). Form accepts both new and legacy field names for one release cycle. |
 | 2026-05-11 | #33 | §3.1, §5.2, §9, §13 | Break KuCoin drain↔rebalance oscillation. (1) Gate pre-trade rebalance on `candidates_passing > 0` (no point equalising wallets when there's no trade to fund). (2) `transfer_futures_to_spot` is now a two-hop: futures `CONTRACT → MAIN` via `transferOut`, then spot `MAIN → TRADE` via inner-transfer. Funds land where the spot order book can spend them without waiting a cycle for `consolidate_spot_wallets`. |
 | 2026-05-11 | #32 | tooling | `diagnostics_post.py`: post heartbeat comment **before** body edit, make body edit non-fatal, trim payload. Body-too-large 504s no longer block the comment, which is what fires the monitor chat webhook. |
