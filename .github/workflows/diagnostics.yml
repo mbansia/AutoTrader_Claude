@@ -45,8 +45,11 @@ jobs:
           HOURS: ${{ github.event.inputs.hours_window || '24' }}
         run: |
           set -eu
-          if [ -z "${BOT_URL:-}" ] || [ -z "${DIAGNOSTICS_TOKEN:-}" ]; then
-            echo "::error::BOT_URL or DIAGNOSTICS_TOKEN secret missing"
+          missing=""
+          if [ -z "${BOT_URL:-}" ]; then missing="${missing} BOT_URL"; fi
+          if [ -z "${DIAGNOSTICS_TOKEN:-}" ]; then missing="${missing} DIAGNOSTICS_TOKEN"; fi
+          if [ -n "${missing}" ]; then
+            echo "::error::Missing repository secret(s):${missing}. Add at Settings → Secrets and variables → Actions → New repository secret. Names are case-sensitive."
             exit 1
           fi
           # ----fail-with-body=false → save the body even on non-200 so we can
