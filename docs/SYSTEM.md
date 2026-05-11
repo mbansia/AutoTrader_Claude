@@ -22,12 +22,26 @@ Operator wears a hands-off hat: deposit capital, set risk thresholds via `/confi
 
 ### 1.1 Vultr (host)
 
-- **Public IPv4**: `45.32.53.166` (confirmed from KuCoin's IP-restriction list, matches the bot URL pattern `m1348vwvjs47x081vz06b141.45.32.53.166.sslip.io`).
-- **Public IPv6**: `2001:8f8:1165:1275:5cd8:e3ba:9660:e28e` (per the KuCoin "Current IP" field).
-- Both IPs are whitelisted on the KuCoin API key's IP restriction list, so re-imaging the host or moving to a new instance will require re-whitelisting before the bot can call KuCoin.
-- Instance specs (region, CPU, RAM, disk):  `[NEEDS OPERATOR INPUT]`
+| Setting | Value |
+|---|---|
+| Label | `arb-bot-tokyo` |
+| Region | Tokyo |
+| OS | Ubuntu 22.04 x64 |
+| vCPU | 1 |
+| RAM | 2048 MB (2 GB) |
+| Storage | 64 GB NVMe |
+| Public IPv4 | `45.32.53.166` (reverse DNS `45.32.53.166.vultrusercontent.com`) |
+| Public IPv6 | `2001:8f8:1165:1275:5cd8:e3ba:9660:e28e` |
+| Subnet mask | `255.255.252.0` |
+| Default gateway | `45.32.52.1` |
+| SSH username | `linuxuser` |
+| Auto Backups | **NOT ENABLED** ⚠ |
+
+- **SSH access**: `ssh linuxuser@45.32.53.166` (password is in the Vultr UI; rotate to key-based auth as a hardening step).
+- Both Vultr IPs are whitelisted on the KuCoin API key's IP restriction list, so re-imaging the host or moving to a new instance will require re-whitelisting on KuCoin (and likely Binance too) before the bot can call them.
 - OS: Linux (CVE-2026-31431 "Copy Fail" patched / `algif_aead` module disabled — see session memory 2026-05-10).
-- Root SSH access:  `[NEEDS OPERATOR INPUT]`
+- **Risk: Auto Backups are not enabled.** The bot's SQLite DB (`bot.db`) lives on the local NVMe. If the instance dies, every trade record, naked_spot reconstruction, capital flow row, and equity-curve point is gone. Either enable Vultr Auto Backups for ~$1/mo, or run a cron that `scp`s the DB to a second host. Worth fixing before the bot accumulates a long P&L history.
+- **Capacity note**: 1 vCPU was running at 41% under the pre-PR-20 paper-loop crash (every 30s loop iteration crashed with a NameError and burned CPU on exception handling + DB write). After PR #20 + #21 the load should drop substantially. If it stays above 50% sustained, consider bumping to 2 vCPU before adding more strategies.
 
 ### 1.2 Coolify (container deployment)
 
@@ -78,12 +92,12 @@ Operator wears a hands-off hat: deposit capital, set risk thresholds via `/confi
 - **API key**: `69f88ba0b70d0a0001cf9523`.
 - **Account mode**: **Classic** today (confirmed via `account_type()` probe at startup). The "Unified Account" toggle on the key permits UTA when the account is in UTA mode, but the master-account-side mode flip didn't take in this session; would require a master-account API call. Until UTA is enabled, the bot exercises the Classic-wallet code paths.
 - Permissions granted (operator-confirmed 2026-05-11):
-  - **General** (read-only baseline — locked-on, can't be disabled)
-  - **Spot Trading**
-  - **Margin Trading**
-  - **Futures Trading**
-  - **Unified Account** (enables UTA when account-side mode allows it)
-  - **Allow Flexible Transfers** (asset transfers across supported types — required for `consolidate_spot_wallets` and `transfer_*` calls)
+  - **General** — ticked and greyed-out (KuCoin baseline; cannot be disabled). Powers every read call (`fetch_balance`, `fetch_funding_rates`, `fetch_order_book`, …).
+  - **Spot Trading** — required for spot leg order placement and dust conversion.
+  - **Margin Trading** — required only if cross/isolated margin is used; harmless to leave on.
+  - **Futures Trading** — required for the perp leg.
+  - **Unified Account** — enables UTA mode when the account-side mode flip allows it. Today the sub-account is in Classic mode, so this permission is dormant.
+  - **Allow Flexible Transfers** — REQUIRED for `consolidate_spot_wallets` and `transfer_*` calls (main↔trade↔contract↔margin↔isolated hops). If this is unticked, every wallet rebalance returns a permission error.
 - **IP restriction**: `45.32.53.166` (IPv4) AND `2001:8f8:1165:1275:5cd8:e3ba:9660:e28e` (IPv6). Both Vultr IPs whitelisted. If the IP changes, KuCoin will silently 401 every call.
 - KuCoin Classic has three+ spot wallets the bot interacts with:
   - `main` — Funding Account (default deposit destination)
@@ -609,6 +623,7 @@ Reviewers (human or monitor chat) reject PRs that change behavior without updati
 
 ## 15. Known fragile / deferred work
 
+- **Vultr Auto Backups are NOT enabled.** Single-instance SQLite DB on local NVMe. If `arb-bot-tokyo` dies, the entire trade / position / event history is lost. Either enable Vultr's automatic backup add-on, or run an off-host backup cron. Should be addressed before serious capital scales up.
 - **KuCoin `futures→spot` drain occasionally fails with 112002** despite positive `free` balance reported by `fetch_balance`. Possibly margin/order locks the transfer endpoint sees that the balance endpoint doesn't. Not crash-inducing but noisy. Investigation pending.
 - **Maker-on-exit fee optimization** would save ~30% of exit fees. Not implemented; needs careful timeout-fallback logic to avoid leaving resting orders that the basis can run away from.
 - **Cross-venue funding arb** strategy is tagged in `TRADE_TYPE_LABELS` but the orchestrator isn't wired.
