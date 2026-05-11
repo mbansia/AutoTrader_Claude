@@ -20,28 +20,33 @@ Operator wears a hands-off hat: deposit capital, set risk thresholds via `/confi
 
 ## 1. Setup
 
-### 1.1 Vultr (host)  `[NEEDS OPERATOR INPUT]`
+### 1.1 Vultr (host)
 
-- Instance specs (region, CPU, RAM, disk):  *TODO*
+- **Public IPv4**: `45.32.53.166` (confirmed from KuCoin's IP-restriction list, matches the bot URL pattern `m1348vwvjs47x081vz06b141.45.32.53.166.sslip.io`).
+- **Public IPv6**: `2001:8f8:1165:1275:5cd8:e3ba:9660:e28e` (per the KuCoin "Current IP" field).
+- Both IPs are whitelisted on the KuCoin API key's IP restriction list, so re-imaging the host or moving to a new instance will require re-whitelisting before the bot can call KuCoin.
+- Instance specs (region, CPU, RAM, disk):  `[NEEDS OPERATOR INPUT]`
 - OS: Linux (CVE-2026-31431 "Copy Fail" patched / `algif_aead` module disabled — see session memory 2026-05-10).
-- Root SSH access: *TODO*
+- Root SSH access:  `[NEEDS OPERATOR INPUT]`
 
-### 1.2 Coolify (container deployment)  `[PARTIAL — confirm operator]`
+### 1.2 Coolify (container deployment)
 
-- Bot is deployed as a Coolify-managed service exposed at the public URL set by the sslip.io wildcard DNS.
+- Bot is deployed as a Coolify-managed service exposed at the public URL set by the sslip.io wildcard DNS (`http://m1348vwvjs47x081vz06b141.45.32.53.166.sslip.io`).
 - Coolify auto-deploys on push to `main` via a GitHub webhook. ~1-2 minutes from `merge → live`.
-- Service-level env vars (set in Coolify UI, not in repo):
-  - `DATABASE_URL` (defaults to `sqlite:///./bot.db` on a Coolify-mounted volume)
+- Build pipeline: **Nixpacks**. The `NIXPACKS_NODE_VERSION` env var (see below) is set even though the bot is Python-only; this is a Coolify default that lets Nixpacks build any optional frontend assets. Currently a no-op because the repo only contains `app/static/tables.js` (vanilla JS, no Node build step).
+- Service-level env vars (set in Coolify UI, not in repo) — current state confirmed by operator 2026-05-11:
   - `BINANCE_API_KEY`, `BINANCE_API_SECRET`
   - `KUCOIN_API_KEY`, `KUCOIN_API_SECRET`, `KUCOIN_API_PASSPHRASE`
-  - `DASHBOARD_USER` (default `admin`), `DASHBOARD_PASSWORD`
-  - `DIAGNOSTICS_TOKEN` (separate from dashboard auth; rotate independently)
+  - `DASHBOARD_USER`, `DASHBOARD_PASSWORD`
+  - `DATABASE_URL`
+  - `DIAGNOSTICS_TOKEN`
+  - `NIXPACKS_NODE_VERSION` (build-time only; not read by app code)
 - When you rename the GitHub repo, **re-confirm the Coolify webhook** in repo Settings → Webhooks. We've hit this before.
 
 ### 1.3 GitHub (source + CI + monitoring tracker)
 
 - Repo: **`mbansia/AutoTrader_Codex`** (only repo accessible via the MCP allowlist).
-- Branch protection on `main`: *TODO confirm* — we route everything through PRs via `mcp__github__create_pull_request` + `mcp__github__merge_pull_request` because direct `git push origin main` is blocked by a proxy.
+- Branch protection on `main`: **none today** (operator-confirmed 2026-05-11). Merges to `main` happen via PR purely as a workflow convention (direct `git push origin main` is also blocked by an HTTP proxy, so PR-via-MCP is the only path that works). If you ever add protections (e.g. require status checks), update §11 of this doc — the monitor chat may need to wait on CI before merging.
 - Dev branch convention: `claude/<short-kebab-description>`. We typically reuse a single long-lived dev branch (`claude/understand-repo-IeAcM`) and merge into `main` via PR.
 - Required repo secrets (Actions → Secrets and variables → Repository secrets):
   - `BOT_URL` — bot's public URL (no trailing slash)
@@ -57,24 +62,38 @@ Operator wears a hands-off hat: deposit capital, set risk thresholds via `/confi
 
 ### 1.5 Binance
 
-- Account type: **Portfolio Margin (PM)** — confirmed in production. All order routing goes through `/papi/v1/*`; Classic `/api/v3/*` and `/fapi/v1/*` calls return -2015 on a PM account.
-- API key permissions required: spot trading, futures trading, universal transfer, asset dust conversion.
+- **Account**: `autotradercodex_virtual@yh0d2v3tnoemail.com` sub-account (per the operator's API Management screen).
+- **Account type**: **Portfolio Margin (PM)** — visible in the sub-account API list as the "Portfolio ..." label and confirmed live in production via `/papi/v1/account` probes. All order routing goes through `/papi/v1/*`; Classic `/api/v3/*` and `/fapi/v1/*` calls return -2015 on a PM account.
+- **API key**: `CTCDgU***` (HMAC type). Permissions granted (operator-confirmed 2026-05-11):
+  - Spot trading
+  - Margin trading
+  - Futures trading
+  - IP restriction enabled (only `45.32.53.166` whitelisted on Binance's side — confirm in the API key edit screen if you re-image the host)
 - The bot's `BinanceGateway.is_unified_margin()` returns `True` unconditionally — this codebase treats every Binance account as PM. If you switch off PM, the bot will misbehave.
+- **Universal transfer permission** isn't a separate Binance toggle on the screen the operator showed — it's implicit when Spot + Futures trading are both enabled on a PM account. If a transfer call ever returns -2014 / -1022, recheck the key.
 
 ### 1.6 KuCoin
 
-- Account: a **sub-account** (Milind's main account uses `m1348vwvjs47x081vz06b141` style sub-domain).
-- Account mode: **Classic** today (confirmed via `account_type()` probe). UTA-enabling from the sub-account UI didn't take in this session; would require master-account API call.
+- **Sub-account name**: `AutoTraderv2` (per the operator's API edit screen).
+- **API key**: `69f88ba0b70d0a0001cf9523`.
+- **Account mode**: **Classic** today (confirmed via `account_type()` probe at startup). The "Unified Account" toggle on the key permits UTA when the account is in UTA mode, but the master-account-side mode flip didn't take in this session; would require a master-account API call. Until UTA is enabled, the bot exercises the Classic-wallet code paths.
+- Permissions granted (operator-confirmed 2026-05-11):
+  - **General** (read-only baseline — locked-on, can't be disabled)
+  - **Spot Trading**
+  - **Margin Trading**
+  - **Futures Trading**
+  - **Unified Account** (enables UTA when account-side mode allows it)
+  - **Allow Flexible Transfers** (asset transfers across supported types — required for `consolidate_spot_wallets` and `transfer_*` calls)
+- **IP restriction**: `45.32.53.166` (IPv4) AND `2001:8f8:1165:1275:5cd8:e3ba:9660:e28e` (IPv6). Both Vultr IPs whitelisted. If the IP changes, KuCoin will silently 401 every call.
 - KuCoin Classic has three+ spot wallets the bot interacts with:
   - `main` — Funding Account (default deposit destination)
   - `trade` — Trading Account (spot orders execute here)
   - `contract` — Futures wallet
   - `margin`, `isolated`, `pool` — also probed by `consolidate_spot_wallets` and `wallet_breakdown`. `pool` (KuCoin Earn) is excluded from sweeps because it's time-locked.
-- API key permissions required: General (read), Spot Trading, Futures Trading, Transfer.
 
-### 1.7 Onchain venues  `[NOT IMPLEMENTED — placeholder for the roadmap]`
+### 1.7 Onchain venues  `[NOT IMPLEMENTED — roadmap target still TBD]`
 
-- Planned trade types: `<venue>_onchain_funding_arb`, `<venue>_cex_to_dex_funding_spread`.
+- Operator hasn't picked a chain/protocol yet. Candidates implied by `TRADE_TYPE_LABELS` in `app/models.py` include `<chain>_onchain_funding_arb` and `<venue>_cex_to_dex_funding_spread`.
 - Will land as new `Gateway` subclasses in `app/exchange.py` (likely thin wrappers over a separate `app/onchain/<venue>.py` module that handles RPCs, wallets, and signing).
 
 ---
@@ -95,6 +114,7 @@ Reference: `app/config.py` — `Settings` class.
 | `DASHBOARD_PASSWORD` | `change-me` | same — operator must set a strong value |
 | `DIAGNOSTICS_TOKEN` | empty | `/api/diagnostics?token=...` — endpoint returns 503 until set |
 | `DATABASE_URL` | `sqlite:///./bot.db` | SQLAlchemy engine; mount on a persistent Coolify volume |
+| `NIXPACKS_NODE_VERSION` | — | Coolify build pipeline (Nixpacks). Not read by Python app code; currently a no-op since the repo has no Node build step. |
 
 ### 2.2 StrategyConfig (operator-tuned, edited via `/config` UI, stored in DB)
 
