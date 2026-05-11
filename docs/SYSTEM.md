@@ -71,8 +71,8 @@ Operator wears a hands-off hat: deposit capital, set risk thresholds via `/confi
 
 - `/api/diagnostics?token=...` on the bot returns a structured JSON snapshot (cycle health, positions, wallets, rejections grouped, recent events, anomalies).
 - The cron workflow calls this endpoint and runs `.github/scripts/diagnostics_post.py` against the response.
-- The script opens or updates a single tracker GitHub issue labeled `bot-diagnostics` when `anomalies` is non-empty, closes it on "all clear".
-- A dedicated Claude monitoring chat subscribes to the tracker via `subscribe_pr_activity`, reads `docs/SYSTEM.md` (this file) on first wake, and responds inline with diagnosis comments or PRs per the response policy in §11.
+- The script posts a comment to a single persistent tracker issue titled **`[bot-diagnostics] Tracker`** on every run, regardless of whether anomalies are present (heartbeat model). The issue body is updated to the latest full state. The comment is the webhook-firing event that wakes the monitor chat.
+- A dedicated Claude monitoring chat subscribes to the tracker via `subscribe_pr_activity`, reads `docs/SYSTEM.md` (this file) on first wake, and responds inline. Response policy is in §11 — TL;DR briefly acknowledge "all clear" comments, react fully when anomalies are present.
 
 ### 1.5 Binance
 
@@ -485,10 +485,12 @@ Auth: `?token=` is mandatory. 503 returned when `DIAGNOSTICS_TOKEN` env is unset
 - `BOT_URL` — public URL (no trailing slash)
 - `DIAGNOSTICS_TOKEN` — matches bot env var
 
-The cron pipes the JSON into `.github/scripts/diagnostics_post.py`, which:
-- Opens / updates the `[bot-diagnostics] Anomaly tracker` issue when anomalies are present
-- Closes the tracker (with "all clear" comment) when the next run finds none
-- Falls back to filing without a label if label creation fails
+The cron pipes the JSON into `.github/scripts/diagnostics_post.py`, which (heartbeat model):
+- Locates (or, on first run, creates) the persistent `[bot-diagnostics] Tracker` issue.
+- Updates the issue body to the latest full state (anomalies + cycle health + positions + rejections + recent events + full JSON in `<details>`).
+- Reopens the issue if someone manually closed it (the heartbeat issue stays open forever).
+- Posts a one-comment-per-run heartbeat with terse status (✅ all clear or ⚠️ N anomalies + top-3). This comment fires the webhook to the monitor chat.
+- Falls back to filing without a label if label creation fails.
 
 ### 8.4 Monitor chat
 
@@ -548,7 +550,19 @@ Separate Claude session from dev work. Reads `docs/SYSTEM.md` (this file) on eve
 
 ## 11. Response policy (for the monitor chat)
 
-When a tracker update arrives:
+Every cron run posts a heartbeat comment to the `[bot-diagnostics] Tracker` issue — anomalies or not — so the monitor chat ALWAYS gets a webhook. The response depends on what the comment says.
+
+### Heartbeat "✅ all clear"
+
+Reply with a **single concise message** confirming the check happened and summarising the state. One line is enough, e.g.
+
+> ✅ Cron @ 2026-05-11T18:00Z — all clear. Positions `{open: 2, closed: 14}`, 8 trades in 24h, errors/warns `0/3`. No action.
+
+This is the operator's proof the chain is alive. Don't pile on detail — the issue body has the full state already.
+
+### Heartbeat "⚠️ N anomalies"
+
+For each anomaly in the comment, decide and act per this table:
 
 | Anomaly type | Action |
 |---|---|
@@ -559,6 +573,8 @@ When a tracker update arrives:
 | Strategy / threshold change | **Ask** the operator on the tracker thread before acting. |
 | Operator-action-required (e.g. no_usdt_pair on a Binance asset) | **Comment** with the manual step. |
 | Anything ambiguous | **Ask** on the thread, don't act. |
+
+Combine related anomalies in a single reply rather than one comment per anomaly. The operator wants a coherent diagnosis, not a wall of bullets.
 
 **Never**: push to `main` directly, skip pre-commit hooks (`--no-verify`), force-push, run destructive shell commands, touch venue credentials.
 
@@ -576,7 +592,7 @@ PR workflow:
 | Job | Schedule | Trigger | Side effects |
 |---|---|---|---|
 | Bot's own loop | every `cfg.loop_seconds` (default 30s) | in-process thread per (mode, venue) | runs the full cycle in §4 |
-| Diagnostics workflow | every 3h (`0 */3 * * *`) | GitHub Actions cron | hits `/api/diagnostics`, files / updates / closes tracker issue |
+| Diagnostics workflow | every 3h (`0 */3 * * *`) | GitHub Actions cron | hits `/api/diagnostics`, updates the persistent `[bot-diagnostics] Tracker` issue body, posts a heartbeat comment EVERY run (✅ all clear or ⚠️ N anomalies). Comment fires the webhook to the monitor chat. |
 | (Future) onchain settlement watcher | TBD | TBD | TBD |
 
 No external crons beyond these today. The bot is self-driving; the diagnostics cron exists only for human + monitor-chat oversight.
