@@ -381,7 +381,8 @@ Same formula, with `live_basis_bps` instead of `fill_basis_bps`. Sign-aware (`rt
 - Three+ separate spot wallets: `main`, `trade`, `contract`, `margin`, `isolated`, `pool`.
 - `is_unified_margin() → False` (returns `self._is_uta`).
 - Synthesised `spot.<asset>.free = main + trade` (aggregated). The actual spot order matching only touches `trade` — so we run `consolidate_spot_wallets` at the top of every cycle to sweep `main`/`margin`/`isolated` → `trade`, making the abstraction honest.
-- `futures.fetch_balance({'currency': cur})` must be called per-currency (default returns USDT only). Implemented since PR #15.
+- `futures.fetch_balance({'currency': cur})` must be called per-currency (default returns USDT only). Implemented since PR #15. `wallet_breakdown` was missing this — fixed in PR #22 so `/api/diagnostics` reports the real USDC contract balance instead of always 0.
+- **Transfer routing — futures→spot must go through the FUTURES client.** `self.spot.transfer('contract','trade',…)` routes to `/api/v3/accounts/universal-transfer`, which on a KuCoin Classic account returns code `112002 "Balance insufficient"` even when the futures `availableBalance` is positive — the spot-side "CONTRACT" account-type doesn't see the futures wallet. Use `self.futures.transfer(asset, amt, 'CONTRACT', 'TRADE')` (legacy `/api/v1/transfer-out`) for draining futures. `transfer_spot_to_futures` (IN direction) keeps using universal-transfer; that path works. Fixed in PR #22.
 - `pool` (KuCoin Earn) is time-locked, never swept.
 
 ### 6.3 KuCoin UTA (not active for the operator's sub-account)
@@ -542,7 +543,7 @@ Separate Claude session from dev work. Reads `docs/SYSTEM.md` (this file) on eve
 | Dust below MIN_NOTIONAL | Notional check in recovery | `convert_dust_to_native` → BNB / KCS via venue dust endpoint (PR #21) |
 | Wallet starvation | Sizing reject `below min position pct` | Wallet breakdown logged; operator inspects via `wallet_breakdown` |
 | Book moves during round-trip | `spot_ioc_zero_fill` | Reject, retry next cycle |
-| KuCoin futures→spot drain 112002 | Post-cycle drain WARN | **Under investigation.** Possibly margin lock invisible to `fetch_balance`. Currently logged, doesn't crash. |
+| KuCoin futures→spot drain 112002 | Post-cycle drain WARN | **Fixed in PR #22.** Spot-side universal-transfer can't drain the Futures wallet on a Classic account; switched to `self.futures.transfer(…, 'CONTRACT', 'TRADE')` (legacy `/api/v1/transfer-out`). Repeated identical transfer failures are now deduped via `_TRANSFER_ERROR_CACHE` (same pattern as `_CLOSE_ERROR_CACHE`). |
 | Symbol drift across ccxt versions | Exit funding miss WARN | Falls back to stale `last_funding_rate`; logged so operator sees drift |
 | Loop crash | Outer try/except in `run_one_cycle` | `Loop iteration error (<mode>): <repr>` logged at ERROR; loop continues next cycle |
 
@@ -640,7 +641,7 @@ Reviewers (human or monitor chat) reject PRs that change behavior without updati
 ## 15. Known fragile / deferred work
 
 - **Vultr Auto Backups are NOT enabled.** Single-instance SQLite DB on local NVMe. If `arb-bot-tokyo` dies, the entire trade / position / event history is lost. Either enable Vultr's automatic backup add-on, or run an off-host backup cron. Should be addressed before serious capital scales up.
-- **KuCoin `futures→spot` drain occasionally fails with 112002** despite positive `free` balance reported by `fetch_balance`. Possibly margin/order locks the transfer endpoint sees that the balance endpoint doesn't. Not crash-inducing but noisy. Investigation pending.
+- ~~**KuCoin `futures→spot` drain occasionally fails with 112002** despite positive `free` balance reported by `fetch_balance`. Possibly margin/order locks the transfer endpoint sees that the balance endpoint doesn't. Not crash-inducing but noisy. Investigation pending.~~ Resolved in PR #22 — routing fix, see §6.2 and §10.
 - **Maker-on-exit fee optimization** would save ~30% of exit fees. Not implemented; needs careful timeout-fallback logic to avoid leaving resting orders that the basis can run away from.
 - **Cross-venue funding arb** strategy is tagged in `TRADE_TYPE_LABELS` but the orchestrator isn't wired.
 - **Onchain integration** is a future track. No code yet.
