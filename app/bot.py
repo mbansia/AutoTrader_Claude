@@ -1585,20 +1585,32 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     # synthesised futures.<asset>.total is 0 by
                     # convention — we skip in that case since the
                     # buckets aren't actually separate wallets.
-                    if mode == MODE_LIVE and not cfg.auto_transfer_enabled:
+                    #
+                    # Gate: only fire when there's an actual candidate
+                    # the bot wants to open. Running this every cycle
+                    # with no candidates was creating a drain↔rebalance
+                    # oscillation on KuCoin (post-cycle drain pushed
+                    # futures→main; top-of-cycle consolidate pushed
+                    # main→trade; this rebalance pushed trade→contract;
+                    # repeat — funds shuffled wallets endlessly with no
+                    # trade ever happening). With no candidates to fund,
+                    # there's nothing to equalize for.
+                    if mode == MODE_LIVE and candidates_passing > 0 and not cfg.auto_transfer_enabled:
                         # Operator has explicitly disabled wallet rebalancing
                         # on /config. With this off the bot will under-size
                         # to whichever leg is smallest. Surface it once per
-                        # cycle so the symptom isn't silent.
+                        # cycle so the symptom isn't silent — but only when
+                        # we actually had a candidate, so an idle account
+                        # doesn't spam WARNs.
                         log_event(db, 'Pre-trade rebalance skipped: auto_transfer_enabled=False on /config (under-sizing to smaller leg)', mode=mode, level='WARN', exchange=gateway.venue_id)
-                    if mode == MODE_LIVE and cfg.auto_transfer_enabled and gateway.is_unified_margin():
+                    if mode == MODE_LIVE and candidates_passing > 0 and cfg.auto_transfer_enabled and gateway.is_unified_margin():
                         # Authoritative unified-margin check — replaces the old
                         # `fut.total <= 0.001` heuristic which mis-classified an
                         # EMPTY contract wallet as unified, silently skipping
                         # the rebalance on a KuCoin Classic account where all
                         # the cash sat on the spot side.
                         log_event(db, f'Pre-trade rebalance skipped: {gateway.name} reports unified margin (no spot↔futures transfer meaningful)', mode=mode, exchange=gateway.venue_id)
-                    elif mode == MODE_LIVE and cfg.auto_transfer_enabled:
+                    elif mode == MODE_LIVE and candidates_passing > 0 and cfg.auto_transfer_enabled:
                         for q in ('USDT', 'USDC'):
                             sf = spot_free_by_q.get(q, 0.0)
                             ff = fut_free_by_q.get(q, 0.0)

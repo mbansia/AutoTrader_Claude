@@ -2376,18 +2376,38 @@ class KuCoinGateway(VenueGateway):
             return True, 'noop'
         if self._is_uta:
             return True, 'UTA mode: unified pool, no transfer needed'
-        # Route via the FUTURES client's `transferOut` endpoint
-        # (/api/v1/transfer-out), NOT the spot-side universal-transfer.
-        # Universal-transfer with from=CONTRACT returns code 112002
-        # "Balance insufficient" against the Futures wallet even when
-        # availableBalance is positive — KuCoin Classic treats the
-        # futures wallet as separate from the spot "contract" account
-        # that v3/universal-transfer reads. The legacy `transferOut`
-        # is the only path that actually drains futures collateral.
+        # Two hops:
+        #
+        #   (1) FUTURES `transferOut` endpoint (/api/v1/transfer-out) for
+        #       CONTRACT → MAIN. ccxt's `kucoinfutures.transfer` is the
+        #       only path that actually drains futures collateral on
+        #       KuCoin Classic — the spot-side universal-transfer can't
+        #       see the futures wallet and returns code 112002 (see PR
+        #       #29). We send `recAccountType=TRADE` via ccxt but KuCoin
+        #       lands the funds in MAIN regardless on our sub-account.
+        #       Use MAIN explicitly so the routing matches reality and
+        #       we don't get bitten by quirky behaviour if KuCoin ever
+        #       starts honouring the hint.
+        #
+        #   (2) SPOT inner-transfer for MAIN → TRADE. The spot order
+        #       book only matches against `trade`; without this hop the
+        #       funds sit in `main` for a cycle until
+        #       `consolidate_spot_wallets` mops them up. Doing it inline
+        #       keeps the abstraction honest: a successful return means
+        #       the funds are actually spendable on the spot leg right
+        #       now.
         try:
-            self.futures.transfer(asset, float(amount), 'CONTRACT', 'TRADE')
+            self.futures.transfer(asset, float(amount), 'CONTRACT', 'MAIN')
         except Exception as e:
             return False, str(e)
+        ok, err = self._transfer('main', 'trade', amount, asset=asset)
+        if not ok:
+            # Funds reached `main` but the spot-side hop failed. Treat
+            # as a soft success — the next cycle's
+            # `consolidate_spot_wallets` will sweep `main → trade` — and
+            # surface the message so the operator can see the partial
+            # path if it persists.
+            return True, f'futures→main OK; main→trade follow-up failed (consolidate will recover): {err[:120]}'
         return True, ''
 
     # KuCoin Classic ships funds in three buckets on the spot side: ``trade``
