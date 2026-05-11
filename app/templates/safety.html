@@ -63,8 +63,8 @@
   <table>
     <thead><tr><th>Rule</th><th>Current setting</th><th>Effect</th></tr></thead>
     <tbody>
-      <tr><th>Entry funding threshold</th><td class="num">{{ '%.2f%% APY' % (cfg.entry_funding_threshold * 100) }}</td><td>Only open when compounded annualized yield ≥ this. APY = (1 + period_rate) ^ (8760 / interval_h) − 1; each candidate uses its own 4h/8h interval.</td></tr>
-      <tr><th>Exit funding threshold</th><td class="num">{{ '%.2f%% APY' % (cfg.exit_funding_threshold * 100) }}</td><td>Close when refreshed funding APY falls below this.</td></tr>
+      <tr><th>Entry minimum net APY</th><td class="num">{{ '%.2f%%' % (cfg.entry_min_net_apy * 100) }}</td><td>Only open when annualized NET profit (funding + signed basis − worst-case adverse swing − round-trip fees, compounded) ≥ this. NOT raw funding APY — a pair with high gross funding can still be rejected if fees+basis eat it.</td></tr>
+      <tr><th>Exit minimum net APY</th><td class="num">{{ '%.2f%%' % (cfg.exit_min_net_apy * 100) }}</td><td>Close when forward NET annualized profit (live funding + live basis − fees, same maths as entry) falls below this. Treats the position as "would I open this fresh now at the more lenient exit threshold?".</td></tr>
       <tr><th>Stop-loss</th><td class="num">{{ '%.2f%%' % (cfg.stop_loss_pct * 100) }}</td><td>Close when MTM PnL ÷ entry notional ≤ this.</td></tr>
       <tr><th>Max hold</th><td class="num">{{ cfg.max_hold_hours }}h</td><td>Close after this elapsed time regardless of funding.</td></tr>
       <tr><th>Max open positions</th><td class="num">{{ cfg.max_open_positions }}</td><td>Hard cap on simultaneous arb pairs.</td></tr>
@@ -73,8 +73,6 @@
       <tr><th>Max position size</th><td class="num">{{ '%.2f%%' % (cfg.max_position_pct * 100) }} of equity</td><td>Cap any single open position at this fraction of total portfolio.</td></tr>
       <tr><th>Wallet auto-transfer</th><td><span class="tag {{ 'good' if cfg.auto_transfer_enabled else 'warn' }}">{{ 'enabled' if cfg.auto_transfer_enabled else 'OFF' }}</span></td><td>{% if cfg.auto_transfer_enabled %}Live, Classic accounts only. Pre-close tops up the futures wallet for the buy-back. No-op on PM / UTA where margin is unified.{% else %}Disabled — manual transfers only.{% endif %}</td></tr>
       <tr><th>Perp margin mode</th><td><span class="tag good">CROSS · {{ cfg.max_perp_leverage or cfg.perp_leverage or 1 }}x</span></td><td>Binance: Portfolio Margin (cross is implicit, leverage set per perp via /papi/v1/um/leverage before each open). KuCoin: per-symbol cross + leverage set via the futures client. 1x keeps perp margin == spot notional, matching the hedge.</td></tr>
-      <tr><th>Min 24h quote volume</th><td class="num">{{ '{:,.0f}'.format(cfg.min_24h_quote_volume) }} USDT</td><td>Liquidity filter on spot leg.</td></tr>
-      <tr><th>Min order-book depth</th><td class="num">{{ '${:,.0f}'.format(cfg.min_order_book_depth_usdt) }} @ ±{{ '%.0f' % cfg.depth_band_bps }}bps</td><td>Reject if min(spot ask depth, perp bid depth) within the band is below this — protects against thin books that would cause large slippage on entry.</td></tr>
       <tr><th>Allocation tiebreak</th><td>funding APY desc, then depth</td><td>When multiple candidates pass all filters, the bot picks the highest funding APY first; ties go to the deeper book. Diversity rule skips any candidate whose base asset is already held open.</td></tr>
       <tr><th>Entry basis sanity gate</th><td>profitability gate only</td><td>The standalone basis_dislocated check was retired: the profitability gate (funding + signed basis − fees, annualized) is the single economic check.</td></tr>
       <tr><th>Max exit basis</th><td class="num">{{ '%.1f' % cfg.max_exit_basis_bps }} bps</td><td>Defer voluntary exits (funding decay, max hold) until basis is favorable. Stop-loss, naked-leg, delisting and maintenance bypass this gate.</td></tr>

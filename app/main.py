@@ -1315,8 +1315,12 @@ def save_config(
     # ``*_pct`` form fields are user-typed in PERCENT units (e.g. 20 for
     # 20%) and we convert to decimal here. Underlying schema fields stay
     # in decimal so legacy callers + comparisons elsewhere don't break.
-    entry_funding_threshold_pct: float = Form(...),
-    exit_funding_threshold_pct: float = Form(...),
+    # NEW form param names after the entry/exit threshold rename.
+    # Aliased so old POSTs from cached browser tabs still work.
+    entry_min_net_apy_pct: float = Form(None),
+    exit_min_net_apy_pct: float = Form(None),
+    entry_funding_threshold_pct: float = Form(None),
+    exit_funding_threshold_pct: float = Form(None),
     stop_loss_pct_pct: float = Form(...),
     min_position_pct_pct: float = Form(...),
     max_position_pct_pct: float = Form(...),
@@ -1329,7 +1333,6 @@ def save_config(
     paper_slippage_bps: float = Form(...),
     paper_fee_bps: float = Form(...),
     paper_starting_equity: float = Form(...),
-    max_entry_basis_bps: float = Form(0.0),  # deprecated; basis_dislocated gate dropped, profitability gate is sole economic check. Field accepted for backward compat with old form posts but no longer applied.
     max_exit_basis_bps: float = Form(...),
     exit_basis_buffer_multiple: float = Form(3.0),
     enforce_hedge_check: int = Form(...),
@@ -1341,8 +1344,14 @@ def save_config(
     with SessionLocal() as db:
         cfg = get_strategy_config(db)
         # Percent → decimal conversions.
-        cfg.entry_funding_threshold = entry_funding_threshold_pct / 100.0
-        cfg.exit_funding_threshold = exit_funding_threshold_pct / 100.0
+        # Accept either the new (entry_min_net_apy_pct) or legacy
+        # (entry_funding_threshold_pct) form name — whichever is non-None.
+        entry_apy_pct = entry_min_net_apy_pct if entry_min_net_apy_pct is not None else entry_funding_threshold_pct
+        exit_apy_pct = exit_min_net_apy_pct if exit_min_net_apy_pct is not None else exit_funding_threshold_pct
+        if entry_apy_pct is None or exit_apy_pct is None:
+            return RedirectResponse(url='/config?error=missing_threshold', status_code=303)
+        cfg.entry_min_net_apy = entry_apy_pct / 100.0
+        cfg.exit_min_net_apy = exit_apy_pct / 100.0
         cfg.stop_loss_pct = stop_loss_pct_pct / 100.0
         cfg.min_position_pct = min_position_pct_pct / 100.0
         cfg.max_position_pct = max_position_pct_pct / 100.0
@@ -1355,9 +1364,6 @@ def save_config(
         cfg.paper_slippage_bps = paper_slippage_bps
         cfg.paper_fee_bps = paper_fee_bps
         cfg.paper_starting_equity = paper_starting_equity
-        # max_entry_basis_bps is no longer applied — basis_dislocated
-        # gate was dropped in favour of letting the profitability gate
-        # decide. The DB column is retained for backward compatibility.
         cfg.max_exit_basis_bps = max_exit_basis_bps
         cfg.exit_basis_buffer_multiple = max(0.0, exit_basis_buffer_multiple)
         cfg.enforce_hedge_check = bool(enforce_hedge_check)
@@ -1366,11 +1372,6 @@ def save_config(
         new_lev = max(1, max_perp_leverage or 1)
         cfg.max_perp_leverage = new_lev
         cfg.perp_leverage = new_lev  # legacy mirror
-        # Zero-out legacy depth/volume gates so old user values stop
-        # firing. simulate_fill at the per-candidate stage is the
-        # single liquidity check now.
-        cfg.min_24h_quote_volume = 0.0
-        cfg.min_order_book_depth_usdt = 0.0
         db.commit()
     return RedirectResponse(url='/config?saved=1', status_code=303)
 
@@ -1714,11 +1715,8 @@ def _render_export_md(v: str) -> str:
         # ---- Configuration ----
         parts.append('## Strategy configuration\n')
         cfg_rows = [
-            ['entry_funding_threshold', cfg.entry_funding_threshold],
-            ['exit_funding_threshold', cfg.exit_funding_threshold],
-            ['min_24h_quote_volume', cfg.min_24h_quote_volume],
-            ['min_order_book_depth_usdt', cfg.min_order_book_depth_usdt],
-            ['depth_band_bps', cfg.depth_band_bps],
+            ['entry_min_net_apy', cfg.entry_min_net_apy],
+            ['exit_min_net_apy', cfg.exit_min_net_apy],
             ['stop_loss_pct', cfg.stop_loss_pct],
             ['max_open_positions', cfg.max_open_positions],
             ['max_trades_per_day', cfg.max_trades_per_day],
@@ -1729,7 +1727,6 @@ def _render_export_md(v: str) -> str:
             ['paper_slippage_bps', cfg.paper_slippage_bps],
             ['paper_fee_bps', cfg.paper_fee_bps],
             ['paper_starting_equity', cfg.paper_starting_equity],
-            ['max_entry_basis_bps', cfg.max_entry_basis_bps],
             ['max_exit_basis_bps', cfg.max_exit_basis_bps],
             ['enforce_hedge_check', cfg.enforce_hedge_check],
             ['delisting_check', cfg.delisting_check],

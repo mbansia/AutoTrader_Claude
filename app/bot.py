@@ -237,6 +237,11 @@ def get_strategy_config(db) -> StrategyConfig:
     # (e.g. 0.0001 = 1 bp per funding window); new semantic is
     # "annualized compounded APR" (e.g. 0.10 = 10% APY). Runs at v0
     # and bumps to v1.
+    # The migrations below DELIBERATELY reference the LEGACY column names
+    # (cfg.entry_funding_threshold / cfg.exit_funding_threshold) because
+    # that's the data they're upgrading FROM. The new column names
+    # (cfg.entry_min_net_apy / cfg.exit_min_net_apy) are the destination.
+    # Don't bulk-rename inside these blocks — it'll break the upgrade.
     if (cfg.config_schema_version or 0) < 1:
         before_entry = cfg.entry_funding_threshold
         before_exit = cfg.exit_funding_threshold
@@ -247,6 +252,22 @@ def get_strategy_config(db) -> StrategyConfig:
         cfg.config_schema_version = 1
         if before_entry != cfg.entry_funding_threshold or before_exit != cfg.exit_funding_threshold:
             log_event(db, f'Migrated funding thresholds to APR (v0→v1): entry {before_entry:.6f}→{cfg.entry_funding_threshold:.4f}, exit {before_exit:.6f}→{cfg.exit_funding_threshold:.4f}', mode=MODE_PAPER, exchange='system')
+        db.flush()
+    # v1 → v2: rename entry_funding_threshold / exit_funding_threshold →
+    # entry_min_net_apy / exit_min_net_apy. The old names misled operators
+    # into thinking they were raw-funding thresholds; the gate has always
+    # been NET APY (after worst-case basis + round-trip fees). Copy old →
+    # new once per row. The bot reads only the new columns going forward.
+    if (cfg.config_schema_version or 0) < 2:
+        # Only copy when the new column is still at its default (i.e. nobody
+        # has explicitly set it via /config since the rename shipped). If
+        # the operator has touched the new column, keep their value.
+        if cfg.entry_funding_threshold and abs(cfg.entry_min_net_apy - 0.20) < 1e-9:
+            cfg.entry_min_net_apy = cfg.entry_funding_threshold
+        if cfg.exit_funding_threshold and abs(cfg.exit_min_net_apy - 0.05) < 1e-9:
+            cfg.exit_min_net_apy = cfg.exit_funding_threshold
+        cfg.config_schema_version = 2
+        log_event(db, f'Migrated threshold names v1→v2: entry_min_net_apy={cfg.entry_min_net_apy:.4f}, exit_min_net_apy={cfg.exit_min_net_apy:.4f} (old entry_funding_threshold / exit_funding_threshold columns retained for back-compat but no longer read)', mode=MODE_PAPER, exchange='system')
         db.flush()
     return cfg
 
@@ -778,8 +799,8 @@ def recover_phantom_spot(db, gateway: VenueGateway, mode: str, cfg: StrategyConf
                 net_apy = (1.0 + net_per_window / 10000.0) ** (24.0 * 365.0 / interval_h) - 1.0
             except OverflowError:
                 net_apy = float('inf') if net_per_window > 0 else -1.0
-            if net_apy < cfg.entry_funding_threshold:
-                log_event(db, f'Phantom spot {asset}: hedge via {perp_sym} skipped (forward net APY {net_apy*100:+.2f}% < {cfg.entry_funding_threshold*100:.2f}% threshold)', mode=mode, exchange=gateway.venue_id)
+            if net_apy < cfg.entry_min_net_apy:
+                log_event(db, f'Phantom spot {asset}: hedge via {perp_sym} skipped (forward net APY {net_apy*100:+.2f}% < {cfg.entry_min_net_apy*100:.2f}% threshold)', mode=mode, exchange=gateway.venue_id)
                 continue
             # Confirm perp book has depth for the phantom qty.
             try:
@@ -1395,9 +1416,9 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         fwd_net_apy = (1.0 + fwd_net_per_window_bps / 10000.0) ** periods_per_year - 1.0
                     except OverflowError:
                         fwd_net_apy = float('inf') if fwd_net_per_window_bps > 0 else -1.0
-                    if fwd_net_apy < cfg.exit_funding_threshold:
+                    if fwd_net_apy < cfg.exit_min_net_apy:
                         exit_reason = (f'forward_profit_below_threshold '
-                                       f'(net {fwd_net_apy*100:+.2f}% APY < {cfg.exit_funding_threshold*100:.2f}% required, '
+                                       f'(net {fwd_net_apy*100:+.2f}% APY < {cfg.exit_min_net_apy*100:.2f}% required, '
                                        f'live: funding {funding_window_bps:+.1f}bps + basis_RT {rt_basis_signed_bps:+.1f}bps − fees {rt_fees_bps:.1f}bps)')
                     elif age > timedelta(hours=cfg.max_hold_hours):
                         exit_reason = 'max_hold'
@@ -1428,7 +1449,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
             if mstate.entry_enabled and len(open_positions) < cfg.max_open_positions and daily_trades < cfg.max_trades_per_day:
                 try:
                     passing, candidates_total, rejected_scan = gateway.scan_funding(
-                        cfg.entry_funding_threshold,
+                        cfg.entry_min_net_apy,
                     )
                 except Exception as e:
                     passing, candidates_total, rejected_scan = [], 0, []
@@ -1950,7 +1971,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                             net_apy = (1.0 + net_per_window_bps / 10000.0) ** periods_per_year - 1.0
                         except OverflowError:
                             net_apy = float('inf') if net_per_window_bps > 0 else -1.0
-                        if net_apy < cfg.entry_funding_threshold:
+                        if net_apy < cfg.entry_min_net_apy:
                             swap_note = f' + swap_RT={swap_fee_bps:.1f}bps' if swap_fee_bps > 0 else ''
                             db.add(RejectedCandidate(mode=mode, exchange=gateway.venue_id, symbol=c.perp_symbol,
                                 reason=(f'insufficient_annualized_profit '
@@ -1958,7 +1979,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                                         f'basis_RT={round_trip_basis_signed_bps:+.1f}bps [entry {fill_basis_bps:+.1f} − worst-swing {worst_adverse_swing_bps:.1f} (×{exit_buffer:.1f})] − '
                                         f'fees={round_trip_fees_bps:.1f}bps [spot {spot_fee_bps:.1f} + perp {perp_fee_bps:.1f}, ×2 RT{swap_note}] '
                                         f'= net {net_per_window_bps:+.1f}bps/{int(interval_h)}h '
-                                        f'→ {net_apy*100:+.2f}% APY < {cfg.entry_funding_threshold*100:.2f}% required)'),
+                                        f'→ {net_apy*100:+.2f}% APY < {cfg.entry_min_net_apy*100:.2f}% required)'),
                                 funding_rate=c.funding_apr))
                             scan_action = 'insufficient_annualized_profit'
                             continue
