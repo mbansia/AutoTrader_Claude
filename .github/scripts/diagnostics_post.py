@@ -27,24 +27,39 @@ def run_gh(args: list[str], check: bool = True) -> str:
     return result.stdout
 
 
-def ensure_label(repo: str) -> None:
-    """Create the tracker label if it doesn't exist (so the issue search
-    works). Idempotent."""
-    existing = run_gh(['api', f'repos/{repo}/labels/{TRACKER_LABEL}'], check=False)
-    if existing.strip():
-        return
-    run_gh([
-        'api', '--method', 'POST', f'repos/{repo}/labels',
-        '-f', f'name={TRACKER_LABEL}',
-        '-f', 'color=d73a4a',
-        '-f', 'description=Auto-filed by the diagnostics cron when anomalies fire.',
-    ], check=False)
+def ensure_label(repo: str) -> bool:
+    """Create the tracker label if it doesn't exist. Returns True on success
+    so the caller knows whether to pass --label to `issue create`. Failures
+    are non-fatal — we'd rather file an unlabeled tracker than no tracker."""
+    # Check by name. `gh api repos/X/labels/<name>` returns 200 if exists.
+    result = subprocess.run(
+        ['gh', 'api', f'repos/{repo}/labels/{TRACKER_LABEL}'],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        return True
+    # Create. POST /repos/{owner}/{repo}/labels with name + color.
+    create = subprocess.run(
+        ['gh', 'api', '--method', 'POST', f'repos/{repo}/labels',
+         '-f', f'name={TRACKER_LABEL}',
+         '-f', 'color=d73a4a',
+         '-f', 'description=Auto-filed by the diagnostics cron when anomalies fire.'],
+        capture_output=True, text=True,
+    )
+    if create.returncode == 0:
+        return True
+    print(f'Label create failed (will file unlabeled): {create.stderr.strip()}', file=sys.stderr)
+    return False
 
 
 def find_open_tracker(repo: str) -> int | None:
+    """Locate the tracker issue by exact title match. We search the whole
+    open-issue list rather than filtering by label so it still works when
+    the label couldn't be created (e.g., insufficient permissions on the
+    repo's default GITHUB_TOKEN)."""
     out = run_gh([
-        'issue', 'list', '--repo', repo, '--label', TRACKER_LABEL,
-        '--state', 'open', '--limit', '5', '--json', 'number,title',
+        'issue', 'list', '--repo', repo,
+        '--state', 'open', '--limit', '100', '--json', 'number,title',
     ])
     try:
         rows = json.loads(out or '[]')
@@ -133,7 +148,7 @@ def main() -> int:
             payload = {'anomalies': [{'severity': 'critical', 'rule': 'invalid_json', 'detail': str(e)[:200]}]}
 
     has_anomalies = bool(payload.get('anomalies'))
-    ensure_label(repo)
+    label_ok = ensure_label(repo)
     existing = find_open_tracker(repo)
     body = render_body(payload, status)
 
@@ -145,12 +160,10 @@ def main() -> int:
             run_gh(['issue', 'comment', str(existing), '--repo', repo, '--body', comment_body])
             print(f'Updated tracker issue #{existing}')
         else:
-            out = run_gh([
-                'issue', 'create', '--repo', repo,
-                '--title', TRACKER_TITLE,
-                '--label', TRACKER_LABEL,
-                '--body', body,
-            ])
+            create_args = ['issue', 'create', '--repo', repo, '--title', TRACKER_TITLE, '--body', body]
+            if label_ok:
+                create_args += ['--label', TRACKER_LABEL]
+            out = run_gh(create_args)
             print(f'Opened tracker issue: {out.strip()}')
     else:
         # No anomalies. Close the tracker if open; otherwise nothing to do.

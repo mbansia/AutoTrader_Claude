@@ -50,7 +50,7 @@ from app.config import settings
 from app.db import SessionLocal
 from app.events import bus
 from app.exchange import SUPPORTED_QUOTES, VenueGateway, _interval_hours, annualize_rate, make_gateways
-from app.finance import position_realized_pnl, position_unrealized_pnl, total_realized_pnl
+from app.finance import position_realized_pnl, position_unrealized_pnl, total_funding_income, total_realized_pnl
 from app.models import (
     ALL_MODES,
     MODE_LIVE,
@@ -579,19 +579,85 @@ def recover_phantom_spot(db, gateway: VenueGateway, mode: str, cfg: StrategyConf
             Position.exchange == gateway.venue_id,
         )).all()
     }
+    # Binance's spot.fetch_balance() returns pseudo-assets that aren't
+    # tradable spot tokens: LD<asset> = Locked/Earn balance, BFRB<asset> =
+    # Flexible Reward, etc. We never want to "recover" these because they
+    # don't have spot markets. Filter by prefix.
+    BINANCE_PSEUDO_PREFIXES = ('LD', 'BFRB', 'BLFI', 'BETH', 'STETH')
+
     for asset, row in spot_assets.items():
         if asset in META_KEYS or asset in SUPPORTED_QUOTES or not isinstance(row, dict):
             continue
+        # Filter out Binance Earn pseudo-tokens — they live in spot balance
+        # response but aren't tradable (LDUSDT, LDBNB, etc.). They show up
+        # as `Phantom spot detected: 0.000000 LDUSDT (no USDT spot price)`
+        # which was both noisy and wrong — the bot can't sell them, and
+        # the right action is "ignore". Pattern is "LD" prefix + the
+        # underlying asset name; same for the others.
+        if gateway.venue_id == 'binance' and any(asset.startswith(p) for p in BINANCE_PSEUDO_PREFIXES):
+            continue
         free_qty = float(row.get('free') or 0)
-        if free_qty <= 0 or asset in held_bases:
+        # Use a small epsilon — Binance sometimes returns dust like
+        # 1e-9 for assets the user never actually holds; the <= 0
+        # check was passing those through to the "no USDT price"
+        # branch and emitting an ERROR every cycle.
+        if free_qty <= 1e-8 or asset in held_bases:
             continue
         sym_usdt = f'{asset}/USDT'
         px = gateway.safe_price(sym_usdt) or 0
         if px <= 0:
-            log_event(db, f'Phantom spot detected: {free_qty:.6f} {asset} (no USDT spot price; leave for manual resolution)', mode=mode, level='ERROR', exchange=gateway.venue_id)
+            # No spot market — can't recover, but log only once per asset
+            # per session by checking if an existing naked_spot Position
+            # already flagged this. Otherwise this emits an ERROR every
+            # cycle for the same asset, drowning the log.
+            existing = naked_already.get(asset)
+            if not existing or 'no_usdt_pair' not in (existing.last_close_error or ''):
+                log_event(db, f'Phantom spot detected: {free_qty:.6f} {asset} (no USDT spot pair; manual action needed)', mode=mode, level='ERROR', exchange=gateway.venue_id)
+                if existing:
+                    existing.last_close_error = 'no_usdt_pair: manual action needed'
+                    db.flush()
             continue
         notional = free_qty * px
         if notional < DUST_USDT:
+            continue
+        # Below-venue-minimum check. If the holding's notional is under
+        # the venue's MIN_NOTIONAL filter, NO sell order can succeed —
+        # Binance returns -1013 NOTIONAL, KuCoin returns 400100 "Order
+        # size below minimum". Logging that error every cycle (1×/10s)
+        # produces thousands of ERROR entries per day for no actionable
+        # signal. Flag the Position once with last_close_error, then
+        # skip future recovery attempts. The position stays visible on
+        # /dashboard (still status='naked_spot') so the operator sees
+        # it; manual sweep is the only resolution for dust this small.
+        VENUE_MIN_NOTIONAL_USDT = {'binance': 5.0, 'kucoin': 1.0}.get(gateway.venue_id, 1.0)
+        if notional < VENUE_MIN_NOTIONAL_USDT:
+            existing = naked_already.get(asset)
+            tag = f'dust_below_venue_min ({notional:.4f} < ${VENUE_MIN_NOTIONAL_USDT:.2f}); manual sweep needed'
+            if not existing:
+                # Persist a Position row so it appears in the portfolio
+                # view; then skip the sell attempt. Fall through below
+                # which records the naked_spot row, then `continue` to
+                # avoid the sell loop.
+                pos = Position(
+                    mode=mode, exchange=gateway.venue_id,
+                    trade_type=venue_to_trade_type(gateway.venue_id),
+                    symbol=asset, spot_symbol=sym_usdt,
+                    perp_symbol=f'{asset}/USDT:USDT',
+                    quote_currency='USDT', spot_quote_currency='USDT',
+                    quantity=free_qty, status='naked_spot',
+                    spot_entry_price=px, last_funding_accrual_ts=datetime.utcnow(),
+                    last_close_error=tag,
+                )
+                db.add(pos)
+                db.flush()
+                record_trade(db, pos.id, mode, sym_usdt, 'spot', 'buy', free_qty,
+                    {'price': px, 'amount': free_qty, 'filled': free_qty, 'fee': {'cost': 0.0}, '_reconstructed_from_phantom': True},
+                    exchange=gateway.venue_id)
+                log_event(db, f'Phantom dust detected: {free_qty:.6f} {asset} (~${notional:.4f}) — below venue min ${VENUE_MIN_NOTIONAL_USDT:.2f}, no sell attempt. Visible on /dashboard as naked_spot; manual action needed.', mode=mode, level='WARN', exchange=gateway.venue_id)
+            elif existing.last_close_error != tag:
+                existing.quantity = free_qty
+                existing.last_close_error = tag
+                db.flush()
             continue
 
         # ─── Persist as a Position FIRST so it shows up in the dashboard
