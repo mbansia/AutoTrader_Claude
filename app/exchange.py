@@ -2374,7 +2374,21 @@ class KuCoinGateway(VenueGateway):
             return True, 'paper'
         if amount <= 0:
             return True, 'noop'
-        return self._transfer('contract', 'trade', amount, asset=asset)
+        if self._is_uta:
+            return True, 'UTA mode: unified pool, no transfer needed'
+        # Route via the FUTURES client's `transferOut` endpoint
+        # (/api/v1/transfer-out), NOT the spot-side universal-transfer.
+        # Universal-transfer with from=CONTRACT returns code 112002
+        # "Balance insufficient" against the Futures wallet even when
+        # availableBalance is positive — KuCoin Classic treats the
+        # futures wallet as separate from the spot "contract" account
+        # that v3/universal-transfer reads. The legacy `transferOut`
+        # is the only path that actually drains futures collateral.
+        try:
+            self.futures.transfer(asset, float(amount), 'CONTRACT', 'TRADE')
+        except Exception as e:
+            return False, str(e)
+        return True, ''
 
     # KuCoin Classic ships funds in three buckets on the spot side: ``trade``
     # (where spot orders execute), ``main`` (default deposit / funding /
@@ -2458,7 +2472,12 @@ class KuCoinGateway(VenueGateway):
             for wtype in ('main', 'trade', 'margin', 'isolated', 'contract', 'pool'):
                 try:
                     if wtype == 'contract':
-                        bal = self.futures.fetch_balance()
+                        # kucoinfutures.fetch_balance() defaults to USDT
+                        # when no `currency` param is sent — without this
+                        # `wallet_breakdown('USDC')` always returned 0
+                        # contract balance, hiding non-zero USDC futures
+                        # from /api/diagnostics. Pass the asset through.
+                        bal = self.futures.fetch_balance({'currency': asset})
                     else:
                         bal = self.spot.fetch_balance({'type': wtype})
                     row = bal.get(asset) or {}

@@ -85,6 +85,33 @@ _LIVE_API_UNHEALTHY_LOGGED = False
 # a duplicate ERROR row on consecutive cycles. Cleared when the close succeeds.
 _CLOSE_ERROR_CACHE: dict[tuple[int, str], str] = {}
 
+# Per-(venue, mode, asset, op) cache of the last transfer-error snippet logged.
+# Same shape as _CLOSE_ERROR_CACHE: a repeated identical failure (e.g. KuCoin
+# returning 112002 "Balance insufficient" every ~13s while a wallet route is
+# unreachable) is suppressed after the first emit. Cleared on a successful
+# transfer for the same key so the next failure logs fresh.
+_TRANSFER_ERROR_CACHE: dict[tuple[str, str, str, str], str] = {}
+
+
+def _log_transfer_error(
+    db,
+    venue: str,
+    mode: str,
+    asset: str,
+    op: str,
+    err: str,
+    msg: str,
+    level: str = 'WARN',
+) -> None:
+    """Log a transfer-failure event, deduped per (venue, mode, asset, op).
+    Mirrors :func:`_log_close_error`. Only emit when the snippet changes."""
+    key = (venue, mode, asset, op)
+    snippet = err[:200]
+    if _TRANSFER_ERROR_CACHE.get(key) == snippet:
+        return
+    _TRANSFER_ERROR_CACHE[key] = snippet
+    log_event(db, msg, mode=mode, level=level, exchange=venue)
+
 
 def log_event(db, message: str, mode: str = MODE_PAPER, level: str = 'INFO', exchange: str = 'system'):
     """Persist a BotEvent row.
@@ -313,8 +340,12 @@ def _ensure_close_readiness(db, gateway: VenueGateway, p: Position, cfg: Strateg
             ok, err = gateway.transfer_spot_to_futures(transfer, False, asset=quote)
             if ok:
                 log_event(db, f'Pre-close: transferred {transfer:.2f} {quote} spot→futures (margin top-up for {p.perp_symbol})', mode=p.mode, exchange=p.exchange)
+                _TRANSFER_ERROR_CACHE.pop((p.exchange, p.mode, quote, 'pre_close_spot_to_futures'), None)
             else:
-                log_event(db, f'Pre-close: spot→futures {quote} transfer for {p.perp_symbol} failed: {err[:120]}', mode=p.mode, level='WARN', exchange=p.exchange)
+                _log_transfer_error(
+                    db, p.exchange, p.mode, quote, 'pre_close_spot_to_futures', err,
+                    f'Pre-close: spot→futures {quote} transfer for {p.perp_symbol} failed: {err[:120]}',
+                )
 
 
 def _actual_spot_qty(gateway: VenueGateway, p: Position) -> float:
@@ -1567,8 +1598,12 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                                     spot_free_by_q[q] = sf + move
                                     fut_free_by_q[q] = ff - move
                                     log_event(db, f'Pre-trade rebalance: {move:.2f} {q} futures→spot (equalize wallets so both legs can fund)', mode=mode, exchange=gateway.venue_id)
+                                    _TRANSFER_ERROR_CACHE.pop((gateway.venue_id, mode, q, 'pre_trade_futures_to_spot'), None)
                                 else:
-                                    log_event(db, f'Pre-trade futures→spot {q} rebalance failed: {err[:200]}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                                    _log_transfer_error(
+                                        db, gateway.venue_id, mode, q, 'pre_trade_futures_to_spot', err,
+                                        f'Pre-trade futures→spot {q} rebalance failed: {err[:200]}',
+                                    )
                             else:
                                 move = sf - midpoint
                                 ok, err = gateway.transfer_spot_to_futures(move, paper, asset=q)
@@ -1576,8 +1611,12 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                                     spot_free_by_q[q] = sf - move
                                     fut_free_by_q[q] = ff + move
                                     log_event(db, f'Pre-trade rebalance: {move:.2f} {q} spot→futures (equalize wallets so both legs can fund)', mode=mode, exchange=gateway.venue_id)
+                                    _TRANSFER_ERROR_CACHE.pop((gateway.venue_id, mode, q, 'pre_trade_spot_to_futures'), None)
                                 else:
-                                    log_event(db, f'Pre-trade spot→futures {q} rebalance failed: {err[:200]}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                                    _log_transfer_error(
+                                        db, gateway.venue_id, mode, q, 'pre_trade_spot_to_futures', err,
+                                        f'Pre-trade spot→futures {q} rebalance failed: {err[:200]}',
+                                    )
 
                     # Diversity: skip any candidate whose base asset we already hold open
                     # in this mode. Avoids piling more capital into the same name even
@@ -2076,8 +2115,12 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                         ok, err = gateway.transfer_futures_to_spot(amt, paper, asset=q)
                         if ok:
                             log_event(db, f'Drained {amt:.2f} {q} futures→spot (kept {keep:.2f} as margin buffer; {len(open_ps_q)} {q} pos open)', mode=mode, exchange=gateway.venue_id)
+                            _TRANSFER_ERROR_CACHE.pop((gateway.venue_id, mode, q, 'drain_futures_to_spot'), None)
                         else:
-                            log_event(db, f'futures→spot {q} drain failed: {err}', mode=mode, level='WARN', exchange=gateway.venue_id)
+                            _log_transfer_error(
+                                db, gateway.venue_id, mode, q, 'drain_futures_to_spot', err,
+                                f'futures→spot {q} drain failed: {err}',
+                            )
 
             # Dust sweep — convert any non-stable, non-position asset
             # back to USDT so the wallet stays clean. Runs every cycle
