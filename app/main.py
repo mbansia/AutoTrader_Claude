@@ -189,6 +189,170 @@ def health():
     return {'ok': True}
 
 
+def _check_diagnostics_token(token: str | None) -> None:
+    """Constant-time-ish check that the caller passed the expected token.
+    Refuses every request when DIAGNOSTICS_TOKEN env var is unset so the
+    endpoint can't be silently public."""
+    expected = settings.diagnostics_token or ''
+    if not expected:
+        raise HTTPException(status_code=503, detail='diagnostics disabled — set DIAGNOSTICS_TOKEN env var to enable')
+    if not token or token != expected:
+        raise HTTPException(status_code=401, detail='invalid or missing diagnostics token')
+
+
+@app.get('/api/diagnostics')
+def api_diagnostics(token: str | None = None, hours: int = 24):
+    """Structured JSON health snapshot for external monitoring / scheduled
+    diagnostics. Pure read; no side effects. Auth via `?token=...` against
+    settings.diagnostics_token (separate from dashboard credentials so it
+    can be rotated independently).
+
+    The payload is grouped so a downstream rule engine can quickly look
+    for known anomaly patterns:
+        - `cycle_health`: heartbeat, recent errors/warns count
+        - `positions`: per-status counts + per-naked-position age
+        - `wallets`: per-venue per-asset per-wallet-type breakdown
+        - `rejections_grouped`: last-N-hours reject reasons by category
+        - `recent_events`: last 50 WARN/ERROR log entries
+        - `anomalies`: rule-based flags ready for human or LLM review
+
+    Caller passes `hours` to widen / narrow the recent-history windows
+    (default 24h, max 168h)."""
+    _check_diagnostics_token(token)
+    hours = max(1, min(int(hours or 24), 168))
+    since = datetime.utcnow() - timedelta(hours=hours)
+    out: dict = {
+        'generated_at_utc': datetime.utcnow().isoformat() + 'Z',
+        'window_hours': hours,
+    }
+    with SessionLocal() as db:
+        # ─── Cycle heartbeat ──────────────────────────────────────────
+        last_event = db.scalar(select(BotEvent).order_by(desc(BotEvent.id)).limit(1))
+        recent_errors = db.scalars(select(BotEvent).where(BotEvent.ts >= since, BotEvent.level == 'ERROR').order_by(desc(BotEvent.id))).all()
+        recent_warns = db.scalars(select(BotEvent).where(BotEvent.ts >= since, BotEvent.level == 'WARN').order_by(desc(BotEvent.id))).all()
+        out['cycle_health'] = {
+            'last_event_ts': last_event.ts.isoformat() + 'Z' if last_event else None,
+            'last_event_msg': (last_event.message[:240] if last_event else None),
+            'seconds_since_last_event': (datetime.utcnow() - last_event.ts).total_seconds() if last_event else None,
+            'error_count': len(recent_errors),
+            'warn_count': len(recent_warns),
+        }
+        # ─── Positions by status + age ────────────────────────────────
+        pos_rows = db.scalars(select(Position)).all()
+        by_status: dict[str, int] = {}
+        naked_positions: list[dict] = []
+        open_positions: list[dict] = []
+        for p in pos_rows:
+            by_status[p.status] = by_status.get(p.status, 0) + 1
+            if p.status == 'naked_spot':
+                age_min = (datetime.utcnow() - p.opened_at).total_seconds() / 60.0
+                naked_positions.append({
+                    'id': p.id,
+                    'mode': p.mode,
+                    'exchange': p.exchange,
+                    'symbol': p.symbol,
+                    'spot_symbol': p.spot_symbol,
+                    'quantity': float(p.quantity or 0),
+                    'spot_entry_price': float(p.spot_entry_price or 0),
+                    'notional_est': float((p.quantity or 0) * (p.spot_entry_price or 0)),
+                    'age_minutes': round(age_min, 1),
+                })
+            elif p.status == 'open':
+                age_h = (datetime.utcnow() - p.opened_at).total_seconds() / 3600.0
+                open_positions.append({
+                    'id': p.id,
+                    'mode': p.mode,
+                    'exchange': p.exchange,
+                    'symbol': p.symbol,
+                    'perp_symbol': p.perp_symbol,
+                    'quote_currency': p.quote_currency,
+                    'quantity': float(p.quantity or 0),
+                    'spot_entry_price': float(p.spot_entry_price or 0),
+                    'perp_entry_price': float(p.perp_entry_price or 0),
+                    'last_funding_rate': float(p.last_funding_rate or 0),
+                    'funding_interval_h': float(p.funding_interval_hours or 8),
+                    'last_close_error': p.last_close_error or '',
+                    'age_hours': round(age_h, 2),
+                })
+        out['positions'] = {
+            'by_status': by_status,
+            'open': open_positions,
+            'naked': naked_positions,
+        }
+        # ─── Wallets per venue ────────────────────────────────────────
+        wallets: dict = {}
+        for gw in make_gateways():
+            try:
+                wb = gw.wallet_breakdown()
+                wallets[gw.venue_id] = wb
+            except Exception as e:
+                wallets[gw.venue_id] = {'error': str(e)[:160]}
+        out['wallets'] = wallets
+        # ─── Rejections grouped by reason category (last `hours`) ─────
+        recent_rejects = db.scalars(select(RejectedCandidate).where(RejectedCandidate.ts >= since)).all()
+        grouped: dict[str, dict[str, int]] = {}
+        for r in recent_rejects:
+            cat = (r.reason or '').split(' (')[0][:40] or 'unknown'
+            key = f'{r.exchange or "?"}/{r.mode or "?"}'
+            grouped.setdefault(key, {})
+            grouped[key][cat] = grouped[key].get(cat, 0) + 1
+        out['rejections_grouped'] = grouped
+        out['rejections_total'] = len(recent_rejects)
+        # ─── Last 50 WARN/ERROR events for direct inspection ──────────
+        last_problem_events = db.scalars(
+            select(BotEvent)
+            .where(BotEvent.ts >= since)
+            .where(BotEvent.level.in_(('WARN', 'ERROR')))
+            .order_by(desc(BotEvent.id))
+            .limit(50)
+        ).all()
+        out['recent_events'] = [{
+            'ts': e.ts.isoformat() + 'Z',
+            'level': e.level,
+            'exchange': e.exchange,
+            'mode': e.mode,
+            'msg': e.message[:400],
+        } for e in last_problem_events]
+        # ─── Recent trades (last 24h) ─────────────────────────────────
+        recent_trades = db.scalars(
+            select(Trade).where(Trade.ts >= since).order_by(desc(Trade.id)).limit(50)
+        ).all()
+        out['recent_trades'] = [{
+            'ts': t.ts.isoformat() + 'Z',
+            'mode': t.mode,
+            'exchange': t.exchange,
+            'symbol': t.symbol,
+            'venue_leg': t.venue,
+            'side': t.side,
+            'qty': float(t.quantity or 0),
+            'price': float(t.price or 0),
+            'fee': float(t.fee or 0),
+        } for t in recent_trades]
+        out['recent_trades_count'] = len(recent_trades)
+        # ─── Rule-based anomaly flags ─────────────────────────────────
+        anomalies: list[dict] = []
+        # Heartbeat: no cycle event in last hour
+        if last_event and (datetime.utcnow() - last_event.ts).total_seconds() > 3600:
+            anomalies.append({'severity': 'critical', 'rule': 'no_recent_events', 'detail': f'No bot event in last {(datetime.utcnow() - last_event.ts).total_seconds() / 3600:.1f}h'})
+        # Naked spot positions older than 1h
+        for n in naked_positions:
+            if n['age_minutes'] > 60:
+                anomalies.append({'severity': 'warn', 'rule': 'stale_naked_spot', 'detail': f'{n["symbol"]} naked for {n["age_minutes"] / 60:.1f}h (qty={n["quantity"]:.6f}, ~${n["notional_est"]:.2f})'})
+        # No trades in the last 24h despite many scans → entry path stuck
+        if out['recent_trades_count'] == 0 and out['rejections_total'] > 20:
+            anomalies.append({'severity': 'warn', 'rule': 'no_trades_despite_scans', 'detail': f'{out["rejections_total"]} candidates rejected in last {hours}h but ZERO trades executed; entry path likely blocked'})
+        # Persistent errors
+        if len(recent_errors) > 20:
+            anomalies.append({'severity': 'warn', 'rule': 'error_burst', 'detail': f'{len(recent_errors)} ERROR-level events in last {hours}h'})
+        # Stuck open position with last_close_error set
+        for op in open_positions:
+            if op['last_close_error']:
+                anomalies.append({'severity': 'warn', 'rule': 'close_blocked', 'detail': f'{op["symbol"]} pos {op["id"]}: {op["last_close_error"][:160]}'})
+        out['anomalies'] = anomalies
+        out['anomalies_count'] = len(anomalies)
+    return out
+
+
 @app.get('/')
 def root():
     return RedirectResponse(url='/dashboard', status_code=303)

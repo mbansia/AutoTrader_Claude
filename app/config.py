@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     kucoin_api_passphrase: str = Field(default='')
     dashboard_user: str = Field(default='admin')
     dashboard_password: str = Field(default='change-me')
+    # Token guarding /api/diagnostics. Separate from dashboard auth so it
+    # can be rotated independently (e.g. when handing a token to a CI
+    # cron without exposing the human-facing dashboard credentials).
+    # Defaults to empty — the endpoint refuses every request until set.
+    diagnostics_token: str = Field(default='')
     database_url: str = Field(default='sqlite:///./bot.db')
 
 
