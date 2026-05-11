@@ -1398,7 +1398,7 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
                     if fwd_net_apy < cfg.exit_funding_threshold:
                         exit_reason = (f'forward_profit_below_threshold '
                                        f'(net {fwd_net_apy*100:+.2f}% APY < {cfg.exit_funding_threshold*100:.2f}% required, '
-                                       f'live: funding {funding_window_bps:+.1f}bps − basis {rt_basis_bps:.1f}bps − fees {rt_fees_bps:.1f}bps)')
+                                       f'live: funding {funding_window_bps:+.1f}bps + basis_RT {rt_basis_signed_bps:+.1f}bps − fees {rt_fees_bps:.1f}bps)')
                     elif age > timedelta(hours=cfg.max_hold_hours):
                         exit_reason = 'max_hold'
                     if p.spot_entry_price > 0 and p.perp_entry_price > 0 and spot_now and perp_now:
