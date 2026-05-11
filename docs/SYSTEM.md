@@ -206,7 +206,10 @@ Phase C — Entries (when entry_enabled, not at max_open_positions)
       rank passing candidates by funding APY desc
    Wallet prep (live only):
       consolidate_spot_wallets (KuCoin Classic: main/margin/isolated → trade)
-      pre-trade rebalance     (split-wallet venues: equalize spot ↔ futures)
+      pre-trade rebalance     (only when candidates_passing > 0 AND split-
+                                wallet venues: equalize spot ↔ futures.
+                                Gated on candidates so idle cycles don't
+                                shuffle wallets, see §5.2 + PR #33)
       auto-swap USDT↔USDC      (if a same-stable arb is starved)
    For each top-5 candidate:
       skip if base already held (incl. naked_spot)
@@ -475,9 +478,13 @@ Deprecated fields are kept in the schema (additive-only migration policy) but sh
 - `is_unified_margin() → False` (returns `self._is_uta`).
 - Synthesised `spot.<asset>.free = main + trade` (aggregated). Spot orders only execute against `trade`.
 - `consolidate_spot_wallets` sweeps `main` / `margin` / `isolated` → `trade` at the top of every cycle so the abstraction matches reality.
-- `futures.fetch_balance({'currency': cur})` called **per-currency** (default returns USDT only). Fixed in PR #15. `wallet_breakdown` had the same bug — fixed in PR #22 so `/api/diagnostics` reports real USDC futures balance instead of always 0.
-- **Transfer routing — futures→spot must go through the FUTURES client, not the spot client.** `self.spot.transfer('contract','trade',…)` routes to `/api/v3/accounts/universal-transfer`, which on a KuCoin Classic account returns `112002 "Balance insufficient"` even when the futures `availableBalance` is positive — the spot-side "CONTRACT" account-type doesn't see the futures wallet. Use `self.futures.transfer(asset, amt, 'CONTRACT', 'TRADE')` (legacy `/api/v1/transfer-out`) for draining. `transfer_spot_to_futures` (IN direction) keeps using universal-transfer; that path works. Fixed in PR #22.
-- Identical-error dedup: repeated transfer failures with the same message are throttled via `_TRANSFER_ERROR_CACHE` (same pattern as `_CLOSE_ERROR_CACHE`) so the log doesn't flood when a venue-side issue persists.
+- `futures.fetch_balance({'currency': cur})` called **per-currency** (default returns USDT only). Fixed in PR #15. `wallet_breakdown` had the same bug — fixed in PR #29 so `/api/diagnostics` reports real USDC futures balance instead of always 0.
+- **Transfer routing — futures→spot is a TWO-HOP.**
+  - **Step 1** (`CONTRACT → MAIN`): `self.futures.transfer(asset, amt, 'CONTRACT', 'MAIN')` via the futures-side legacy `/api/v1/transfer-out`. The spot-side `/api/v3/accounts/universal-transfer` can't drain the futures wallet and returns `112002 "Balance insufficient"` even when `availableBalance` is positive (PR #29).
+  - **Step 2** (`MAIN → TRADE`): `self._transfer('main', 'trade', amt)` via spot inner-transfer. KuCoin's `transferOut` ignores the `recAccountType=TRADE` hint and always lands funds in `main`; without the hop, funds wait a cycle for `consolidate_spot_wallets` to sweep them — and that's the window the bot's old drain↔rebalance oscillation used to push them straight back into `contract`. The inline hop guarantees a successful return = "funds are spendable on the spot leg right now".
+  - `transfer_spot_to_futures` (IN direction) still uses universal-transfer; that path works.
+  - **Idle-cycle oscillation fix (PR #33)**: the pre-trade rebalance now only runs when `candidates_passing > 0`. Without that gate, every idle cycle reshuffled the same dollars through `contract → main → trade → contract …` and produced a ~21k-event/24h log storm of identical transfer failures.
+- Identical-error dedup: repeated transfer failures with the same message are throttled via `_TRANSFER_ERROR_CACHE` (same pattern as `_CLOSE_ERROR_CACHE`).
 - `pool` (KuCoin Earn) is time-locked; never swept.
 
 ### 5.3 KuCoin UTA (not active today)
@@ -646,7 +653,7 @@ Separate Claude session. Reads this doc on every wake-up. Subscribes to the trac
 | Stale `naked_spot` (spot disappeared from wallet) | Stale reconciliation at top of recovery | Auto-mark `closed` (PR #30) |
 | Wallet starvation | `below min position pct` rejection | `wallet_breakdown` diagnostic surfaces stranded funds |
 | Book moves during round-trip | `spot_ioc_zero_fill` / `perp_ioc_zero_fill` | Reject, retry next cycle |
-| KuCoin futures→spot drain `112002` | Post-cycle drain WARN | **Fixed in PR #22.** Spot-side universal-transfer can't drain the Futures wallet on KuCoin Classic; switched to `self.futures.transfer(…, 'CONTRACT', 'TRADE')` via legacy `/api/v1/transfer-out`. Repeated identical transfer failures now deduped via `_TRANSFER_ERROR_CACHE`. |
+| KuCoin futures→spot drain `112002` / `250001` / wallet oscillation | Post-cycle drain WARN repeating every cycle on idle accounts (21k+/24h) | **Resolved across PR #29 + PR #33.** Three layers: (1) **routing** — switched from spot-side universal-transfer to `self.futures.transfer('CONTRACT', 'MAIN')` via legacy `/api/v1/transfer-out`; (2) **two-hop** — append `main → trade` via spot inner-transfer so funds land where the spot order book can spend them; (3) **idle-cycle gate** — pre-trade rebalance only fires when `candidates_passing > 0`, breaking the drain↔rebalance oscillation. Persistent failures are deduped via `_TRANSFER_ERROR_CACHE`. |
 | Symbol drift across ccxt versions | Exit funding miss WARN | Falls back to stale `last_funding_rate`; logged. |
 | Loop crash | Outer `try/except` in `run_one_cycle` | Logged as ERROR; loop continues next cycle. |
 
@@ -734,7 +741,7 @@ Reviewers reject PRs that change behavior without updating this doc. When in dou
 - **Maker-on-exit fee optimization** not implemented. ~30% of exit fees could be saved with post-only-with-timeout-fallback.
 - **Symbol mapping drift** across ccxt versions could leave open positions un-lookupable for exit funding refresh. Currently logs a WARN and falls back to stale `last_funding_rate`.
 - **Cross-venue + onchain strategies** are roadmap, not implemented.
-- ~~KuCoin `futures→spot` drain 112002~~ **resolved in PR #22** (routing fix, see §5.2).
+- ~~KuCoin `futures→spot` drain 112002 / 250001 / oscillation~~ **resolved in PR #29 (routing) + PR #33 (two-hop + idle-cycle gate)** — see §5.2.
 
 ---
 
@@ -744,8 +751,10 @@ Append-only. Format: `YYYY-MM-DD · PR# · §sections touched · summary`.
 
 | Date | PR | Sections | Summary |
 |---|---|---|---|
-| 2026-05-11 | #31 | rewrite | SYSTEM.md v1.0 — full rewrite after operator audit. Definitions upfront, per-strategy SOP + math, config layers explained, deprecated fields called out, exit-logic regression `rt_basis_bps` → `rt_basis_signed_bps` fixed alongside. Merged with PR #22's KuCoin futures→spot transfer routing fix during rebase. |
-| 2026-05-11 | #22 (parallel session) | §5.2, §9, §13 | KuCoin futures→spot drain uses `self.futures.transfer(…, 'CONTRACT', 'TRADE')` (legacy `/api/v1/transfer-out`) instead of spot-side universal-transfer. Identical-error dedup via `_TRANSFER_ERROR_CACHE`. Resolves the 112002 deferred item. |
+| 2026-05-11 | #33 | §3.1, §5.2, §9, §13 | Break KuCoin drain↔rebalance oscillation. (1) Gate pre-trade rebalance on `candidates_passing > 0` (no point equalising wallets when there's no trade to fund). (2) `transfer_futures_to_spot` is now a two-hop: futures `CONTRACT → MAIN` via `transferOut`, then spot `MAIN → TRADE` via inner-transfer. Funds land where the spot order book can spend them without waiting a cycle for `consolidate_spot_wallets`. |
+| 2026-05-11 | #32 | tooling | `diagnostics_post.py`: post heartbeat comment **before** body edit, make body edit non-fatal, trim payload. Body-too-large 504s no longer block the comment, which is what fires the monitor chat webhook. |
+| 2026-05-11 | #31 | rewrite | SYSTEM.md v1.0 — full rewrite after operator audit. Definitions upfront, per-strategy SOP + math, config layers explained, deprecated fields called out, exit-logic regression `rt_basis_bps` → `rt_basis_signed_bps` fixed alongside. |
+| 2026-05-11 | #29 | §5.2, §9, §13 | KuCoin futures→spot drain uses the futures-side `transferOut` endpoint (legacy `/api/v1/transfer-out`) instead of the spot-side universal-transfer (which can't see the futures wallet). `wallet_breakdown` USDC contract under-report fixed. Identical-error dedup via `_TRANSFER_ERROR_CACHE`. Resolved the 112002 deferred item. *(The v1.0 rewrite's first draft mis-credited this as "PR #22" — corrected here.)* |
 | 2026-05-11 | #30 | §6.2, §9 | Don't render fake perp leg for `naked_spot`; auto-close stale naked rows. |
 | 2026-05-11 | #27 | §7, §10, §11 | Heartbeat-model diagnostics tracker. Monitor always knows the cron ran. |
 | 2026-05-11 | #26 | §2 | Vultr specs + KuCoin permissions clarification + backup-risk callout. |
