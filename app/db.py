@@ -118,6 +118,13 @@ def run_schema_migrations() -> None:
     # bot.py get_strategy_config().
     _add_column_if_missing('strategy_config', 'entry_min_net_apy', 'FLOAT NOT NULL DEFAULT 0.20')
     _add_column_if_missing('strategy_config', 'exit_min_net_apy', 'FLOAT NOT NULL DEFAULT 0.05')
+    # Per-strategy config table (one row per trade_type). Bot's
+    # _get_or_seed_strategy_overrides() auto-creates a row on first read
+    # by copying the global StrategyConfig values; subsequent edits via
+    # /config can target individual strategies. Table is created via
+    # Base.metadata.create_all() at startup — the call below only handles
+    # the additive ALTERs the bot's migration policy uses. No-op if the
+    # table doesn't yet exist (create_all handles it).
     # Cross-venue tag — every per-row table carries an ``exchange`` column so
     # the dashboard, logs, scans, and exports can break down state by venue
     # without ambiguity. Default 'binance' on every existing row guarantees

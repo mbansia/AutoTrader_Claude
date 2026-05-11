@@ -66,7 +66,9 @@ from app.models import (
     RejectedCandidate,
     RuntimeState,
     ScanResult,
+    PER_STRATEGY_FIELDS,
     StrategyConfig,
+    StrategyConfigPerStrategy,
     Trade,
     venue_to_trade_type,
 )
@@ -223,13 +225,70 @@ def _accrue_paper_funding(db, gateway, mode: str) -> None:
 _LEGACY_PERIOD_SENTINEL = 0.005
 
 
-def get_strategy_config(db) -> StrategyConfig:
+class MergedConfig:
+    """Per-strategy view onto the merged (global + strategy-specific) config.
+
+    Attribute access first checks the per-strategy row (``StrategyConfigPerStrategy``)
+    for fields in ``PER_STRATEGY_FIELDS``; everything else falls through to
+    the global ``StrategyConfig`` singleton. Writes go to whichever side
+    owns the field, which keeps `cfg.foo = bar` semantics consistent.
+
+    This means call sites that previously did ``cfg = get_strategy_config(db)``
+    + ``cfg.entry_min_net_apy`` continue to work — they just need to pass a
+    ``trade_type`` so the right per-strategy row is selected.
+    """
+    __slots__ = ('_global', '_per_strategy')
+
+    def __init__(self, global_cfg: StrategyConfig, per_strategy: StrategyConfigPerStrategy):
+        object.__setattr__(self, '_global', global_cfg)
+        object.__setattr__(self, '_per_strategy', per_strategy)
+
+    def __getattr__(self, name: str):
+        # Only reached when normal attribute resolution misses, i.e. for
+        # fields not on MergedConfig itself.
+        if name in PER_STRATEGY_FIELDS:
+            return getattr(self._per_strategy, name)
+        return getattr(self._global, name)
+
+    def __setattr__(self, name: str, value):
+        if name in PER_STRATEGY_FIELDS:
+            setattr(self._per_strategy, name, value)
+        else:
+            setattr(self._global, name, value)
+
+
+def _get_or_seed_strategy_overrides(db, trade_type: str, global_cfg: StrategyConfig) -> StrategyConfigPerStrategy:
+    """Locate the per-strategy row for ``trade_type``, or create it by
+    copying values from the global ``StrategyConfig``. First-cycle seed
+    after the migration lands; subsequent edits via /config can target
+    this row directly to specialise the strategy."""
+    row = db.scalar(select(StrategyConfigPerStrategy).where(StrategyConfigPerStrategy.trade_type == trade_type))
+    if row is not None:
+        return row
+    seeded = {field: getattr(global_cfg, field) for field in PER_STRATEGY_FIELDS}
+    row = StrategyConfigPerStrategy(trade_type=trade_type, **seeded)
+    db.add(row)
+    db.flush()
+    log_event(db, f'Seeded per-strategy config for {trade_type} from global StrategyConfig (entry_min_net_apy={row.entry_min_net_apy:.4f}, exit_min_net_apy={row.exit_min_net_apy:.4f})', mode=MODE_PAPER, exchange='system')
+    return row
+
+
+def get_strategy_config(db, trade_type: str | None = None) -> StrategyConfig | MergedConfig:
+    """Return the runtime strategy config. When ``trade_type`` is None,
+    returns the global ``StrategyConfig`` singleton (back-compat for call
+    sites that read non-per-strategy fields). When ``trade_type`` is
+    given, returns a ``MergedConfig`` view that resolves per-strategy
+    fields from ``StrategyConfigPerStrategy`` and everything else from
+    the global row."""
     cfg = db.scalar(select(StrategyConfig).where(StrategyConfig.id == 1))
     if cfg is None:
         cfg = StrategyConfig(id=1)
         db.add(cfg)
         db.flush()
-        return cfg
+        if trade_type is None:
+            return cfg
+        per = _get_or_seed_strategy_overrides(db, trade_type, cfg)
+        return MergedConfig(cfg, per)
     # One-shot legacy threshold migration, gated by a PERSISTED schema
     # version so it runs exactly once per row regardless of how many
     # times get_strategy_config() is called and regardless of any
@@ -269,7 +328,10 @@ def get_strategy_config(db) -> StrategyConfig:
         cfg.config_schema_version = 2
         log_event(db, f'Migrated threshold names v1→v2: entry_min_net_apy={cfg.entry_min_net_apy:.4f}, exit_min_net_apy={cfg.exit_min_net_apy:.4f} (old entry_funding_threshold / exit_funding_threshold columns retained for back-compat but no longer read)', mode=MODE_PAPER, exchange='system')
         db.flush()
-    return cfg
+    if trade_type is None:
+        return cfg
+    per = _get_or_seed_strategy_overrides(db, trade_type, cfg)
+    return MergedConfig(cfg, per)
 
 
 def record_trade(db, position_id: int | None, mode: str, symbol: str, venue: str, side: str, qty: float, order: dict, exchange: str = VENUE_BINANCE, trade_type: str | None = None):
@@ -1225,7 +1287,11 @@ def run_one_cycle_for_mode(gateway: VenueGateway, mode: str) -> None:
             # via /config picks up on the next iteration without restart.
             if not venue_is_active(db, gateway.venue_id):
                 return
-            cfg = get_strategy_config(db)
+            # Per-strategy config: every gateway maps to one trade_type, so
+            # the merged config view (global + that strategy's overrides) is
+            # what every read inside this cycle should use. See SYSTEM.md §4.
+            trade_type = venue_to_trade_type(gateway.venue_id)
+            cfg = get_strategy_config(db, trade_type=trade_type)
             mstate = get_mode_state(db, mode)
 
             # Paper-mode funding income accrual on open positions (live is auto-credited

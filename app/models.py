@@ -352,6 +352,74 @@ class StrategyConfig(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class StrategyConfigPerStrategy(Base):
+    """Per-strategy config overrides. One row per ``trade_type``.
+
+    The bot reads strategy-specific fields from here. If a row doesn't exist
+    for a given trade_type, the runtime seeds one by copying values from
+    the global StrategyConfig. After seeding, edits to /config can target a
+    specific strategy (or all of them) without changing the global row.
+
+    Fields that apply UNIFORMLY across strategies (process-level like
+    loop_seconds, account-level like max_open_positions, mode-level like
+    paper_starting_equity, and switches like delisting_check / enforce_hedge_check)
+    stay on the singleton StrategyConfig. Everything below has been split
+    out because different strategies have meaningfully different risk
+    profiles or execution mechanics.
+
+    See SYSTEM.md §4 for the full per-strategy vs global split rationale.
+    """
+    __tablename__ = 'strategy_config_per_strategy'
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # Unique per trade_type. Composite-pk-style enforcement via index + the
+    # auto-seed path in bot.get_strategy_config() never creating duplicates.
+    trade_type: Mapped[str] = mapped_column(String(48), unique=True, index=True)
+
+    # Thresholds (net-APY, decimal)
+    entry_min_net_apy: Mapped[float] = mapped_column(Float, default=0.20)
+    exit_min_net_apy: Mapped[float] = mapped_column(Float, default=0.05)
+
+    # Basis modelling
+    exit_basis_buffer_multiple: Mapped[float] = mapped_column(Float, default=3.0)
+    max_exit_basis_bps: Mapped[float] = mapped_column(Float, default=5.0)
+
+    # Risk
+    stop_loss_pct: Mapped[float] = mapped_column(Float, default=-0.02)
+    max_hold_hours: Mapped[int] = mapped_column(Integer, default=72)
+
+    # Sizing
+    min_position_pct: Mapped[float] = mapped_column(Float, default=0.005)
+    max_position_pct: Mapped[float] = mapped_column(Float, default=0.10)
+
+    # Execution
+    entry_tick_buffer_bps: Mapped[float] = mapped_column(Float, default=1.0)
+    exit_tick_buffer_bps: Mapped[float] = mapped_column(Float, default=2.0)
+    perp_leverage: Mapped[int] = mapped_column(Integer, default=1)
+    max_perp_leverage: Mapped[int] = mapped_column(Integer, default=1)
+
+    # Wallet
+    auto_transfer_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    auto_quote_swap_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    futures_buffer_pct: Mapped[float] = mapped_column(Float, default=0.20)
+
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+# Names of the fields that live on StrategyConfigPerStrategy. Used by
+# MergedConfig and the form handler to know which fields belong to the
+# per-strategy row vs the global row. Keep in sync with the class above.
+PER_STRATEGY_FIELDS: tuple[str, ...] = (
+    'entry_min_net_apy', 'exit_min_net_apy',
+    'exit_basis_buffer_multiple', 'max_exit_basis_bps',
+    'stop_loss_pct', 'max_hold_hours',
+    'min_position_pct', 'max_position_pct',
+    'entry_tick_buffer_bps', 'exit_tick_buffer_bps',
+    'perp_leverage', 'max_perp_leverage',
+    'auto_transfer_enabled', 'auto_quote_swap_enabled',
+    'futures_buffer_pct',
+)
+
+
 class BalanceSnapshot(Base):
     """Per-cycle, per-(mode, venue) snapshot of the wallet balances. The
     dashboard reads the latest row per venue and sums to get the live total.
