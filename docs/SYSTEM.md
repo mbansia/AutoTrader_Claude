@@ -438,6 +438,10 @@ SQLite by default (`bot.db`). Schema is defined in `app/models.py`; lightweight 
 
 `OPEN_STATUSES = ('open', 'naked_spot')` is used by every "currently exposed" query so naked positions never disappear from the portfolio view.
 
+**Rendering rule for `naked_spot`**: the perp leg of a `naked_spot` Position has `perp_entry_price = 0` because no perp short was ever filled (that's what makes it naked). The dashboard suppresses the perp-leg detail card for these rows and shows a "never opened (phantom spot)" tag instead, so no fabricated entry-price / MTM-PnL numbers appear. The spot-leg detail card is real.
+
+**Stale reconciliation**: `recover_phantom_spot` runs a stale-naked-spot pass at the top of every live cycle. Any `naked_spot` Position whose underlying spot balance is gone from the wallet (sold externally, dust-converted by a prior cycle, venue Earn redemption, etc.) gets marked `closed` with `last_close_error = 'spot leg disappeared from wallet …'`. This stops the row from lingering in the open table indefinitely.
+
 ### 7.3 Migration policy
 
 - Additive only — never drop columns. Code may stop reading a column; the column stays for back-compat.
