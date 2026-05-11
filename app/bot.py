@@ -610,6 +610,23 @@ def recover_phantom_spot(db, gateway: VenueGateway, mode: str, cfg: StrategyConf
             Position.exchange == gateway.venue_id,
         )).all()
     }
+    # Stale naked_spot reconciliation: any naked_spot Position whose
+    # underlying spot balance is no longer in the wallet got resolved
+    # outside our control (operator manually sold, dust-conversion swept
+    # in a previous cycle, venue Earn auto-redeem, etc.). Close those
+    # rows so the dashboard stops showing them as "open but both legs
+    # flat" — which is what the operator saw on the GTC case 2026-05-11.
+    for asset, pos in naked_already.items():
+        bal_row = spot_assets.get(asset) or {}
+        free = float(bal_row.get('free') or 0)
+        total = float(bal_row.get('total') or 0)
+        if free + total <= 1e-8:
+            pos.status = 'closed'
+            if not pos.last_close_error:
+                pos.last_close_error = 'spot leg disappeared from wallet (sold externally or by an earlier cycle); position auto-closed'
+            db.flush()
+            log_event(db, f'Stale naked_spot reconciled: {asset} no longer in spot wallet — marked closed', mode=mode, exchange=gateway.venue_id)
+
     # Binance's spot.fetch_balance() returns pseudo-assets that aren't
     # tradable spot tokens: LD<asset> = Locked/Earn balance, BFRB<asset> =
     # Flexible Reward, etc. We never want to "recover" these because they

@@ -315,9 +315,18 @@
         <div class="leg-title">
           <span class="tag bad">PERP · short</span>
           <span class="mono">{{ r.perp_leg.symbol }}</span>
-          {% if r.perp_alive %}<span class="tag good" style="font-size:10px;">on-chain · {{ '%.6f' % r.perp_actual }}</span>
+          {% if r.status == 'naked_spot' %}<span class="tag bad" style="font-size:10px;">never opened (phantom spot)</span>
+          {% elif r.perp_alive %}<span class="tag good" style="font-size:10px;">on-chain · {{ '%.6f' % r.perp_actual }}</span>
           {% else %}<span class="tag bad" style="font-size:10px;">flat (closed externally?)</span>{% endif %}
         </div>
+        {% if r.status == 'naked_spot' %}
+        <div class="muted" style="padding:8px 12px;font-size:12px;">
+          No perp leg was opened. This row is a <strong>naked_spot</strong>: the spot fill on the left landed
+          (likely a partial fill under <code>spot_buy_error</code>) but the matching perp short never executed.
+          The bot will try to hedge it on the next live cycle, or sell the spot back to USDT if the hedge isn't
+          profitable. Any "entry price" / "MTM" numbers for this leg would be fabricated, so they're hidden.
+        </div>
+        {% else %}
         <table class="leg-table">
           <tr><th>Quantity</th><td class="num">{{ '%.6f' % r.perp_leg.qty }}</td></tr>
           <tr><th>Entry price</th><td class="num">{{ '%.6f' % r.perp_leg.entry_price }} USDT</td></tr>
@@ -330,6 +339,7 @@
           <tr><th>Funding earned</th><td class="num {{ 'good' if r.perp_leg.funding_income >= 0 else 'bad' }}">{{ '%+.4f' % r.perp_leg.funding_income }} USDT</td></tr>
           <tr><th>Filled at</th><td class="muted mono">{{ r.perp_leg.entry_ts }}</td></tr>
         </table>
+        {% endif %}
       </div>
     </div>
   </div>
