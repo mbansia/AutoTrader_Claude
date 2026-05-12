@@ -2,7 +2,7 @@
 
 The single living source of truth for what this bot does and how it works. Every behavior-changing PR updates the relevant section in the same commit. The diagnostics-monitor chat re-reads this on every wake-up before judging anomalies; any new dev reads it once to onboard.
 
-> Status: **v1.1** — 2026-05-12 naked-direction symmetry audit (v1.0 → v1.1). See changelog §15.
+> Status: **v1.2** — 2026-05-12 implementer-gap audit (v1.1 → v1.2). Tier-A gaps closed inline; Tier B + C catalogued in §18. See changelog §15.
 
 ## How to read this doc
 
@@ -42,6 +42,7 @@ If a sentence in any section uses a term, that term is in §0. If it isn't, **th
 - [15. Changelog](#15-changelog)
 - [16. Learnings](#16-learnings)
 - [17. Rewrite plan](#17-rewrite-plan-core--ui-from-scratch)
+- [18. Open implementation gaps](#18-open-implementation-gaps-for-the-next-audit-pass)
 
 ---
 
@@ -174,6 +175,20 @@ Different venues bundle balances differently. The bot abstracts over this but th
 | **Anomaly** | A rule-based flag produced by the diagnostics endpoint when the bot's state diverges from healthy steady-state — e.g. no events in the last hour, naked leg (spot or perp) older than 1 hour, error burst, etc. |
 | **Heartbeat tracker** | A persistent GitHub issue that the diagnostics cron updates every 3 hours regardless of anomaly state. Posting a comment per run guarantees a webhook fires every cycle so the monitor chat can confirm "the bot's still alive". |
 | **Monitor chat** | A dedicated Claude session subscribed to the heartbeat tracker. Reads this doc on every wake-up before judging anomalies. Responds inline on the tracker with one-line acknowledgements on clean runs, full diagnosis on anomaly runs, or PRs when it detects a code regression. |
+
+### 0.10 Implementation primitives (the stack this spec assumes)
+
+The spec is intentionally code-agnostic in §3 onward, but a from-scratch implementer needs to know which stack the operational details were written against. Picking a different stack is allowed, but the venue quirks in §6 and §16 L11 are described in ccxt's vocabulary and will need re-derivation.
+
+| Layer | Choice | Why it matters |
+|---|---|---|
+| **Language** | Python 3.11+ | Every formula, error class, datetime, and concurrency primitive in this doc assumes Python semantics. |
+| **Venue SDK** | **ccxt** (unified spot + futures wrappers) | The "venue quirks" catalog (KuCoin `limit=20|100`, Binance PM `/papi/v1`, two-hop transfer, `LDUSDT` filter) are documented as ccxt deviations. A non-ccxt rewrite must re-discover these from venue docs. |
+| **Web framework** | FastAPI + Jinja2 templates, no SPA | §5 page taxonomy + form-handling conventions assume server-rendered HTML with `Depends(auth)` dependency injection. |
+| **DB / ORM** | SQLite + SQLAlchemy (declarative `Base`), additive migrations applied at startup | §7 schema is written as SQLAlchemy column types; `DATABASE_URL` env var swaps the backend. |
+| **Concurrency** | One in-process loop thread per (mode, gateway). No multi-process, no async venues. | The bot relies on serialised access to ccxt clients and the SQLite write path. |
+| **Datetime discipline** | All persisted timestamps are **UTC-aware** (`datetime.now(timezone.utc)`); all `/api/diagnostics` outputs use ISO-8601 with `Z` suffix. Never use naive `datetime.now()` — silently corrupts time-based queries on hosts whose locale isn't UTC. | |
+| **No JS build step** | Vanilla JS in `app/static/`; Nixpacks runs a Node phase that does nothing | Keeps the deploy story trivial; a from-scratch UI should preserve this. |
 
 ---
 
@@ -320,10 +335,39 @@ Still rejected at per-window accounting. The signal: under a *strictly* per-wind
 Loop period: globally configured (default 30s). Runs separately for paper and live mode, on each active venue.
 
 ```
-Phase A — Safety (live only)
+Phase A — Safety (live only — but paper mode still runs the READ-ONLY
+                 portions: venue probes, balance fetches, state inspection;
+                 only ORDER PLACEMENT is paper-side synthetic)
    For each open position:
-      market-health check     → if market is delisted/halted, force-close both legs
-      hedge-integrity check   → if one leg has disappeared from the venue, close the surviving leg
+      market-health check     → if the venue reports the perp's market as
+                                delisted, halted, or missing from the live
+                                markets list, force-close both legs via the
+                                normal close path (limit-IOC at worst-walked
+                                price + exit_tick_buffer_bps — same path as a
+                                voluntary exit, never a market order)
+      hedge-integrity check   → detection rule:
+                                  spot leg present iff
+                                    spot_wallet[base].free + .used ≥ qty − ε
+                                  perp leg present iff
+                                    a non-zero open-perp position exists on
+                                    the venue for perp_symbol with the same
+                                    sign and qty within ε
+                                If exactly ONE leg is present → close the
+                                surviving leg (same limit-IOC close path);
+                                mark the position closed with last_close_error
+                                describing which leg vanished.
+                                If BOTH legs missing → mark closed (orphan
+                                cleanup; the position rowed-out via two
+                                external interventions).
+   Maintenance-mode handling (if mode_state.maintenance_mode is true):
+      For every currently-exposed position (status in OPEN_STATUSES):
+        run the normal close path (limit-IOC, profitability deferral DISABLED
+        because maintenance is a mandatory exit). Skip the profitability gate
+        and the deferral logic; the operator wants out.
+        DO NOT use market orders — slippage on thin books would burn the
+        operator. Limit-IOC with the exit tick buffer is the right tool even
+        in maintenance.
+        Entries are blocked for the duration (no Phase C).
    Phantom-leg recovery (sweep BOTH wallets, look for orphaned legs in either
    direction — naked spot AND naked perp are symmetric failure modes):
       ① Stale reconciliation   any naked-spot or naked-perp position whose
@@ -507,20 +551,34 @@ Voluntary exits (forward profit, max-hold) **defer** for one cycle when the live
 
 The matching engine on both venues reserves `qty × limit_price` (not avg-fill price) from the trade wallet when a limit-IOC buy lands. The limit price is `worst_walked_price + tick_buffer`, which is strictly above the average fill. Sizing `target_qty` purely against `sized_notional / mid_price` overflows the wallet's free balance on thin books and causes mid-fill "balance insufficient" errors with partial-fill exposure.
 
+**Worst-walked price** is defined precisely: walk the order book level-by-level until cumulative size ≥ `target_qty`; record the price at the **deepest** level touched (worst for the side being placed — highest for a buy, lowest for a sell). This is the price the matching engine will actually charge on the marginal unit, not the average fill.
+
 The walk loop converges by clamping `target_qty` every pass:
 
 ```
-spot_limit  = spot_worst_price × (1 + tick_buffer / 10⁴)
-perp_limit  = perp_worst_price × (1 − tick_buffer / 10⁴)
+spot_limit_raw = spot_worst_price × (1 + tick_buffer / 10⁴)
+perp_limit_raw = perp_worst_price × (1 − tick_buffer / 10⁴)
+
+# Tick-rounding is MANDATORY before order submission — venues reject
+# off-tick prices outright. Round CONSERVATIVELY for each side:
+#   buy  → round UP   to next tick (overpay slightly, still IOC)
+#   sell → round DOWN to next tick (underprice slightly, still IOC)
+# "Conservative" here means "in the direction that costs us the tick".
+spot_limit  = round_up_to_tick(spot_limit_raw, spot_tick_size)
+perp_limit  = round_down_to_tick(perp_limit_raw, perp_tick_size)
 
 max_qty_by_spot_balance = (spot_leg_free × safety_factor) / spot_limit
 max_qty_by_perp_balance = (perp_leg_free × safety_factor × leverage) / perp_limit
 
 target_qty = min(target_qty, spot_book_fillable, perp_book_fillable,
                  max_qty_by_spot_balance, max_qty_by_perp_balance)
+
+# Quantity also has a venue lot-size step; floor target_qty to it
+# AFTER all clamping so reservation math uses the final submitted qty.
+target_qty = floor_to_lot_step(target_qty, lot_step)
 ```
 
-The safety factor (~0.99) absorbs fee accrual and rounding. Up to 4 passes; walks re-execute when target_qty shrinks so the profitability gate downstream sees fill prices for the FINAL (post-clamp) size, not pre-clamp.
+The safety factor (~0.99) absorbs fee accrual and rounding. Up to 4 passes; walks re-execute when target_qty shrinks so the profitability gate downstream sees fill prices for the FINAL (post-clamp, post-rounded) size, not pre-clamp.
 
 #### Per-strategy config that applies
 
@@ -995,7 +1053,30 @@ Legacy columns retained for back-compat (no longer read): `entry_funding_thresho
 
 - **Additive only.** Never drop columns. Code may stop reading a column; the column stays.
 - New columns get a sensible `DEFAULT`. Idempotent.
-- One-shot value transforms gated by `config_schema_version` so they run exactly once per row regardless of restarts.
+- One-shot value transforms gated by `config_schema_version` so they run exactly once per row regardless of restarts. The cursor lives on the global `strategy_config` row only — per-strategy rows inherit the global version.
+
+### 7.4 Timestamp discipline
+
+- Every datetime column persists **UTC-aware** values. Construct with `datetime.now(timezone.utc)`, never with `datetime.now()` (naive, local — corrupts every time-based filter on a non-UTC host).
+- Every datetime emitted by `/api/diagnostics` is ISO-8601 with the `Z` suffix.
+- Migrations that backfill datetime defaults (e.g. `'1970-01-01 00:00:00'`) MUST treat the sentinel as UTC.
+- Comparisons (`utcnow() - ts`) require both sides to be aware; mixing aware + naive raises `TypeError` and breaks the cycle loop.
+
+### 7.5 `capital_flows.external_id` construction
+
+The column must be **UNIQUE** so re-ingesting venue history is idempotent. Construction rule (per venue, per flow type):
+
+| Venue | Flow type | `external_id` source |
+|---|---|---|
+| Binance | Deposit | `binance:deposit:<txId>` |
+| Binance | Withdrawal | `binance:withdrawal:<id>` (venue-side id; `txId` may be empty for in-flight) |
+| Binance | Sub-transfer | `binance:subtransfer:<tranId>` |
+| Binance | Universal transfer | NOT INGESTED — intra-account moves are not capital flows (see §6.1 / §10 cleanup) |
+| KuCoin | Deposit | `kucoin:deposit:<id>` (history endpoint id, not txid) |
+| KuCoin | Withdrawal | `kucoin:withdrawal:<id>` |
+| KuCoin | Inter-sub-account transfer | `kucoin:subtransfer:<id>` |
+
+The prefix `<venue>:<flow_type>:` guarantees disambiguation across venues even when raw ids collide. Auto-ingested rows without a sourceable external id are skipped (logged at INFO) — they're picked up the next time the venue history pages back through them.
 
 ---
 
@@ -1284,6 +1365,7 @@ No external crons beyond these.
 - New `/api/*` endpoint or anomaly rule → §8.
 - New rejection category or log pattern → §9.
 - New failure mode + recovery → §10.
+- Closing an item from §18 → delete the row from §18 in the same PR that lands the resolution (the resolved behavior lives in its proper section now).
 
 Reviewers reject PRs that change behavior without updating this doc. When in doubt, add a one-liner — better to over-document than under.
 
@@ -1308,6 +1390,7 @@ Append-only. Format: `YYYY-MM-DD · PR# · §sections touched · summary`.
 
 | Date | PR | Sections | Summary |
 |---|---|---|---|
+| 2026-05-12 | doc | §0.10, §3.1 SOP + math, §7.3/4/5, §18 (new) | Implementer-gap audit (v1.1 → v1.2). Added §0.10 stack assumptions (Python / FastAPI / ccxt / SQLAlchemy / UTC-aware datetimes). Math: defined "worst-walked price"; mandated tick-rounding + lot-step flooring with explicit conservative-rounding direction per side. SOP: detailed hedge-integrity detection rule, maintenance-mode mechanics (limit-IOC, never market), paper-mode probe-vs-order delineation. §7.3 cursor placement; new §7.4 timestamp discipline; new §7.5 `external_id` construction table. New §18 enumerates Tier B (strategy-correctness) and Tier C (polish) gaps that the spec is still silent on. |
 | 2026-05-12 | doc | §0.3, §0.4, §3.1 SOP, §7.1.1, §7.2, §8.1, §8.2, §9.2, §10, §16 L03/L16/L21/L32 | Naked-direction symmetry audit. Added `naked_perp` as a first-class position status alongside `naked_spot`. Phantom-leg recovery sweep symmetrised across both directions. Dashboard rendering rule generalised: missing-leg suppression keyed on status. New `stale_naked_perp` anomaly + log patterns. `NakedPosition` JSON carries a `status` field + uses `leg_entry_price`. L21 explicitly direction-neutral. Concrete-example math cleaned up (no more "actually wait" in spec text). |
 | 2026-05-11 | #35 | §4, §14 | Per-strategy config split: new `StrategyConfigPerStrategy` table (one row per trade_type) holds strategy-specific fields (thresholds, sizing, execution, wallet). `StrategyConfig` keeps account/process/mode-level globals. `MergedConfig` proxy lets bot.py call sites read transparently — pass `trade_type` to `get_strategy_config()`. `/config` gets a strategy tab selector; POSTs route per-strategy fields to the active tab's row, global fields to the singleton. Per-strategy rows lazily seeded from global on first read. |
 | 2026-05-11 | #34 | §0, §3.1 math, §4, §14 | Renamed `entry/exit_funding_threshold` → `entry/exit_min_net_apy` (config_schema_version v1→v2 migration). Removed deprecated form fields (`max_entry_basis_bps`, `min_24h_quote_volume`, `min_order_book_depth_usdt`, `depth_band_bps`). Form accepts both new and legacy field names for one release cycle. |
@@ -1586,6 +1669,40 @@ Estimates assume the rewrite is the only ongoing work. Concurrent feature develo
 ### 17.7 Status
 
 Pre-Stage-0. Awaiting operator go-ahead.
+
+---
+
+## 18. Open implementation gaps (for the next audit pass)
+
+Catalogued from the "if a from-scratch coding agent built this with only the spec, where would it mess up?" review (2026-05-12). Tier A items have been closed inline above; Tier B and C remain TODOs. Each item is a place where the spec is silent or hand-wavy enough that two different implementers would build incompatible behaviors.
+
+### Tier B — strategy correctness gaps (resolve before the rewrite)
+
+| Gap | Where in spec | Resolution direction |
+|---|---|---|
+| **Funding accrual formula not written** | §0.5 "Funding income" defines the concept; §7.1.1 `funding_income_accrued` + `last_funding_accrual_ts` columns exist. Update rule per cycle is not specified. | Paper: `Δaccrued = position_notional × current_funding_rate × min(1, elapsed_since_last_accrual / funding_interval)`. Live: derive from per-cycle delta of the futures wallet's funding-history endpoint, attributed by symbol. Document both. |
+| **Cross-stable arb sizing formula** | §6.4 says "independent buckets" but never writes the formula. | `sized_qty = min(spot_quote_wallet × safety_factor / spot_limit, perp_quote_wallet × safety_factor × leverage / perp_limit)` then floor to lot step. Same formula as same-stable but reads each wallet independently. |
+| **Auto-swap 5 bps basis cost** | §3.1 math `fees_RT_bps` formula uses "+5 bps USDC/USDT spot basis" as a magic constant. | Promote to a per-strategy config field with default 5.0; or document that it's a hardcoded safety margin and why 5 specifically. |
+| **Per-symbol fee caching policy** | §3.1 says "live per-symbol taker fees from the venue's fee API"; cache TTL unspecified. | Recommended: fetch once per cycle into a `{symbol: (spot_fee_bps, perp_fee_bps)}` dict; invalidate at the top of the next cycle. Rate-limit budget assumes this. |
+| **Two-hop drain: step-1-succeeded, step-2-failed** | §6.2 specifies the two-hop but not the half-failed state. | Funds land in `main`; next cycle's wallet-consolidation sweep (Phase C entry-prep) picks them up. Document this explicitly so an implementer doesn't add a separate retry. |
+| **Wallet-consolidation atomicity** | §6.2 says "sweep all sibling spot wallets into trade" but error semantics undefined. | Best-effort per source bucket; on per-source failure log WARN and continue with the others (a partial sweep still improves the "spendable in trade" total). Do not abort the cycle. |
+| **Mode-state vs strategy-state precedence** | §4 + §7.1 define both `mode_state.entry_enabled` and `strategy_state.entry_enabled` but never the AND. | AND of both. Rejection category when mode-disabled: `mode_disabled:<mode>`. When strategy-disabled: `strategy_disabled:<trade_type>`. Document the precedence. |
+| **Partial-window funding on fresh opens** | §0.4 + §3.1 — position opens mid-window; first funding payment lands at next scheduled time. | The funding accrual formula above (with `min(1, elapsed/interval)`) handles this correctly; document the property explicitly. |
+
+### Tier C — polish / future cleanup
+
+| Gap | Where in spec |
+|---|---|
+| Vocabulary drift: "asset" vs "currency", "60min" vs "3600s", "spot symbol" vs "spot pair" | scattered |
+| Tick-buffer rationale (why default 1 bp entry / 2 bps exit) | §4 active fields |
+| `rejected_candidates` retention policy ("prune old rows") — keep how long? | §3.1 SOP post-cycle |
+| `/config` strategy tab source — `StrategyConfigPerStrategy` rows, or a static `ACTIVE_STRATEGIES` constant? | §5.3 |
+| Dashboard view-cookie name + max-age | §5 |
+| Should `/api/diagnostics` omit `perp_entry_price=0` / `spot_entry_price=0` sentinel fields for naked rows, or surface them with a `is_real_leg` boolean? | §8.1 |
+| Re-validate the "venue dust endpoint min" floor: $0.10 tracking floor is a magic number | §3.1 SOP Phase A |
+| `last_close_error` retention — does it clear on successful retry, or accumulate? | §7.1.1 |
+
+Resolution policy: each Tier B gap should be closed in a separate doc PR (or in the PR that implements the corresponding behavior). Tier C gets one consolidated cleanup PR before the rewrite kicks off at Stage 0.
 
 ---
 
