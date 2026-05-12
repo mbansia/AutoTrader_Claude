@@ -2,7 +2,7 @@
 
 The single living source of truth for what this bot does and how it works. Every behavior-changing PR updates the relevant section in the same commit. The diagnostics-monitor chat re-reads this on every wake-up before judging anomalies; any new dev reads it once to onboard.
 
-> Status: **v1.0** — 2026-05-11 rewrite after operator audit.
+> Status: **v1.1** — 2026-05-12 naked-direction symmetry audit (v1.0 → v1.1). See changelog §15.
 
 ## How to read this doc
 
@@ -86,18 +86,20 @@ Every term used downstream in the doc lives here. Grouped to build up from primi
 | **Entry basis** | The basis at the moment we open: `(perp_sell_fill_price − spot_buy_fill_price) / spot_buy_fill_price × 10000`, in bps. Positive entry basis = we sold the perp leg at a premium relative to where we bought the spot leg = we pocketed that gap as entry profit. |
 | **Worst-case adverse exit basis** | A conservative assumption: "by the time we close, the basis will have moved against us by `m × |entry_basis|` bps", where m is a multiplier (default 3.0). For long-spot / short-perp, "adverse" means basis moves further positive — we sell our spot cheap relative to where we have to buy back the perp. |
 | **Position leg** | Either the spot side or the perp side of a single delta-neutral position. Each position has two legs that should be equal in absolute quantity at all times. |
-| **Naked leg** | A leg that lost its counterpart (e.g. spot leg filled but perp leg failed → the spot is "naked-long"). Naked legs are unhedged and exposed to price moves; the bot tries to recover them every cycle. |
-| **Naked spot** | A spot holding the bot owns but for which it has no matching perp short. Persisted as a position with status `naked_spot`. Created when a partial fill under an error response left a spot position with no perp hedge. See §10. |
+| **Naked leg** | A leg that lost its counterpart. Naked legs are unhedged and exposed to price moves; the bot tries to recover them every cycle. Has two symmetric directions — naked spot and naked perp (below). The recovery logic must treat both as first-class; assuming only one direction is the brittleness §16 L21 calls out. |
+| **Naked spot** | A spot holding the bot owns but with no matching perp short. Net exposure: **long base asset, no hedge** (price down → loss). Persisted as a position with status `naked_spot`. Origin: an entry path filled the spot leg, then the perp short failed (error, zero-fill, partial). See §10. |
+| **Naked perp** (also "naked futures") | An open perp short with no matching spot holding. Net exposure: **short base asset, no hedge** (price up → loss). Persisted as a position with status `naked_perp`. Origin: an exit path closed the spot leg (sold), then the perp buy-back failed; or an entry/exit-phase glitch left a perp short on the venue with no spot backing. Symmetric to naked spot — same recovery model in the opposite direction. See §10. |
 
 ### 0.4 Position lifecycle
 
 | Term | Definition |
 |---|---|
-| **Position** | A row in the bot's database recording one delta-neutral pair (one spot leg + one perp leg) on one venue under one strategy. Has a status: `open`, `naked_spot`, or `closed`. |
+| **Position** | A row in the bot's database recording one delta-neutral pair (one spot leg + one perp leg) on one venue under one strategy. Has a status: `open`, `naked_spot`, `naked_perp`, or `closed`. |
 | **Open position** | Both legs are live on the venue and the position is earning funding. The dashboard's "Open positions" table shows these. |
 | **Naked-spot position** | Spot leg exists, perp leg does not. Sub-state of "open" for accounting (counts toward exposure) but flagged for recovery on the next cycle. Once hedged or sold back, the row transitions out of `naked_spot`. |
+| **Naked-perp position** | Perp short exists, spot leg does not. Symmetric to naked-spot. Sub-state of "open" for accounting; flagged for recovery — try to hedge by buying matching spot (if forward profitability passes), else buy back the perp short to flatten. |
 | **Closed position** | The position has been fully closed (both legs flat) and the realized P&L is locked in. Visible in the dashboard's "Closed positions" history. |
-| **Currently exposed** | The combined set `{open, naked_spot}` — every "currently exposed" query in the bot uses this set. |
+| **Currently exposed** | The combined set `{open, naked_spot, naked_perp}` — every "currently exposed" query in the bot uses this set. Either naked direction counts toward portfolio exposure exactly like an open position because the unhedged leg has real price risk. |
 
 ### 0.5 Money quantities (what the dashboard's KPI cards show)
 
@@ -169,7 +171,7 @@ Different venues bundle balances differently. The bot abstracts over this but th
 | Term | Definition |
 |---|---|
 | **Diagnostics endpoint** | An auth-gated JSON endpoint (§8) that returns a structured snapshot of cycle health, positions, wallets, recent events, recent trades, and rule-based anomalies. Polled by an external cron every 3 hours and by humans / monitor agents on demand. |
-| **Anomaly** | A rule-based flag produced by the diagnostics endpoint when the bot's state diverges from healthy steady-state — e.g. no events in the last hour, naked-spot older than 1 hour, error burst, etc. |
+| **Anomaly** | A rule-based flag produced by the diagnostics endpoint when the bot's state diverges from healthy steady-state — e.g. no events in the last hour, naked leg (spot or perp) older than 1 hour, error burst, etc. |
 | **Heartbeat tracker** | A persistent GitHub issue that the diagnostics cron updates every 3 hours regardless of anomaly state. Posting a comment per run guarantees a webhook fires every cycle so the monitor chat can confirm "the bot's still alive". |
 | **Monitor chat** | A dedicated Claude session subscribed to the heartbeat tracker. Reads this doc on every wake-up before judging anomalies. Responds inline on the tracker with one-line acknowledgements on clean runs, full diagnosis on anomaly runs, or PRs when it detects a code regression. |
 
@@ -289,23 +291,29 @@ The bot's gate compares **net APY** (funding − adverse basis − fees, all ann
 
 Operator sets entry threshold = 20% net APY. The scanner finds `XYZ/USDT:USDT` paying 0.025% funding per 4h, with a +30 bps entry basis (we sell the perp 30 bps above where we buy spot).
 
-- Funding per 4h = 0.025% = 2.5 bps
-- Worst-case basis cost (m=3, entry=30 bps) = −90 bps over the round trip
-- Round-trip fees (2 × spot + 2 × perp, ~6 bps each) ≈ −24 bps
-- Net per 4h window = 2.5 − 90/N − 24/N bps, where N = funding-windows-held expected count
+Costs and income per 4h window:
 
-For the **first** window alone, the basis + fees overwhelm the funding. But the bot annualizes the *per-window* net: 2.5 − 90 − 24 = −111.5 bps per 4h, which is a deeply negative APY. The gate rejects this candidate.
+| Item | Value |
+|---|---|
+| Funding income | +0.025% = +2.5 bps |
+| Worst-case adverse basis (m = 3 × \|entry\| = 90 bps), charged as a per-window cost (see "why per-window" below) | −90 bps |
+| Round-trip taker fees (2 × spot + 2 × perp, ~6 bps each), also charged per-window | −24 bps |
+| **Net per 4h window** | **−111.5 bps** |
 
-For a higher-funding candidate at 0.5%/4h:
-- Funding per 4h = 50 bps
-- Adverse basis (m=3, entry=30 bps) = −90 bps total round-trip cost
-- Fees ≈ −24 bps
-- Net per 4h window = 50 − 90 − 24 = ... actually wait — the basis and fee costs are *one-time* round-trip costs, not per-window. Better formulation:
-  - Per-window net = funding − (round-trip basis + fees) / N
-  - Annualized (compounded) = (1 + net_per_window_bps / 10000)^(24×365/i_h) − 1
-  - For 50 bps funding / 4h, with one-time costs of 90+24 = 114 bps amortised over (say) 18 windows held = 6.3 bps/window: net = 50 − 6.3 = 43.7 bps per 4h → APY ~ 16,000% (compounded). Cleared the gate.
+Annualised: `(1 + net_per_window)^(periods_per_year) − 1` where `net_per_window = −0.01115` and `periods_per_year = 24×365/4 = 2190`. Result is deeply negative. The gate rejects.
 
-The bot's actual math is more conservative than this rough sketch — it treats the worst-case basis as a per-window cost (not amortised over expected hold) so the gate stays robust to early exits. See the formulas below.
+Now a higher-funding candidate at 0.5% / 4h with the same +30 bps entry basis:
+
+| Item | Value |
+|---|---|
+| Funding income | +50 bps |
+| Worst-case adverse basis | −90 bps |
+| Round-trip fees | −24 bps |
+| **Net per 4h window** | **−64 bps** |
+
+Still rejected at per-window accounting. The signal: under a *strictly* per-window cost charge, only very-high-funding candidates clear the gate — exactly the safety property the operator wants.
+
+**Why "per-window" cost, not "amortised over expected hold"?** Amortising 114 bps over (say) 18 expected windows held = 6.3 bps/window would *seem* more accurate (50 − 6.3 = 43.7 bps net → ~16,000% APY, cleared). But the bot has no commitment to hold for 18 windows: a stop-loss or hedge-integrity exit can fire after one window. Per-window accounting is the conservative choice that survives early exits. The gate is intentionally stricter than the expected case so a candidate that clears it is robust to bad scenarios, not just the average.
 
 #### SOP per loop iteration
 
@@ -316,21 +324,36 @@ Phase A — Safety (live only)
    For each open position:
       market-health check     → if market is delisted/halted, force-close both legs
       hedge-integrity check   → if one leg has disappeared from the venue, close the surviving leg
-   Phantom-spot recovery (sweep wallet, look for orphaned spot holdings):
-      ① Stale reconciliation   any naked-spot position whose underlying spot
-                                balance is no longer in the wallet → mark closed
-      ② For each non-stable spot asset present in the wallet with notional ≥
-         tracking floor (≈ $0.10):
+   Phantom-leg recovery (sweep BOTH wallets, look for orphaned legs in either
+   direction — naked spot AND naked perp are symmetric failure modes):
+      ① Stale reconciliation   any naked-spot or naked-perp position whose
+                                underlying leg has disappeared from the venue
+                                (spot balance gone / perp short closed
+                                externally) → mark closed
+      ② Naked-spot branch — for each non-stable spot asset present in the
+         wallet with notional ≥ tracking floor (≈ $0.10):
            - if notional < venue MIN_NOTIONAL → persist as naked-spot dust;
              skip recovery this cycle, defer to dust sweep
            - else: persist as naked-spot, then either
-               Phase 1: try to hedge with the matching perp (if forward
-                        profitability gate passes at current funding); or
-               Phase 2: sell the spot back to the quote stablecoin via
+               Phase 1: try to hedge by SHORTING the matching perp (if
+                        forward profitability gate passes at current funding); or
+               Phase 2: SELL the spot back to the quote stablecoin via
                         limit-IOC
-      ③ Dust sweep: convert all naked-spot-dust positions to the venue's
+      ③ Naked-perp branch — for each open perp short on the venue without a
+         matching spot holding (or matching DB row):
+           - persist as naked-perp, then either
+               Phase 1: try to hedge by BUYING matching spot (if forward
+                        profitability gate passes at current funding); or
+               Phase 2: BUY BACK the perp short via limit-IOC to flatten
+         Note: today's entry flow places spot first, perp second — so
+         naked-perp is rare from entries (it would require an exit-time perp
+         buy-back failure, or an externally-opened short). Recovery logic
+         must still handle it; assuming only one direction is L21 brittleness.
+      ④ Dust sweep: convert all naked-spot-dust positions to the venue's
          native fee token (BNB / KCS) via the venue's dust-conversion
-         endpoint; mark each converted position closed
+         endpoint; mark each converted position closed. (Perp shorts have no
+         dust equivalent — sub-min perp shorts are simply bought back at the
+         next opportunity.)
 
 Phase B — Exits (when exit is enabled for this mode/strategy)
    Fetch fresh predicted funding rates per venue.
@@ -732,7 +755,7 @@ If we're rebuilding the UI from scratch, **keep**:
 - Form-by-percentage convention (`*_pct` field names) — works but produces ugly Python signatures. A nicer pattern: submit decimal, JS displays as percent.
 - Mixing display + edit on `/safety` (it duplicates `/config`). Either delete `/safety` or make it strictly an "active state" snapshot that's auto-derived.
 - Per-strategy display gaps (§5.3 above) — fix while you're rewriting.
-- The "naked spot" rendering path. Today there's special handling in `dashboard.html` for `status='naked_spot'` (suppress fake perp leg). A from-scratch rewrite could unify this into a generic "position has missing leg" component.
+- The "naked spot" rendering path. Today there's special handling in `dashboard.html` for `status='naked_spot'` (suppress fake perp leg). A from-scratch rewrite MUST unify this into a generic "position has missing leg" component that handles both `naked_spot` (suppress perp leg) and `naked_perp` (suppress spot leg) through one code path keyed on status. Two parallel branches will drift; one component will not.
 
 **Throw away:**
 
@@ -797,7 +820,7 @@ SQLite by default (configurable via `DATABASE_URL`). Schema is defined declarati
 | `strategy_config_per_strategy` | One row per strategy (`trade_type`). Holds strategy-specific runtime config. Unique key on `trade_type`. |
 | `mode_state` | Per-mode (paper/live) master toggles: `entry_enabled`, `exit_enabled`, `maintenance_mode`. PK: `mode`. |
 | `strategy_state` | Per-(mode, trade_type) strategy-level toggles: `entry_enabled`, `exit_all_pending`. PK: composite (`mode`, `trade_type`). |
-| `positions` | Lifecycle: `open → naked_spot → closed`. Carries entry prices, funding accruals, last close error. |
+| `positions` | Lifecycle: `open → naked_spot | naked_perp → closed`. Carries entry prices, funding accruals, last close error. |
 | `trades` | One row per fill. Tagged to a `position_id` (nullable). Used by P&L + transactions UI. |
 | `bot_events` | Logs at INFO / WARN / ERROR. Source of the `/logs` UI and `recent_events` in `/api/diagnostics`. Timestamp column is `ts`. |
 | `rejected_candidates` | Scan rejections — symbol, reason, funding APR at scan time, ts. Source of the `/logs` UI and `rejections_grouped` in `/api/diagnostics`. |
@@ -859,7 +882,7 @@ Legacy columns retained for back-compat (no longer read): `entry_funding_thresho
 | `mode` | string, indexed | `'paper'` or `'live'`. |
 | `exchange` | string, indexed | Venue id (`binance`, `kucoin`). |
 | `trade_type` | string, indexed | Strategy identifier. |
-| `status` | string, indexed | `'open'` \| `'naked_spot'` \| `'closed'`. Open-statuses tuple: `('open', 'naked_spot')`. |
+| `status` | string, indexed | `'open'` \| `'naked_spot'` \| `'naked_perp'` \| `'closed'`. Open-statuses tuple: `('open', 'naked_spot', 'naked_perp')`. Either naked status counts as "currently exposed". |
 | `symbol` | string, indexed | Base asset (`BTC`, `ETH`). |
 | `spot_symbol` | string | e.g. `BTC/USDT`. |
 | `perp_symbol` | string | e.g. `BTC/USDT:USDT`. |
@@ -869,8 +892,8 @@ Legacy columns retained for back-compat (no longer read): `entry_funding_thresho
 | `opened_at` | datetime | Set at first leg fill. |
 | `entry_funding_rate` | float | At entry (decimal per window). |
 | `last_funding_rate` | float | Refreshed every cycle while open. |
-| `spot_entry_price` | float | Real for `open`; current-mid estimate for reconstructed `naked_spot`. |
-| `perp_entry_price` | float | Real for `open`; `0` sentinel for `naked_spot` (UI must suppress display). |
+| `spot_entry_price` | float | Real for `open`; current-mid estimate for reconstructed `naked_spot`; `0` sentinel for `naked_perp` (no spot leg ever existed — UI must suppress display). |
+| `perp_entry_price` | float | Real for `open`; `0` sentinel for `naked_spot` (no perp leg ever existed — UI must suppress display); current-mid estimate for reconstructed `naked_perp`. |
 | `funding_interval_hours` | float, default 8 | Read from contract metadata. |
 | `funding_income_accrued` | float, default 0 | Paper-mode accrual; live mode infers from balance delta. |
 | `last_funding_accrual_ts` | datetime | Last accrual touch. |
@@ -885,7 +908,7 @@ Legacy columns retained for back-compat (no longer read): `entry_funding_thresho
 | `mode` | string, indexed | |
 | `exchange` | string, indexed | |
 | `trade_type` | string, indexed | Mirrored from the parent position. |
-| `position_id` | integer, indexed, nullable | NULL for ghost-entries reconstructed during naked-spot recovery. |
+| `position_id` | integer, indexed, nullable | NULL for ghost-entries reconstructed during naked-leg recovery (either direction). |
 | `symbol` | string, indexed | |
 | `venue` | string | `'spot'` or `'futures'` — the leg. |
 | `side` | string | `'buy'` or `'sell'`. |
@@ -944,23 +967,29 @@ Legacy columns retained for back-compat (no longer read): `entry_funding_thresho
 ```
                    (entry path)                            (recovery path)
                         │                                        │
-                        ▼                                        ▼
-                  ┌──────────┐                              ┌────────────┐
-                  │   open   │                              │ naked_spot │
-                  └──────────┘                              └────────────┘
-                        │                                        │
-                exit / close                                  hedge succeeds
-                        ▼                                        │
-                  ┌──────────┐  ◄────────────────────────────────┘
-                  │  closed  │  ◄── sell-back or dust-convert
-                  └──────────┘  ◄── stale reconciliation (spot disappeared)
+                        ▼                       ┌────────────────┴────────────────┐
+                  ┌──────────┐                  ▼                                 ▼
+                  │   open   │            ┌────────────┐                    ┌────────────┐
+                  └──────────┘            │ naked_spot │                    │ naked_perp │
+                        │                 └────────────┘                    └────────────┘
+                exit / close                    │                                  │
+                        ▼                       │                                  │
+                  ┌──────────┐  ◄───────────────┘                                  │
+                  │  closed  │  ◄── hedge succeeds  /  sell-back  /  dust-convert  │
+                  │          │  ◄── stale reconciliation (spot disappeared)        │
+                  │          │  ◄────────────────────────────────────────────────  ┘
+                  │          │       hedge succeeds  /  perp buy-back to flatten
+                  │          │       stale reconciliation (perp short closed externally)
+                  └──────────┘
 ```
 
-`OPEN_STATUSES = ('open', 'naked_spot')` is used by every "currently exposed" query.
+`OPEN_STATUSES = ('open', 'naked_spot', 'naked_perp')` is used by every "currently exposed" query.
 
 **Rendering rule for `naked_spot`**: the perp leg has `perp_entry_price = 0` (placeholder; no perp short was ever filled). The dashboard suppresses the perp-leg detail table for these rows — no fabricated entry/PnL numbers. Spot leg is real.
 
-**Stale reconciliation**: at the top of every live cycle, any naked-spot position whose underlying spot balance is no longer in the wallet (sold externally, dust-converted by a prior cycle, Earn redemption, etc.) is auto-closed.
+**Rendering rule for `naked_perp`** (symmetric): the spot leg has `spot_entry_price = 0` (placeholder; no spot buy was ever filled). The dashboard suppresses the spot-leg detail table for these rows. Perp leg is real. Generalisation: the UI's "missing-leg" treatment should be a single component keyed on status, not two parallel branches that can drift apart.
+
+**Stale reconciliation**: at the top of every live cycle, any naked-spot position whose underlying spot balance is no longer in the wallet (sold externally, dust-converted by a prior cycle, Earn redemption, etc.) is auto-closed. Symmetrically: any naked-perp position whose underlying perp short is no longer open on the venue (closed externally, liquidated, expired) is also auto-closed in the same pass.
 
 ### 7.3 Migration policy
 
@@ -994,9 +1023,9 @@ Response shape (all timestamps are ISO-8601 UTC strings ending in `Z`):
   },
 
   "positions": {
-    "by_status": { string: integer },            // e.g. {"open": 2, "naked_spot": 1, "closed": 14}
+    "by_status": { string: integer },            // e.g. {"open": 2, "naked_spot": 1, "naked_perp": 0, "closed": 14}
     "open":   [ OpenPosition ],                  // every Position with status == "open"
-    "naked":  [ NakedPosition ]                  // every Position with status == "naked_spot"
+    "naked":  [ NakedPosition ]                  // every Position whose status is in ("naked_spot", "naked_perp"); each entry carries its own status so the consumer can tell the leg-direction apart
   },
 
   "wallets": {
@@ -1074,11 +1103,13 @@ NakedPosition: {
   "id":                  integer,
   "mode":                "paper" | "live",
   "exchange":            string,
+  "status":              "naked_spot" | "naked_perp",  // direction of the orphaned leg
   "symbol":              string,                 // base asset
-  "spot_symbol":         string,
-  "quantity":            number,
-  "spot_entry_price":    number,                 // current-mid estimate when reconstructed
-  "notional_est":        number,                 // quantity × spot_entry_price
+  "spot_symbol":         string,                 // present for naked_spot; may be empty for naked_perp
+  "perp_symbol":         string,                 // present for naked_perp; may be empty for naked_spot
+  "quantity":            number,                 // base units; absolute magnitude regardless of direction
+  "leg_entry_price":     number,                 // current-mid estimate for the surviving leg (spot price for naked_spot, perp mark for naked_perp)
+  "notional_est":        number,                 // quantity × leg_entry_price
   "age_minutes":         number
 }
 ```
@@ -1100,6 +1131,7 @@ Constraints / invariants the rewrite must preserve:
 |---|---|---|
 | `no_recent_events` | critical | No `BotEvent` in last 3600s |
 | `stale_naked_spot` | warn | A `naked_spot` Position older than 60min |
+| `stale_naked_perp` | warn | A `naked_perp` Position older than 60min (symmetric to stale_naked_spot) |
 | `no_trades_despite_scans` | warn | 0 recent trades AND > 20 rejections in window |
 | `error_burst` | warn | > 20 ERROR events in window |
 | `close_blocked` | warn | Open Position with non-empty `last_close_error` |
@@ -1151,9 +1183,12 @@ Separate Claude session. Reads this doc on every wake-up. Subscribes to the trac
 - `Scan top <symbol>: predicted rate=X% per Yh → APY=Z%` — top-3 candidate diagnostic per cycle.
 - `Phantom spot RESCUED into a hedged position` — phantom-recovery hedge succeeded; orphan spot is now a real hedged position.
 - `Phantom spot CLOSED: sold ... → USDT` — phantom-recovery sell-back succeeded; orphan flattened.
+- `Phantom perp RESCUED into a hedged position` — symmetric: naked-perp recovery hedge succeeded; matching spot bought.
+- `Phantom perp CLOSED: bought back ...` — symmetric: naked-perp buy-back succeeded; short flattened.
 - `Phantom dust detected: ... below venue min` — too small to sell, flagged for dust sweep.
 - `Dust sweep CLOSED N naked_spot position(s)` — auto-conversion to BNB/KCS succeeded.
 - `Stale naked_spot reconciled: <asset> no longer in spot wallet — marked closed` — stale cleanup fired.
+- `Stale naked_perp reconciled: <symbol> short no longer open on venue — marked closed` — symmetric stale cleanup for naked perps (externally closed or liquidated).
 
 ### 9.3 Log patterns that indicate a regression
 
@@ -1167,10 +1202,12 @@ Separate Claude session. Reads this doc on every wake-up. Subscribes to the trac
 
 | Failure | Detection | Recovery |
 |---|---|---|
-| Partial fill under `spot_buy_error` | Pre/post-balance snapshot delta in entry path | Synthesize partial fill, continue to perp leg at smaller qty (PR #14) |
-| Naked spot left behind | Phantom-recovery sweep every live cycle (Phase A) | Try to hedge with matching perp if profitable, else sell back, else flag as dust |
-| Dust below MIN_NOTIONAL | Notional check in recovery | Convert to venue's native fee token (BNB / KCS) via the venue's dust-conversion endpoint |
+| Partial fill on the FIRST leg under an error response | Pre/post-balance snapshot delta in entry/exit path | Synthesize partial fill from the balance delta, continue to the SECOND leg at the smaller actual qty (PR #14). Applies to both directions: entry where spot partially fills before the order errors, and exit where the perp buy-back partially fills. |
+| Naked spot left behind (spot filled, perp short failed) | Phantom-recovery sweep every live cycle (Phase A) | Try to hedge by shorting matching perp if profitable, else sell spot back to quote, else flag as dust |
+| Naked perp left behind (perp short open, spot leg failed or sold) | Phantom-recovery sweep every live cycle (Phase A) — symmetric branch | Try to hedge by buying matching spot if profitable, else buy back perp to flatten. No "dust" branch — perp shorts have no native dust-conversion endpoint. |
+| Dust below MIN_NOTIONAL (naked spot only) | Notional check in recovery | Convert to venue's native fee token (BNB / KCS) via the venue's dust-conversion endpoint |
 | Naked spot whose underlying spot disappeared from wallet | Stale-reconciliation pass at top of recovery | Auto-mark closed |
+| Naked perp whose underlying perp short was closed externally / liquidated | Stale-reconciliation pass at top of recovery — symmetric branch | Auto-mark closed |
 | Wallet starvation | "below min position pct" rejection | Wallet-breakdown diagnostic surfaces where funds are stranded (`/api/diagnostics` payload includes the per-wallet-type view) |
 | Book moves during round-trip | Zero-fill on the limit-IOC | Reject, retry next cycle |
 | KuCoin futures→spot drain "balance insufficient" / wallet oscillation | Post-cycle drain WARN repeating every cycle on idle accounts (21k+/24h) | **Resolved across PR #29 + PR #33.** Three layers: (1) routing — switched from spot-side universal-transfer to the futures-side legacy transfer-out endpoint, which is the only one that can see the futures wallet; (2) two-hop — append the main→trade hop via spot inner-transfer so funds land where the spot order book can spend them; (3) idle-cycle gate — pre-trade rebalance only fires when a candidate passed the scan, breaking the drain↔rebalance oscillation. Persistent failures are deduped via an error-message throttle. |
@@ -1271,6 +1308,7 @@ Append-only. Format: `YYYY-MM-DD · PR# · §sections touched · summary`.
 
 | Date | PR | Sections | Summary |
 |---|---|---|---|
+| 2026-05-12 | doc | §0.3, §0.4, §3.1 SOP, §7.1.1, §7.2, §8.1, §8.2, §9.2, §10, §16 L03/L16/L21/L32 | Naked-direction symmetry audit. Added `naked_perp` as a first-class position status alongside `naked_spot`. Phantom-leg recovery sweep symmetrised across both directions. Dashboard rendering rule generalised: missing-leg suppression keyed on status. New `stale_naked_perp` anomaly + log patterns. `NakedPosition` JSON carries a `status` field + uses `leg_entry_price`. L21 explicitly direction-neutral. Concrete-example math cleaned up (no more "actually wait" in spec text). |
 | 2026-05-11 | #35 | §4, §14 | Per-strategy config split: new `StrategyConfigPerStrategy` table (one row per trade_type) holds strategy-specific fields (thresholds, sizing, execution, wallet). `StrategyConfig` keeps account/process/mode-level globals. `MergedConfig` proxy lets bot.py call sites read transparently — pass `trade_type` to `get_strategy_config()`. `/config` gets a strategy tab selector; POSTs route per-strategy fields to the active tab's row, global fields to the singleton. Per-strategy rows lazily seeded from global on first read. |
 | 2026-05-11 | #34 | §0, §3.1 math, §4, §14 | Renamed `entry/exit_funding_threshold` → `entry/exit_min_net_apy` (config_schema_version v1→v2 migration). Removed deprecated form fields (`max_entry_basis_bps`, `min_24h_quote_volume`, `min_order_book_depth_usdt`, `depth_band_bps`). Form accepts both new and legacy field names for one release cycle. |
 | 2026-05-11 | #33 | §3.1, §6.2, §10, §14 | Break KuCoin drain↔rebalance oscillation. (1) Gate pre-trade rebalance on `candidates_passing > 0` (no point equalising wallets when there's no trade to fund). (2) `transfer_futures_to_spot` is now a two-hop: futures `CONTRACT → MAIN` via `transferOut`, then spot `MAIN → TRADE` via inner-transfer. Funds land where the spot order book can spend them without waiting a cycle for `consolidate_spot_wallets`. |
@@ -1309,7 +1347,7 @@ The hard lessons distilled from the first implementation. **Read this section be
 
 - **L01 — Names that lie cost more than ugly names.** A threshold called `entry_funding_threshold` that actually compares NET APY (after fees + worst-case basis) misled the operator for months. Every threshold name should describe what it's compared AGAINST. The rename to `entry_min_net_apy` should have happened on day one.
 - **L02 — Outer try/except + log-and-continue is a silent killer.** Wrapping the cycle loop in `try / except: log_event(ERROR); continue` is correct policy. But a single NameError (a missing import, a renamed variable) caused **every** paper-mode cycle to die for ~15 hours and burn CPU on exception handling, with the only signal being log volume. Two such regressions in this session (`total_funding_income`, `rt_basis_bps`). Mitigation: cycle health monitor on error/cycle ratio, NOT just liveness.
-- **L03 — Display ≠ state.** Persisting a `naked_spot` position with `perp_entry_price=0` as a placeholder is fine as long as the UI knows it's a placeholder. Rendering it as a real "−$2.93 MTM" in the perp leg card produced fabricated numbers the operator (correctly) called out. Display layer must know which fields are real vs sentinel.
+- **L03 — Display ≠ state.** Persisting a `naked_spot` position with `perp_entry_price=0` (or, symmetrically, a `naked_perp` with `spot_entry_price=0`) as a placeholder is fine as long as the UI knows it's a placeholder. Rendering it as a real "−$2.93 MTM" in the missing-leg card produced fabricated numbers the operator (correctly) called out. Display layer must know which fields are real vs sentinel, and the rule must apply identically to both directions.
 
 ### Money math
 
@@ -1331,7 +1369,7 @@ The hard lessons distilled from the first implementation. **Read this section be
 
 ### State management
 
-- **L16 — Phantom state is the enemy.** Any state that exists on the venue but has no row in the bot's DB is invisible to every reconciler, every gate, every monitor. The moment the bot detects an unexpected balance (e.g., a partial spot fill the order error path didn't capture), it MUST persist a `naked_spot` (or equivalent) row immediately, before attempting any recovery. The portfolio view is broken otherwise.
+- **L16 — Phantom state is the enemy.** Any state that exists on the venue but has no row in the bot's DB is invisible to every reconciler, every gate, every monitor. The moment the bot detects an unexpected balance OR an unexpected open perp position (e.g., a partial spot fill the order error path didn't capture, or an externally-opened short), it MUST persist a `naked_spot` / `naked_perp` row immediately, before attempting any recovery. The portfolio view is broken otherwise. Both leg-directions need the same "persist-first, recover-second" discipline.
 - **L17 — Stale reconciliation is mandatory.** A persisted position can outlive its underlying balance (operator sold externally, dust got swept, Earn got auto-redeemed). The bot must check at every cycle that DB state matches venue state for every open row, and auto-close the orphans. Without this, the dashboard shows positions that don't exist anymore.
 - **L18 — Cache + force-refresh on every state mutation.** Balance fetches are cached for rate-limit reasons. After EVERY transfer, swap, or order placement, the cache must be invalidated explicitly or the next read returns pre-mutation data. The bug surface is "the bot says it has $9.90 but the venue says $0.10 — and the bot is using the stale value to make sizing decisions".
 - **L19 — Idle-cycle gating.** Wallet rebalance is expensive (multiple API calls, multiple venue acks). On an idle cycle (no candidates passed the scan), rebalancing produces a drain↔rebalance oscillation that burns ~21k log events / day for zero benefit. Rebalance MUST be gated on "at least one candidate passed the scan AND needs both wallets funded".
@@ -1339,7 +1377,7 @@ The hard lessons distilled from the first implementation. **Read this section be
 
 ### Recovery
 
-- **L21 — Hedge before flat-close.** When recovering an orphan spot leg, the right first action is to try to hedge with the matching perp short — if the forward profitability gate passes, the orphan becomes a real position. Only fall back to selling the spot when hedging isn't feasible (no perp listing, insufficient depth, gate fails). Flat-closing as the first action throws away a profitable opportunity.
+- **L21 — Hedge before flat-close, in EITHER direction.** When recovering an orphan leg, the right first action is to try to hedge with the missing counterpart — if the forward profitability gate passes, the orphan becomes a real hedged position. Only fall back to flat-closing (selling the surviving spot, or buying back the surviving perp) when hedging isn't feasible (no listing, insufficient depth, gate fails). The recovery logic must be SYMMETRIC across the two naked directions; writing it for "naked spot" only is the brittleness that caused this learning. Reframed: the orphan is "a leg looking for its counterpart" — the counterpart is the matching short (for naked_spot) or matching long (for naked_perp). Same machinery, same gate, opposite trade.
 - **L22 — Dust below MIN_NOTIONAL is unsellable through normal orders.** Use the venue's dust-conversion endpoint (Binance dust → BNB, KuCoin dust → KCS). Otherwise small balances accumulate forever and trip "balance insufficient" rejections every cycle.
 
 ### Configuration
@@ -1359,7 +1397,7 @@ The hard lessons distilled from the first implementation. **Read this section be
 
 ### Display
 
-- **L32 — Naked positions are first-class.** Any exposure on a venue must show on the portfolio view, even if its origin is a partial-fill orphan or an external transfer. Hiding them under "open positions only with a DB row" makes the operator's mental model inconsistent with the actual account balance. Operator's quote: "Any position is the position!"
+- **L32 — Naked positions are first-class — both directions.** Any exposure on a venue must show on the portfolio view, regardless of which leg is the orphan. A naked spot (long, unhedged) and a naked perp (short, unhedged) are equally real, equally exposed to price moves, and equally must surface on the dashboard / transactions / diagnostics. Hiding either kind under "open positions only with a DB row" makes the operator's mental model inconsistent with the actual account balance. Operator's quote: "Any position is the position!" Recovery, accounting, and UI must treat the two directions as siblings, not as a primary plus an afterthought.
 - **L33 — Show the math the gate did.** Rejection log lines must show the comparison the gate actually performed. A line saying "net 11.57% < 10%" is fine; a line saying "11.57% < 10%" without "net" looks like a bug because the math doesn't check out at first glance.
 - **L34 — Per-position thresholds in per-position rows.** Once thresholds are per-strategy, the dashboard's open-positions table should show each row's strategy threshold inline. Showing a single global threshold in the summary card is correct (it's the default); showing it on a per-position row creates a wrong impression.
 
@@ -1465,7 +1503,7 @@ Do Binance first (smaller wallet surface), KuCoin second (Classic wallet quirks)
 2. Implement the math in §3.1 — gates, signed basis, worst-case adverse swing, reservation clamp. Unit tests for every formula in §3.1 math (use the worked examples in the doc as test vectors).
 3. Tier separation (L10): Tier-1 in the scanner, Tier-2 in the book walk, Tier-3 in the gate.
 4. Idle-cycle gating (L19): wallet rebalance only runs when at least one candidate passed Tier-1.
-5. Position state machine: open ↔ naked_spot ↔ closed, transitions per §7.2.
+5. Position state machine: `open ↔ {naked_spot, naked_perp} ↔ closed`, transitions per §7.2. Both naked directions are first-class states; no special-casing only one.
 6. Naked-spot recovery (L16, L21): hedge-before-sell + stale reconciliation + dust sweep.
 7. Outer exception handler that logs `Loop iteration error` and continues — BUT also a NameError-prevention measure: every cycle entry-point function has at least one import-time symbol resolution check (L02).
 
@@ -1490,7 +1528,7 @@ Do Binance first (smaller wallet surface), KuCoin second (Classic wallet quirks)
 **Exit criteria:**
 - Every route in §5.2 returns `200` smoke-tested.
 - Parity test harness: `/api/diagnostics` response from new code equals old code's response on the same DB snapshot (modulo timestamps).
-- HTML pages render correctly with naked-spot, multi-strategy, and various edge-case states present.
+- HTML pages render correctly with naked-spot AND naked-perp rows, multi-strategy, and various edge-case states present.
 
 #### Stage 5 — Live mode validation (paper-only first, then dry-run)
 
@@ -1504,7 +1542,7 @@ Do Binance first (smaller wallet surface), KuCoin second (Classic wallet quirks)
 
 **Exit criteria:**
 - 48h paper-mode parity (or all deltas intentional + documented).
-- 48h live single-venue clean: no naked positions accumulated, no error bursts, all trades reconcile.
+- 48h live single-venue clean: no naked positions (either direction) accumulated, no error bursts, all trades reconcile.
 - 48h live both-venue clean.
 
 #### Stage 6 — Cutover + decommission
