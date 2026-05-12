@@ -4,6 +4,19 @@ The single living source of truth for what this bot does and how it works. Every
 
 > Status: **v1.0** — 2026-05-11 rewrite after operator audit.
 
+## How to read this doc
+
+This is a **specification**, not a description of the running code. It tells a developer or operator what the bot DOES and what a future rewrite must preserve. Code identifiers (file paths, class names, function names) are intentionally absent — they belong in the implementation, not the spec.
+
+Suggested reading order on first pass:
+
+- **Brand-new to the bot?** §1 (Purpose) → §0 (Definitions, all sections) → §3 (Strategy SOP + math) → §5 (UI). The strategy section assumes every term in §0.
+- **Operating it day-to-day?** §0.5 (money quantities — what the dashboard means) → §5 (UI tour) → §8 (diagnostics) → §10 (failure modes).
+- **Modifying it?** §3 (strategy) + §4 (configuration) + §13 (doc-update policy) + §16 (learnings — read this before every PR).
+- **Rewriting it?** §17 (rewrite plan) is the runbook. §16 is the regression catalogue.
+
+If a sentence in any section uses a term, that term is in §0. If it isn't, **the section is wrong, not the reader** — please open a PR adding the definition.
+
 ---
 
 ## Table of contents
@@ -34,36 +47,131 @@ The single living source of truth for what this bot does and how it works. Every
 
 ## 0. Definitions
 
-These terms appear throughout. Read them first.
+Every term used downstream in the doc lives here. Grouped to build up from primitives to compound concepts; later groups assume the earlier ones. **If a section uses a term not defined below, the section is wrong — fix the section.**
+
+### 0.1 Trading primitives
 
 | Term | Definition |
 |---|---|
-| **Funding rate** | Periodic payment between perp longs and shorts. *Positive* funding = longs pay shorts. Settled at the **funding window**. |
-| **Funding window** | The interval at which funding is settled. Typically 4h or 8h, contract-specific. Read per-pair from the venue. |
-| **APR** | Annualized rate using simple (non-compounded) addition: `r × N` where N = periods/year. **Not used in this codebase.** |
-| **APY** | Annualized rate using compounding: `(1 + r)^N − 1`. **All thresholds in this codebase are APY**, even when historical variable names say "APR". |
-| **Spot** | Cash market — `BASE/QUOTE` pair, e.g. `BTC/USDT`. Buying spot = owning the base asset. |
-| **Perp** | Perpetual futures contract — `BASE/QUOTE:QUOTE`, e.g. `BTC/USDT:USDT`. No expiry; held positions accrue/pay funding. |
-| **Basis** | `(perp_price − spot_price) / spot_price`, in bps. **Positive** = perp at a premium to spot. |
-| **Long spot + short perp** | This bot's only active structure. Net price exposure = 0 (delta-neutral). Earns funding when funding rate is positive. |
-| **Entry basis** | Basis at the moment we open: `(perp_sell_fill − spot_buy_fill) / spot_buy_fill × 10⁴`. Positive = we sold the perp at a premium = entry profit. |
-| **Worst-case adverse exit basis** | Conservative assumption about the basis when we eventually close. Model: `entry_basis + buffer × |entry_basis|`, where buffer = `cfg.exit_basis_buffer_multiple` (default 3.0). |
-| **Limit-IOC** | Limit order with Immediate-Or-Cancel time-in-force. Fills against existing depth at or better than the limit, cancels any remainder. We never leave resting orders. Pays taker fee. |
-| **Reservation** | Cash a venue's matching engine sets aside when a limit-buy is placed: `qty × limit_price` from the trade wallet. If this exceeds the wallet's free balance, the venue rejects mid-fill (e.g. KuCoin `200004 Balance insufficient!`). |
-| **Naked spot** | A spot holding with no matching perp short. Created when a partial fill under `spot_buy_error` left the perp leg unfilled. Stored as `Position(status='naked_spot')`. |
-| **Phantom spot** | Same as naked spot — older terminology. We persist them so the dashboard never shows a fabricated number. |
-| **PM** | Binance **Portfolio Margin** — unified margin pool across cross-margin / USDM-futures / CM-futures. Orders route through `/papi/v1/*`. |
-| **UTA** | KuCoin **Unified Trading Account** — single unified pool across spot + futures. |
-| **Classic** (KuCoin) | The non-UTA mode. Spot funds split across `main`, `trade`, `margin`, `isolated`, `pool`; futures in `contract`. |
-| **MIN_NOTIONAL** | Venue's per-symbol minimum order notional. Binance returns `-1013 NOTIONAL` below it; KuCoin returns `400100 minimum requirement`. Roughly $5 on Binance, $1 on KuCoin. |
-| **Net APY** | Annualized profit AFTER all costs (worst-case basis, round-trip fees, swap fees if any). The gate threshold (`entry_funding_threshold` / `exit_funding_threshold`) is in this unit. **NOT the raw funding APY.** |
-| **Round-trip** | Entry + exit on both legs = 4 fee-bearing trades. If the bot needed a USDT↔USDC swap to fund the trade, +2 more swap legs. |
-| **Heartbeat tracker** | The persistent GitHub issue (`[bot-diagnostics] Tracker`) the cron updates and comments on every 3h. |
-| **Cross-stable arb** | A funding-arb candidate whose perp quote currency differs from the spot quote — e.g. spot leg on `DOGE/USDT`, perp leg on `DOGE/USDC:USDC`. Per-quote sizing reads the spot leg from the spot-quote wallet and the perp leg from the perp-quote wallet; these are independent. |
-| **Same-stable arb** | Spot and perp use the same quote (both USDT or both USDC). If the wallet for that quote is empty but the other stable has surplus, the `auto-swap` path can fund the trade. |
-| **Tier-1 / Tier-2 / Tier-3** | The three gates a candidate passes before the bot will trade it. **Tier-1**: cheap pre-filter on annualized net APY using approximate fees and zero basis, run during the venue-wide funding-rate scan. **Tier-2**: book-walk simulation confirming both legs can actually fill at the sized quantity (returns real avg + worst-fill prices). **Tier-3**: full profitability gate using actual fill prices, live per-symbol fees, signed basis, plus a swap-fee surcharge if a stablecoin swap is required. Only candidates that pass all three reach order placement. |
-| **Paper vs live mode** | Two parallel execution paths. **Paper** uses synthetic fills (`paper_slippage_bps`, `paper_fee_bps`) against real venue prices — no orders sent, no real money at risk. **Live** sends real orders. Both run every cycle on every gateway. Their DB rows are kept separate via the `mode` column. |
-| **Mandatory vs voluntary exit** | **Voluntary** exits (`forward_profit_below_threshold`, `max_hold`) are deferred when live basis is unfavourable — closing right now would print an extra basis cost. **Mandatory** exits (`stop_loss`, `check_hedge` naked-leg, `check_market_health` delisting) close immediately regardless of basis. |
+| **Spot market** | The "right now" market for an asset paired with a quote (e.g. `BTC/USDT`). Buying spot = you now own the asset. Selling spot = you no longer own it and have the quote currency instead. No leverage, no funding payments, no expiry. |
+| **Perpetual futures (perp)** | A derivative contract that tracks the spot price of an asset (e.g. `BTC/USDT:USDT` tracks BTC vs USDT) but has **no expiry date**. Traders can be **long** (profit if price rises) or **short** (profit if price falls). The contract is held open indefinitely; the platform forces buyers and sellers to keep the perp's price near the spot price by charging periodic **funding payments**. |
+| **Funding rate** | The periodic payment between perp longs and shorts that keeps the perp price anchored to spot. Quoted as a percentage per **funding window**. **Positive funding** = longs pay shorts (perp is trading above spot); **negative funding** = shorts pay longs. |
+| **Funding window** | The cadence of funding settlements. Typically 4 hours or 8 hours, set per contract by the venue. A 0.01% funding rate at an 8h window means the short side receives 0.01% of the position's notional from the long side every 8 hours. |
+| **Base asset** / **Quote asset** | In `BTC/USDT`, **BTC** is the base (what you're buying / selling) and **USDT** is the quote (the currency you pay or receive). The pair's price is quoted in units of QUOTE per unit of BASE. |
+| **Stablecoin** (or **stable**) | A token designed to track $1 USD. The bot trades USDT and USDC. Their prices vs USD are usually ~$1 ± 5 bps (0.05%) but can drift. The bot treats USDT face-value as 1 USD and prices USDC at the live USDC/USDT mid for equity reporting. |
+| **Long position** | You've bought the asset (or perp) and will profit if the price rises. |
+| **Short position** | You've sold an asset you don't own (in the case of perps, via the contract's short side). You profit if the price falls. |
+| **Delta-neutral** | Net exposure to the underlying asset's price moves is zero. If price goes up, gains on the long leg cancel losses on the short leg. The bot is **always** delta-neutral by construction: long spot + short perp on the same base, same quantity. |
+| **Basis** | The price gap between perp and spot, normalised: `(perp_price − spot_price) / spot_price`, expressed in basis points (bps). **Positive basis** = perp is trading at a premium to spot. Example: spot BTC = $50,000, perp BTC = $50,050 → basis = +10 bps. |
+
+### 0.2 Order types
+
+| Term | Definition |
+|---|---|
+| **Market order** | "Buy/sell now at whatever price the book offers." Fills immediately, but at potentially poor prices on thin books. **The bot never uses market orders** — too much slippage risk on thinly-traded pairs. |
+| **Limit order** | "Buy/sell at price X or better." Fills against existing orders that cross your limit. Can rest on the book waiting if nothing crosses. |
+| **IOC** (Immediate-Or-Cancel) | A time-in-force flag. Order fills whatever depth it can against existing book at the moment of arrival, then immediately cancels any unfilled remainder. **Never** leaves a resting order. |
+| **Limit-IOC** | The bot's only order type. Combines limit + IOC: "fill against the book up to my limit price, right now, and cancel anything left." Predictable cost, predictable fill quantity, no resting-order risk. |
+| **Taker fee** | The fee charged when an order crosses the existing book (i.e. removes liquidity). Limit-IOC orders are always takers. Typically 0.06–0.10% per fill on these venues. |
+| **Maker fee** | The fee (sometimes a rebate) for an order that rests on the book waiting to be crossed. The bot does NOT use maker orders — see §16 L11 / L21. |
+| **Reservation** | When you submit a limit-buy for `qty × limit_price`, the venue immediately **reserves** that much cash from your wallet. If your wallet's free balance is less, the venue rejects the order mid-fill. Crucial because the reservation uses the LIMIT price (always worse than the average fill price), not the average. |
+| **Tick size** | The minimum price increment a venue accepts for an order on a given symbol. E.g. 0.0001 USDT. Orders priced off-tick are rejected. |
+| **MIN_NOTIONAL** | The venue's per-symbol minimum order value in quote currency. Below this, the venue rejects the order. Roughly $5 on Binance, $1 on KuCoin. Dust below this can't be sold through normal orders — must use the venue's dedicated dust-conversion endpoint. |
+
+### 0.3 The bot's strategy (long-spot / short-perp funding arbitrage)
+
+| Term | Definition |
+|---|---|
+| **Long spot + short perp** | The bot's only active structure. Buy the base asset on spot; simultaneously short the same quantity of that asset's perp. Net price exposure = 0. The position earns funding payments every funding window while the perp's funding rate is positive. |
+| **Entry basis** | The basis at the moment we open: `(perp_sell_fill_price − spot_buy_fill_price) / spot_buy_fill_price × 10000`, in bps. Positive entry basis = we sold the perp leg at a premium relative to where we bought the spot leg = we pocketed that gap as entry profit. |
+| **Worst-case adverse exit basis** | A conservative assumption: "by the time we close, the basis will have moved against us by `m × |entry_basis|` bps", where m is a multiplier (default 3.0). For long-spot / short-perp, "adverse" means basis moves further positive — we sell our spot cheap relative to where we have to buy back the perp. |
+| **Position leg** | Either the spot side or the perp side of a single delta-neutral position. Each position has two legs that should be equal in absolute quantity at all times. |
+| **Naked leg** | A leg that lost its counterpart (e.g. spot leg filled but perp leg failed → the spot is "naked-long"). Naked legs are unhedged and exposed to price moves; the bot tries to recover them every cycle. |
+| **Naked spot** | A spot holding the bot owns but for which it has no matching perp short. Persisted as a position with status `naked_spot`. Created when a partial fill under an error response left a spot position with no perp hedge. See §10. |
+
+### 0.4 Position lifecycle
+
+| Term | Definition |
+|---|---|
+| **Position** | A row in the bot's database recording one delta-neutral pair (one spot leg + one perp leg) on one venue under one strategy. Has a status: `open`, `naked_spot`, or `closed`. |
+| **Open position** | Both legs are live on the venue and the position is earning funding. The dashboard's "Open positions" table shows these. |
+| **Naked-spot position** | Spot leg exists, perp leg does not. Sub-state of "open" for accounting (counts toward exposure) but flagged for recovery on the next cycle. Once hedged or sold back, the row transitions out of `naked_spot`. |
+| **Closed position** | The position has been fully closed (both legs flat) and the realized P&L is locked in. Visible in the dashboard's "Closed positions" history. |
+| **Currently exposed** | The combined set `{open, naked_spot}` — every "currently exposed" query in the bot uses this set. |
+
+### 0.5 Money quantities (what the dashboard's KPI cards show)
+
+This is the operator's primary "how am I doing?" view. Every number here has a precise definition.
+
+| Term | Definition |
+|---|---|
+| **Notional** | The dollar value of a position, computed as `quantity × price`. The bot uses `quantity × spot_entry_price` for entry notional and `quantity × current_spot_price` for current notional. A 0.05 BTC position with BTC at $50,000 has notional $2,500. |
+| **Portfolio equity** (or just **equity**) | The total dollar value of every asset the bot's account holds across every wallet on every venue, valued at current market prices. Computed by summing: (a) the operator's USDT balances at face value, (b) USDC balances at the live USDC/USDT mid, (c) every non-stable base asset balance at its current spot price. Equity changes second-to-second as prices move; the dashboard's "Current equity" KPI refreshes per cycle. |
+| **Free deployable** | The portion of equity NOT currently committed to an open position — i.e. cash that the bot could route into a new trade right now. Spot positions count as "committed" because their value moves with price; only idle stablecoin balances count as free deployable. Computed as `idle USDT + idle USDC × USDC/USDT rate`. |
+| **Net injected capital** | The total dollars the operator has deposited into the account, minus dollars withdrawn, since the bot's inception. **Does NOT include trading P&L.** Ingested from each venue's deposit / withdrawal / sub-transfer history. Used as the baseline for total-PnL and XIRR calculations. |
+| **Mark-to-market (MTM)** | Valuing a position at the current market price rather than entry price. Standard accounting convention — even though no trade has been executed, the position's "what would I have if I closed right now?" value matters. |
+| **Realized P&L** (or **trade PnL**) | Profit / loss already locked in by closed positions. Computed across every closed trade's entry-vs-exit prices. Excludes funding income (tracked separately). |
+| **Unrealized P&L** (or **MTM PnL**) | Profit / loss on currently-open positions, valued at current market prices. Becomes realized when the position closes. |
+| **Funding income** | The cumulative funding payments the open shorts have received from open longs across the position's lifetime. Tracked per-position and summed for the portfolio total. On the dashboard's "Total PnL" breakdown, this is a separate line item from trade PnL. |
+| **Total PnL** | `Current equity − Net injected capital`. The bottom-line "have I made or lost money since I deposited?" number. Decomposes into `trade_PnL + funding_income + unrealized_MTM_PnL`. |
+| **Total fees** | The sum of all taker fees paid across every spot and perp leg of every trade the bot has executed. Visible on the dashboard with average fee per transaction as a % of notional and a per-(venue, leg) breakdown. |
+| **XIRR** | Internal Rate of Return computed against the actual deposit / withdrawal timestamps. Annualised. Handles irregular capital flows correctly (a simple % return on net-injected doesn't). Needs at least 7 days of history and at least one capital flow to be meaningful. |
+
+### 0.6 Annualization
+
+The bot uses APY everywhere it talks about a yearly return. APR appears only as a historical name in some legacy variables; it is never the actual math the bot does.
+
+| Term | Definition |
+|---|---|
+| **APR** (simple-interest annualization) | `period_rate × periods_per_year`. Linear, no compounding. *Not used in this codebase, despite the name appearing in some legacy variable names.* |
+| **APY** (compounded annualization) | `(1 + period_rate)^periods_per_year − 1`. Compounds the period yield into yearly. This is what every threshold and every dashboard rate in the bot uses. |
+| **Worked example** | A perp pays 0.01% funding every 8 hours. Periods/year = 24×365 / 8 = 1095. APR = 0.01% × 1095 = **10.95%**. APY = (1.0001)^1095 − 1 = **11.57%**. The bot uses 11.57%. Same rate at 4-hour funding: APR = 21.9%, APY = **24.50%**. The funding window matters a lot when annualizing. |
+| **Net APY** | The bot's headline performance metric per candidate. The annualization of **net** profit (funding income + signed basis P&L − round-trip fees − optional stablecoin-swap costs). Every threshold in the configuration (`entry_min_net_apy`, `exit_min_net_apy`) is expressed in this unit. **NOT the raw funding APY.** A pair with 100% raw funding APY can fail the entry gate if fees + worst-case basis cost more than (100% − operator's threshold). |
+
+### 0.7 Venue account models
+
+Different venues bundle balances differently. The bot abstracts over this but the differences matter for the wallet model in §6.
+
+| Term | Definition |
+|---|---|
+| **Account** | The top-level identity on a venue. Operator may have a master account and several sub-accounts. The bot lives in one sub-account per venue. |
+| **Sub-account** | A bookkeeping isolation within an account. Different sub-accounts can run different strategies / API keys; balances don't pool unless explicitly transferred. |
+| **Master account** | The parent that can create / fund / restrict sub-accounts. |
+| **Wallet type** | A sub-bucket within an account. On simple venues there's one "spot wallet" + one "futures wallet". On more complex venues (KuCoin Classic) the spot side splits into `main` (deposits land here), `trade` (where spot orders execute), `margin` / `isolated` (for margin trading), and `pool` (Earn / yield products). |
+| **PM** (Portfolio Margin, Binance) | A unified-margin account mode where the spot wallet, USDM-futures wallet, and CM-futures wallet all draw from a single collateral pool. Orders route through a separate set of API endpoints (`/papi/v1/*`). This bot's Binance integration assumes PM unconditionally. |
+| **UTA** (Unified Trading Account, KuCoin) | KuCoin's equivalent of PM — single unified pool across spot + futures. Not active for this bot's KuCoin sub-account; it runs in **Classic** mode. |
+| **Classic** (KuCoin non-UTA) | The default KuCoin mode. Funds split across multiple wallet types (main, trade, contract, margin, isolated, pool) and the bot has to physically transfer between them — see §6.2. |
+
+### 0.8 Strategy + execution terms
+
+| Term | Definition |
+|---|---|
+| **Strategy** | A trading approach implemented in the bot. Today only one is active: same-venue funding arbitrage (long spot + short perp on the same venue). Each active venue + strategy combination gets its own runtime config row. |
+| **Trade type** | The identifier for a (strategy, venue) pair, e.g. `binance_same_venue_funding_arb`. Every Position and Trade row carries the trade type that produced it. |
+| **Cross-stable arb** | A funding-arb candidate where the perp's quote currency differs from the spot's quote currency — e.g. spot `DOGE/USDT` + perp `DOGE/USDC:USDC`. The bot funds the spot leg from the spot-quote wallet and the perp leg from the perp-quote wallet independently. |
+| **Same-stable arb** | Spot and perp share the same quote (both USDT or both USDC). If the wallet for that single quote is empty but the OTHER stable has surplus, the bot can auto-swap USDT↔USDC to fund the trade. |
+| **Mode** | The bot runs two parallel execution paths: **paper** (synthetic fills against real venue prices — no orders sent, no real money at risk) and **live** (real orders). Both run every cycle on every venue. Data is segregated by a `mode` tag on every database row. |
+| **Cycle** (or **loop iteration**) | One pass of the bot's three-phase work: safety checks (Phase A) → position exits (Phase B) → new entries (Phase C) → post-cycle bookkeeping. Runs every ~30 seconds (configurable). |
+| **Gate** | A binary decision point that admits or rejects a candidate trade based on a rule. The bot has three tiers (below). |
+| **Tier-1 gate** | Cheap pre-filter run during the venue-wide funding-rate scan. Uses approximate fees and assumes zero basis. Rejects candidates whose net APY estimate is below the entry threshold before any expensive work happens. |
+| **Tier-2 gate** | Book-walk simulation. The bot replays the venue's actual order book at the bot's actual sizing and confirms both spot and perp legs can fill cleanly. Returns real avg + worst-fill prices. |
+| **Tier-3 gate** | The real economic check. Uses the actual fill prices from Tier-2, live per-symbol taker fees from the venue's fee API, signed basis P&L with worst-case adverse exit, plus a stablecoin-swap surcharge if needed. The candidate must clear net APY ≥ entry threshold to reach order placement. |
+| **Candidate** | A perp the scan considers a potential trade for this cycle. Becomes a candidate after passing Tier-1 and having a viable spot pair. Top candidates by net APY then face Tier-2 and Tier-3. |
+| **Sized notional** | The dollar amount of equity the bot wants to commit to this trade, computed before the book walk. Bounded below by `min_position_pct × equity` and above by `max_position_pct × equity`, then further capped by the smaller of the two leg wallets' free balances. |
+| **Wallet cap** | The hard ceiling on a trade's size imposed by available cash: `min(spot_leg_free, perp_leg_free) × safety_factor` (safety factor ≈ 0.97 covers limit-vs-mid price spread + fees). The bot will never try to commit more than this even if `max_position_pct × equity` is larger. |
+| **Target quantity** (target_qty in formulas) | The base-asset quantity the bot is trying to fill. Initially `sized_notional / spot_mid_price`; clamped down in the book-walk loop by both fillable depth and reservation limits at the final limit price. |
+| **Reservation** | When a limit-buy is placed for `qty × limit_price`, the venue immediately reserves that much from the trade wallet. The clamp ensures `qty × limit_price ≤ wallet_free × safety_factor` so the venue never rejects mid-fill. See §16 L07. |
+| **Safety factor** | A multiplier (~0.99) applied to free-balance ceilings to absorb fee accrual, rounding, and last-millisecond balance shifts. Trades a tiny bit of headroom for reservation-rejection insurance. |
+| **Mandatory vs voluntary exit** | **Voluntary** exits (forward profitability dropped, max-hold reached) are deferred for one cycle if closing right now would print an extra cost (unfavourable live basis). **Mandatory** exits (stop-loss, hedge integrity, market unhealthy) close immediately regardless. |
+
+### 0.9 Operational concepts
+
+| Term | Definition |
+|---|---|
+| **Diagnostics endpoint** | An auth-gated JSON endpoint (§8) that returns a structured snapshot of cycle health, positions, wallets, recent events, recent trades, and rule-based anomalies. Polled by an external cron every 3 hours and by humans / monitor agents on demand. |
+| **Anomaly** | A rule-based flag produced by the diagnostics endpoint when the bot's state diverges from healthy steady-state — e.g. no events in the last hour, naked-spot older than 1 hour, error burst, etc. |
+| **Heartbeat tracker** | A persistent GitHub issue that the diagnostics cron updates every 3 hours regardless of anomaly state. Posting a comment per run guarantees a webhook fires every cycle so the monitor chat can confirm "the bot's still alive". |
+| **Monitor chat** | A dedicated Claude session subscribed to the heartbeat tracker. Reads this doc on every wake-up before judging anomalies. Responds inline on the tracker with one-line acknowledgements on clean runs, full diagnosis on anomaly runs, or PRs when it detects a code regression. |
 
 ---
 
@@ -152,21 +260,52 @@ This bot is multi-strategy by design — each strategy has its own SOP and per-s
 
 **Identifier:** `binance_same_venue_funding_arb`, `kucoin_same_venue_funding_arb` (one strategy instance per active venue).
 
-#### Thesis
+#### Thesis (plain English)
 
-When a perp pays positive funding (longs pay shorts), the bot opens a delta-neutral structure on that base asset:
+Perpetual futures don't expire, so the venue needs a mechanism to keep the perp's price close to the spot price. That mechanism is the **funding rate** — every funding window (typically 4 or 8 hours), one side of the perp's order book pays the other side. When the perp is trading above spot, longs pay shorts; when below, shorts pay longs.
+
+This bot's only active trade: pick a perp paying high positive funding, **buy the base asset on spot** and simultaneously **short the same base on the perp** in equal quantity. Net price exposure is zero (whatever spot does, the short perp does the opposite), so the position doesn't care if the underlying goes up or down. Each funding window, the short perp **receives** the funding payment from the long perp side. The position holds until either the funding rate falls below a threshold or 72 hours pass.
+
+#### Where the money comes from (and where it leaks)
 
 ```
-LONG spot   (own the base asset)
-SHORT perp  (hedge price + collect funding from longs)
+LONG spot   (own the base asset; hedge against the perp)
+SHORT perp  (collect funding from longs as long as funding rate > 0)
 ```
 
-Net price exposure ≈ 0. Returns come from:
+Returns come from:
 
-1. **Funding income** every funding window. Dominant on hot pairs.
-2. **Entry basis kicker** when the perp sells at a premium to where the spot buys.
-3. (Negative) **Worst-case adverse basis swing** between entry and exit (conservative model — see math below).
-4. (Negative) **Round-trip taker fees**: 2 spot legs + 2 perp legs + 2 USDC↔USDT swap legs if a stablecoin swap was needed.
+1. **Funding income** every funding window. Dominant on hot pairs — a perp paying 0.6% per 8h compounds to ~700% APY if it persists.
+2. **Entry basis kicker** when the perp sells at a premium to where the spot buys. If the bot fills spot at $1.00 and perp at $1.005, that 50 bps gap is locked-in profit on entry.
+
+And leaks:
+
+3. **Worst-case adverse basis swing** between entry and exit. The bot conservatively assumes basis moves against it by `m × |entry_basis|` (m default 3.0) by close time. Subtracts that from the funding income.
+4. **Round-trip taker fees** — 2 spot legs (entry + exit) + 2 perp legs (entry + exit) + 2 USDC↔USDT swap legs if a stablecoin swap was needed.
+
+The bot's gate compares **net APY** (funding − adverse basis − fees, all annualized) against the operator's threshold (default 20% net APY). Raw funding APY is NOT the threshold.
+
+#### Concrete example
+
+Operator sets entry threshold = 20% net APY. The scanner finds `XYZ/USDT:USDT` paying 0.025% funding per 4h, with a +30 bps entry basis (we sell the perp 30 bps above where we buy spot).
+
+- Funding per 4h = 0.025% = 2.5 bps
+- Worst-case basis cost (m=3, entry=30 bps) = −90 bps over the round trip
+- Round-trip fees (2 × spot + 2 × perp, ~6 bps each) ≈ −24 bps
+- Net per 4h window = 2.5 − 90/N − 24/N bps, where N = funding-windows-held expected count
+
+For the **first** window alone, the basis + fees overwhelm the funding. But the bot annualizes the *per-window* net: 2.5 − 90 − 24 = −111.5 bps per 4h, which is a deeply negative APY. The gate rejects this candidate.
+
+For a higher-funding candidate at 0.5%/4h:
+- Funding per 4h = 50 bps
+- Adverse basis (m=3, entry=30 bps) = −90 bps total round-trip cost
+- Fees ≈ −24 bps
+- Net per 4h window = 50 − 90 − 24 = ... actually wait — the basis and fee costs are *one-time* round-trip costs, not per-window. Better formulation:
+  - Per-window net = funding − (round-trip basis + fees) / N
+  - Annualized (compounded) = (1 + net_per_window_bps / 10000)^(24×365/i_h) − 1
+  - For 50 bps funding / 4h, with one-time costs of 90+24 = 114 bps amortised over (say) 18 windows held = 6.3 bps/window: net = 50 − 6.3 = 43.7 bps per 4h → APY ~ 16,000% (compounded). Cleared the gate.
+
+The bot's actual math is more conservative than this rough sketch — it treats the worst-case basis as a per-window cost (not amortised over expected hold) so the gate stays robust to early exits. See the formulas below.
 
 #### SOP per loop iteration
 
