@@ -16,16 +16,17 @@ The single living source of truth for what this bot does and how it works. Every
   - [3.2 Cross-venue funding arb (planned)](#32-cross-venue-funding-arb-planned)
   - [3.3 Onchain (planned)](#33-onchain-planned)
 - [4. Configuration](#4-configuration)
-- [5. Wallet model per venue](#5-wallet-model-per-venue)
-- [6. Database schema](#6-database-schema)
-- [7. Monitoring & diagnostics](#7-monitoring--diagnostics)
-- [8. Logs & rejection categories](#8-logs--rejection-categories)
-- [9. Failure modes & recovery](#9-failure-modes--recovery)
-- [10. Response policy (monitor chat)](#10-response-policy-monitor-chat)
-- [11. Crons](#11-crons)
-- [12. Doc-update policy](#12-doc-update-policy)
-- [13. Known fragile / deferred](#13-known-fragile--deferred)
-- [14. Changelog](#14-changelog)
+- [5. UI](#5-ui)
+- [6. Wallet model per venue](#6-wallet-model-per-venue)
+- [7. Database schema](#7-database-schema)
+- [8. Monitoring & diagnostics](#8-monitoring--diagnostics)
+- [9. Logs & rejection categories](#9-logs--rejection-categories)
+- [10. Failure modes & recovery](#10-failure-modes--recovery)
+- [11. Response policy (monitor chat)](#11-response-policy-monitor-chat)
+- [12. Crons](#12-crons)
+- [13. Doc-update policy](#13-doc-update-policy)
+- [14. Known fragile / deferred](#14-known-fragile--deferred)
+- [15. Changelog](#15-changelog)
 
 ---
 
@@ -85,7 +86,7 @@ Generate returns from **market-neutral funding-rate arbitrage** on centralized p
 | Public IPv4 | `45.32.53.166` (reverse DNS `45.32.53.166.vultrusercontent.com`) |
 | Public IPv6 | `2001:8f8:1165:1275:5cd8:e3ba:9660:e28e` |
 | SSH | `ssh linuxuser@45.32.53.166` (password in Vultr UI) |
-| Auto Backups | **NOT ENABLED** ⚠ (see §13) |
+| Auto Backups | **NOT ENABLED** ⚠ (see §14) |
 
 Both IPs are whitelisted on KuCoin's API key. Re-imaging or migrating instances requires re-whitelisting on KuCoin (and Binance if IP-restriction is enabled there).
 
@@ -209,7 +210,7 @@ Phase C — Entries (when entry_enabled, not at max_open_positions)
       pre-trade rebalance     (only when candidates_passing > 0 AND split-
                                 wallet venues: equalize spot ↔ futures.
                                 Gated on candidates so idle cycles don't
-                                shuffle wallets, see §5.2 + PR #33)
+                                shuffle wallets, see §6.2 + PR #33)
       auto-swap USDT↔USDC      (if a same-stable arb is starved)
    For each top-5 candidate:
       skip if base already held (incl. naked_spot)
@@ -507,16 +508,139 @@ Deprecated fields are kept in the schema (additive-only migration policy) but sh
 
 ---
 
-## 5. Wallet model per venue
+## 5. UI
 
-### 5.1 Binance Portfolio Margin (active)
+The bot has a FastAPI server (`app/main.py`) that serves HTML pages (Jinja2 templates under `app/templates/`) plus JSON / Markdown endpoints. **Single operator user**, HTTP Basic auth (`DASHBOARD_USER` / `DASHBOARD_PASSWORD`) on every route except `/health` and `/api/diagnostics`. There are no roles, no per-user state. The "view" toggle (paper vs live) is a session cookie (`view=paper|live`), not user account state.
+
+### 5.1 Layout
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  [logo]  paper▾  Dashboard  Transactions  Logs           │
+│                  Monitoring  Configuration  Safety       │
+├──────────────────────────────────────────────────────────┤
+│  (page content)                                          │
+└──────────────────────────────────────────────────────────┘
+```
+
+Nav bar is in `base.html`. All routed pages extend `base.html`. The paper/live toggle in the top-left switches the `view` cookie via a POST to `/view/{mode}`; the page reloads showing the data for that mode.
+
+### 5.2 Pages
+
+Six routed HTML pages + JSON / Markdown endpoints. **The "purpose" column is the SSOT — if you're rewriting from scratch, build each page to fulfil its purpose, not to mimic the current implementation.**
+
+| Page | Route | Purpose | Key contents (current) |
+|---|---|---|---|
+| **Dashboard** | `/dashboard` (and `/` redirects here) | "What's happening right now". The operator's home page. | KPI cards (current equity, net injected capital, total PnL, XIRR, open positions, fees paid, free deployable). Open positions table with expandable per-position detail (spot + perp leg cards). Closed positions table. Worker liveness alert. Stuck-position alert. |
+| **Transactions** | `/transactions` | "Every fill, sortable/filterable". | Trade rows (entry + exit legs), grouped by position. Per-row: timestamp, venue, leg (spot/futures), side, qty, price, fee. Filterable by date / symbol / mode. |
+| **Logs & Scans** | `/logs` | "What did the bot decide, and why didn't it trade?". | Two tables: `BotEvent` log (INFO/WARN/ERROR) + `RejectedCandidate` scan rejections (symbol, reason, funding APY at scan time). Filterable. The diagnostic alphabet from §9 is rendered here. |
+| **Monitoring** | `/monitoring` | "Is each venue's API healthy?". | One card per gateway (Binance, KuCoin, Onchain placeholder). Live probes: balance fetch, funding rates fetch, account-type detection, dust endpoint, capital-flow history. Each card shows OK/error per probe. Used to diagnose permission / IP / connectivity issues without diving into logs. |
+| **Configuration** | `/config` | "Set thresholds + per-strategy knobs". | Strategy tab strip (per active trade_type). Form with the active strategy's per-strategy fields + the shared global fields. POST routes per-strategy fields to that tab's row, globals to the singleton. See §4. |
+| **Safety & Rules** | `/safety` | "Read-only view of the active guardrails + API-key whitelist IP". | Outbound IP for API-key whitelisting. Per-mode entry/exit/maintenance flags. Active guardrails table (thresholds, leverage mode, hedge integrity, market-status check, loop interval). Mirror of `/config` but display-only with hint text. |
+
+### 5.3 Per-strategy UI rules
+
+After PR #35 (per-strategy config split):
+
+- **`/config`** has a tab strip with one tab per active trade_type. Switching tabs reloads with `?strategy=<trade_type>` and shows that strategy's per-strategy fields. Global fields display the same across all tabs.
+- **`/dashboard` position rows** carry `trade_type`. **Should** show "Threshold X% (binance_funding_arb)" inline per row so the operator can see per-position thresholds at a glance. *(Today still shows global threshold. Deferred follow-up.)*
+- **`/safety`** **should** mirror `/config`'s strategy tabs. *(Today shows global only. Deferred follow-up.)*
+- **`/monitoring`** already has per-strategy enable/exit state via `StrategyState`. Per-strategy config can be inlined into the same card per trade_type. *(Today not done.)*
+- **`/logs` rejection rows** carry `mode` + `exchange` but not `trade_type` directly. Filter by venue is the proxy; when per-strategy thresholds diverge between binance and kucoin, the rejection reason text already shows the threshold value used, so this is fine without further work.
+- **`/transactions`** rows carry `trade_type`. Adding a column or filter for it is a tiny UX improvement.
+
+### 5.4 Form-handling conventions
+
+- All forms POST to a route on the same path family (e.g. `/config` POSTs to `/config`).
+- POSTs return `303 See Other` redirecting back to the GET view, with a query param like `?saved=1` so the GET can render a banner.
+- Percent fields are submitted as percentages (e.g. `entry_min_net_apy_pct=20.0`) and divided by 100 in the handler. Underlying schema stays in decimal.
+- Toggle fields use `0|1` form values; cast to bool in the handler.
+- New form names should be additive (don't break old form posts mid-flight — accept aliases for one release cycle).
+- `auth: None = Depends(auth)` is the standard pattern; do not bypass it on any non-`/health`, non-`/api/diagnostics` route.
+
+### 5.5 Action endpoints (POSTs)
+
+Beyond config-save, the UI exposes these mutators:
+
+| Endpoint | Action |
+|---|---|
+| `POST /view/{mode}` | Switch the session's view cookie between `paper` and `live`. |
+| `POST /mode/{mode}/start` / `/stop` | Toggle `ModeState.entry_enabled` (and the maintenance flag's inverse). |
+| `POST /mode/{mode}/exit-all-stop` | Set maintenance mode + close everything currently open in that mode. |
+| `POST /strategies/{mode}/{trade_type}/start` / `/stop` | Per-strategy entry toggle. |
+| `POST /strategies/{mode}/{trade_type}/exit-all-stop` | Per-strategy exit-all. |
+| `POST /positions/{position_id}/close` | Manual close of a single open position. |
+| `POST /run-once` | Trigger one immediate cycle (for testing — usually the auto-loop suffices). |
+| `POST /worker/start` | Start the background loop if it died. |
+| `POST /admin/reingest-flows` | Replay capital-flow history ingestion. |
+
+Every action POST has a `confirm()` `onsubmit` handler in the template — JS dialog asks "Are you sure?" before the form submits. This is the only soft safety; there's no second-factor or audit-log step.
+
+### 5.6 JSON / Markdown endpoints
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `GET /health` | none | Liveness for Coolify / uptime monitors. Returns `{"ok": true}`. |
+| `GET /api/diagnostics?token=...&hours=...` | `DIAGNOSTICS_TOKEN` | Structured snapshot. See §8. |
+| `GET /monitoring/export.md` | dashboard auth | Markdown dump of monitoring state — for pasting into chat / share. |
+
+### 5.7 Templates
+
+| Template | Routes | Notes |
+|---|---|---|
+| `base.html` | (all) | Nav bar, view toggle, static-asset versioning. |
+| `dashboard.html` | `/dashboard` | KPIs + open positions + closed positions + alerts. |
+| `transactions.html` | `/transactions` | Trade table with filters. |
+| `logs.html` | `/logs` | BotEvent + RejectedCandidate tables. |
+| `monitoring.html` | `/monitoring` | Per-gateway probe cards. |
+| `config.html` | `/config` | Strategy tab strip + form. |
+| `safety.html` | `/safety` | Read-only guardrails view + IP whitelist helper. |
+
+### 5.8 What to keep, what to throw away (for a rewrite)
+
+If we're rebuilding the UI from scratch, **keep**:
+
+- The page taxonomy (Dashboard / Transactions / Logs / Monitoring / Configuration / Safety) — these names match operator vocabulary.
+- The paper/live view toggle as a session cookie — it's the right ergonomic.
+- The KPI-cards-then-tables layout on Dashboard.
+- The expandable per-position leg detail (it's the most operator-friendly thing in the current UI).
+- The `/api/diagnostics` JSON contract (§8) — external monitor + cron rely on it.
+- `/health` shape (`{"ok": true}`) — Coolify pings this.
+
+**Reconsider:**
+
+- Form-by-percentage convention (`*_pct` field names) — works but produces ugly Python signatures. A nicer pattern: submit decimal, JS displays as percent.
+- Mixing display + edit on `/safety` (it duplicates `/config`). Either delete `/safety` or make it strictly an "active state" snapshot that's auto-derived.
+- Per-strategy display gaps (§5.3 above) — fix while you're rewriting.
+- The "naked spot" rendering path. Today there's special handling in `dashboard.html` for `status='naked_spot'` (suppress fake perp leg). A from-scratch rewrite could unify this into a generic "position has missing leg" component.
+
+**Throw away:**
+
+- Deprecated form fields still showing on `/safety` (`min_24h_quote_volume`, `min_order_book_depth_usdt`, etc. were purged from `/config` in PR #34 — but check `/safety` and `/monitoring` exports for stragglers).
+- Any `<input>` whose `name` is still `entry_funding_threshold_pct` rather than `entry_min_net_apy_pct` — accepted as a back-compat alias for one cycle, drop after the next release.
+- The strategy placeholder rows on `/config` for trade-types that aren't wired (cross-venue, IBKR) — keep as "coming soon" notes but don't render disabled form controls.
+
+### 5.9 UI dependencies
+
+- **Jinja2** for templating. No SSR framework beyond that.
+- **Vanilla JS** for `togglePositionDetail`, sortable tables, filterable rows (one file: `app/static/tables.js`).
+- **CSS** in `app/static/style.css`. Custom theme; no UI framework (no Bootstrap, no Tailwind).
+- **No build step.** The `NIXPACKS_NODE_VERSION` env var exists in Coolify but the repo has no JS build — Nixpacks runs a Node phase that does nothing.
+
+If we rewrite, the build-step-free Vanilla setup is worth preserving — it keeps the deploy story trivial. A from-scratch UI in HTMX + a tiny amount of Alpine.js (or pure server-rendered Jinja, same as today) would be appropriate. Avoid React / SPA churn.
+
+---
+
+## 6. Wallet model per venue
+
+### 6.1 Binance Portfolio Margin (active)
 - Unified pool: one balance per asset, used for both spot and perp.
 - Synthesised `futures.<asset>.free` mirrors `spot.<asset>.free`; `futures.<asset>.total = 0` by convention to avoid double-counting in equity sums.
 - `is_unified_margin() → True`.
 - `transfer_*_to_spot` / `_to_futures` are no-ops on PM (return early).
 - Balance fetch: `/papi/v1/balance` → free = `crossMarginFree + umWalletBalance + cmWalletBalance`.
 
-### 5.2 KuCoin Classic (active)
+### 6.2 KuCoin Classic (active)
 - Three+ spot wallets: `main`, `trade`, `contract`, `margin`, `isolated`, `pool`.
 - `is_unified_margin() → False` (returns `self._is_uta`).
 - Synthesised `spot.<asset>.free = main + trade` (aggregated). Spot orders only execute against `trade`.
@@ -530,21 +654,21 @@ Deprecated fields are kept in the schema (additive-only migration policy) but sh
 - Identical-error dedup: repeated transfer failures with the same message are throttled via `_TRANSFER_ERROR_CACHE` (same pattern as `_CLOSE_ERROR_CACHE`).
 - `pool` (KuCoin Earn) is time-locked; never swept.
 
-### 5.3 KuCoin UTA (not active today)
+### 6.3 KuCoin UTA (not active today)
 - Single unified pool. `is_unified_margin() → True`. Transfer methods are no-ops.
 
-### 5.4 Cross-stable USDT ↔ USDC
+### 6.4 Cross-stable USDT ↔ USDC
 - Per-quote sizing reads `spot_free_by_q[sq]` and `fut_free_by_q[cq]`. For cross-stable arbs `sq ≠ cq`.
 - Auto-swap fires only for same-stable arbs (`sq == cq`) when the relevant pool is below `min_notional` and the other stable has surplus.
 - Swap path: `swap_quote(from, to, target)` walks USDC/USDT book, places limit-IOC at worst + tick, with a ±50 bps de-peg guard. Cost is charged to the profitability gate.
 
 ---
 
-## 6. Database schema
+## 7. Database schema
 
 SQLite default (`bot.db`). Schema in `app/models.py`. Migrations are additive-only `ALTER TABLE ADD COLUMN` calls run at startup (`app/db.py`).
 
-### 6.1 Tables
+### 7.1 Tables
 
 | Table | Purpose |
 |---|---|
@@ -560,7 +684,7 @@ SQLite default (`bot.db`). Schema in `app/models.py`. Migrations are additive-on
 | `capital_flows` | Deposits / withdrawals / sub-transfers, ingested from venue history for XIRR. |
 | `scan_results` | Per-cycle scan summary. |
 
-### 6.2 Position lifecycle
+### 7.2 Position lifecycle
 
 ```
                    (entry path)                            (recovery path)
@@ -583,7 +707,7 @@ SQLite default (`bot.db`). Schema in `app/models.py`. Migrations are additive-on
 
 **Stale reconciliation**: any `naked_spot` Position whose spot wallet balance is gone (sold externally, dust-converted by a prior cycle, Earn redemption) is auto-closed at the top of every live cycle by `recover_phantom_spot`.
 
-### 6.3 Migration policy
+### 7.3 Migration policy
 
 - **Additive only.** Never drop columns. Code may stop reading a column; the column stays.
 - New columns get a sensible `DEFAULT`. Idempotent.
@@ -591,9 +715,9 @@ SQLite default (`bot.db`). Schema in `app/models.py`. Migrations are additive-on
 
 ---
 
-## 7. Monitoring & diagnostics
+## 8. Monitoring & diagnostics
 
-### 7.1 `/api/diagnostics?token=<DIAGNOSTICS_TOKEN>&hours=<1-168>`
+### 8.1 `/api/diagnostics?token=<DIAGNOSTICS_TOKEN>&hours=<1-168>`
 
 Reference: `app/main.py:api_diagnostics`. Auth: `?token=`. Returns `503` if the env var is unset.
 
@@ -617,7 +741,7 @@ anomalies              [ {severity, rule, detail}, ... ]
 anomalies_count        int
 ```
 
-### 7.2 Anomaly rules
+### 8.2 Anomaly rules
 
 | Rule | Severity | Trigger |
 |---|---|---|
@@ -627,7 +751,7 @@ anomalies_count        int
 | `error_burst` | warn | > 20 ERROR events in window |
 | `close_blocked` | warn | Open Position with non-empty `last_close_error` |
 
-### 7.3 Cron + tracker
+### 8.3 Cron + tracker
 
 `.github/workflows/diagnostics.yml` runs every 3h. Required repo secrets: `BOT_URL`, `DIAGNOSTICS_TOKEN`.
 
@@ -640,15 +764,15 @@ The cron pipes the JSON into `.github/scripts/diagnostics_post.py`, which uses t
 
 The comment fires the GitHub webhook every run — that's how the monitor chat hears about all cycles, not just bad ones.
 
-### 7.4 Monitor chat
+### 8.4 Monitor chat
 
-Separate Claude session. Reads this doc on every wake-up. Subscribes to the tracker via `subscribe_pr_activity`. Responds per the policy in §10.
+Separate Claude session. Reads this doc on every wake-up. Subscribes to the tracker via `subscribe_pr_activity`. Responds per the policy in §11.
 
 ---
 
-## 8. Logs & rejection categories
+## 9. Logs & rejection categories
 
-### 8.1 Rejection categories (`rejections_grouped`)
+### 9.1 Rejection categories (`rejections_grouped`)
 
 | Category | Meaning | Action when dominant |
 |---|---|---|
@@ -665,7 +789,7 @@ Separate Claude session. Reads this doc on every wake-up. Subscribes to the trac
 | `spot_ioc_zero_fill` / `perp_ioc_zero_fill` | Book moved during round-trip. Transient. | None — retries next cycle. |
 | `strategy_disabled:<trade_type>` | Operator killed strategy via `/config`. | None unless unintentional. |
 
-### 8.2 Common log patterns (informational)
+### 9.2 Common log patterns (informational)
 
 - `Spot wallet consolidate <asset>: X main→trade` — KuCoin Classic sweep working.
 - `Wallet snapshot <q> [Classic|UTA]·split|unified: spot free/total=...; fut free/total=...` — per-cycle wallet state.
@@ -678,7 +802,7 @@ Separate Claude session. Reads this doc on every wake-up. Subscribes to the trac
 - `Dust sweep CLOSED N naked_spot position(s)` — auto-conversion to BNB/KCS succeeded.
 - `Stale naked_spot reconciled: <asset> no longer in spot wallet — marked closed` — stale cleanup fired.
 
-### 8.3 Log patterns that indicate a regression
+### 9.3 Log patterns that indicate a regression
 
 - `Loop iteration error (<mode>): name '<X>' is not defined` — Python NameError from a missing import. Open a PR. Past examples: `total_funding_income`, `rt_basis_bps`.
 - `Reservation clamp on <symbol>` — should NOT appear (clamp moved inside walk loop in PR #12). If it surfaces, regression.
@@ -686,7 +810,7 @@ Separate Claude session. Reads this doc on every wake-up. Subscribes to the trac
 
 ---
 
-## 9. Failure modes & recovery
+## 10. Failure modes & recovery
 
 | Failure | Detection | Recovery |
 |---|---|---|
@@ -702,7 +826,7 @@ Separate Claude session. Reads this doc on every wake-up. Subscribes to the trac
 
 ---
 
-## 10. Response policy (monitor chat)
+## 11. Response policy (monitor chat)
 
 The cron posts a heartbeat comment on the tracker every run — anomalies or not.
 
@@ -721,7 +845,7 @@ For each anomaly, choose:
 | Well-understood, no code change (e.g. dust will sweep next cycle) | **Comment** with one-line diagnosis. |
 | Known transient (book moved, network blip) | **Skip** if clears next cycle; comment otherwise. |
 | Clear code regression (NameError, broken endpoint, latent bug) | **Open PR**. Reference the SYSTEM.md section the fix touches. |
-| New venue error code not handled | **Open PR** adding handler + new rejection category in §8.1. |
+| New venue error code not handled | **Open PR** adding handler + new rejection category in §9.1. |
 | Strategy / threshold change | **Ask** the operator before acting. |
 | Operator-action-required (e.g. asset with no USDT pair) | **Comment** with the manual step. |
 | Anything ambiguous | **Ask** on the thread. |
@@ -741,11 +865,11 @@ Combine related anomalies into one reply.
 2. Small, focused. No drive-by refactors.
 3. Smoke: `python -c "import app.main"` + `curl /health` if route surface changed.
 4. Use `mcp__github__create_pull_request` + `mcp__github__merge_pull_request` (proxy blocks direct push).
-5. **Update SYSTEM.md** in the same PR if behavior changed (§12 makes this binding).
+5. **Update SYSTEM.md** in the same PR if behavior changed (§13 makes this binding).
 
 ---
 
-## 11. Crons
+## 12. Crons
 
 | Job | Schedule | Trigger | Side effects |
 |---|---|---|---|
@@ -756,26 +880,26 @@ No external crons beyond these.
 
 ---
 
-## 12. Doc-update policy
+## 13. Doc-update policy
 
 **Binding.** Every PR that changes BEHAVIOR — not just refactors — must update `docs/SYSTEM.md` in the same PR. Specifically:
 
 - New strategy or trade-type → §3.
 - New phase / step in the cycle → §3.1 SOP.
 - Math change (formula, threshold default, gate logic) → §3.1 math + §0 definitions if a new term is used.
-- New venue / wallet type / transfer route → §5.
-- New DB column or status value → §6.2.
+- New venue / wallet type / transfer route → §6.
+- New DB column or status value → §7.2.
 - New env var → §2.2 + §4.
 - New `StrategyConfig` field → §4.
-- New `/api/*` endpoint or anomaly rule → §7.
-- New rejection category or log pattern → §8.
-- New failure mode + recovery → §9.
+- New `/api/*` endpoint or anomaly rule → §8.
+- New rejection category or log pattern → §9.
+- New failure mode + recovery → §10.
 
 Reviewers reject PRs that change behavior without updating this doc. When in doubt, add a one-liner — better to over-document than under.
 
 ---
 
-## 13. Known fragile / deferred
+## 14. Known fragile / deferred
 
 - **Vultr Auto Backups are NOT enabled.** Single-instance SQLite DB on local NVMe. Loss = entire trade / position / event history. Enable Vultr backups (~$1/mo) or run an off-host backup cron.
 - ~~**Per-strategy config split**~~ — shipped in PR #35. New `StrategyConfigPerStrategy` table; `MergedConfig` proxy reads global + per-strategy.
@@ -784,44 +908,44 @@ Reviewers reject PRs that change behavior without updating this doc. When in dou
 - **Maker-on-exit fee optimization** not implemented. ~30% of exit fees could be saved with post-only-with-timeout-fallback.
 - **Symbol mapping drift** across ccxt versions could leave open positions un-lookupable for exit funding refresh. Currently logs a WARN and falls back to stale `last_funding_rate`.
 - **Cross-venue + onchain strategies** are roadmap, not implemented.
-- ~~KuCoin `futures→spot` drain 112002 / 250001 / oscillation~~ **resolved in PR #29 (routing) + PR #33 (two-hop + idle-cycle gate)** — see §5.2.
+- ~~KuCoin `futures→spot` drain 112002 / 250001 / oscillation~~ **resolved in PR #29 (routing) + PR #33 (two-hop + idle-cycle gate)** — see §6.2.
 
 ---
 
-## 14. Changelog
+## 15. Changelog
 
 Append-only. Format: `YYYY-MM-DD · PR# · §sections touched · summary`.
 
 | Date | PR | Sections | Summary |
 |---|---|---|---|
-| 2026-05-11 | #35 | §4, §13 | Per-strategy config split: new `StrategyConfigPerStrategy` table (one row per trade_type) holds strategy-specific fields (thresholds, sizing, execution, wallet). `StrategyConfig` keeps account/process/mode-level globals. `MergedConfig` proxy lets bot.py call sites read transparently — pass `trade_type` to `get_strategy_config()`. `/config` gets a strategy tab selector; POSTs route per-strategy fields to the active tab's row, global fields to the singleton. Per-strategy rows lazily seeded from global on first read. |
-| 2026-05-11 | #34 | §0, §3.1 math, §4, §13 | Renamed `entry/exit_funding_threshold` → `entry/exit_min_net_apy` (config_schema_version v1→v2 migration). Removed deprecated form fields (`max_entry_basis_bps`, `min_24h_quote_volume`, `min_order_book_depth_usdt`, `depth_band_bps`). Form accepts both new and legacy field names for one release cycle. |
-| 2026-05-11 | #33 | §3.1, §5.2, §9, §13 | Break KuCoin drain↔rebalance oscillation. (1) Gate pre-trade rebalance on `candidates_passing > 0` (no point equalising wallets when there's no trade to fund). (2) `transfer_futures_to_spot` is now a two-hop: futures `CONTRACT → MAIN` via `transferOut`, then spot `MAIN → TRADE` via inner-transfer. Funds land where the spot order book can spend them without waiting a cycle for `consolidate_spot_wallets`. |
+| 2026-05-11 | #35 | §4, §14 | Per-strategy config split: new `StrategyConfigPerStrategy` table (one row per trade_type) holds strategy-specific fields (thresholds, sizing, execution, wallet). `StrategyConfig` keeps account/process/mode-level globals. `MergedConfig` proxy lets bot.py call sites read transparently — pass `trade_type` to `get_strategy_config()`. `/config` gets a strategy tab selector; POSTs route per-strategy fields to the active tab's row, global fields to the singleton. Per-strategy rows lazily seeded from global on first read. |
+| 2026-05-11 | #34 | §0, §3.1 math, §4, §14 | Renamed `entry/exit_funding_threshold` → `entry/exit_min_net_apy` (config_schema_version v1→v2 migration). Removed deprecated form fields (`max_entry_basis_bps`, `min_24h_quote_volume`, `min_order_book_depth_usdt`, `depth_band_bps`). Form accepts both new and legacy field names for one release cycle. |
+| 2026-05-11 | #33 | §3.1, §6.2, §10, §14 | Break KuCoin drain↔rebalance oscillation. (1) Gate pre-trade rebalance on `candidates_passing > 0` (no point equalising wallets when there's no trade to fund). (2) `transfer_futures_to_spot` is now a two-hop: futures `CONTRACT → MAIN` via `transferOut`, then spot `MAIN → TRADE` via inner-transfer. Funds land where the spot order book can spend them without waiting a cycle for `consolidate_spot_wallets`. |
 | 2026-05-11 | #32 | tooling | `diagnostics_post.py`: post heartbeat comment **before** body edit, make body edit non-fatal, trim payload. Body-too-large 504s no longer block the comment, which is what fires the monitor chat webhook. |
 | 2026-05-11 | #31 | rewrite | SYSTEM.md v1.0 — full rewrite after operator audit. Definitions upfront, per-strategy SOP + math, config layers explained, deprecated fields called out, exit-logic regression `rt_basis_bps` → `rt_basis_signed_bps` fixed alongside. |
-| 2026-05-11 | #29 | §5.2, §9, §13 | KuCoin futures→spot drain uses the futures-side `transferOut` endpoint (legacy `/api/v1/transfer-out`) instead of the spot-side universal-transfer (which can't see the futures wallet). `wallet_breakdown` USDC contract under-report fixed. Identical-error dedup via `_TRANSFER_ERROR_CACHE`. Resolved the 112002 deferred item. |
-| 2026-05-11 | #30 | §6.2, §9 | Don't render fake perp leg for `naked_spot`; auto-close stale naked rows. |
-| 2026-05-11 | #27 | §7, §10, §11 | Heartbeat-model diagnostics tracker. Monitor always knows the cron ran. |
+| 2026-05-11 | #29 | §6.2, §10, §14 | KuCoin futures→spot drain uses the futures-side `transferOut` endpoint (legacy `/api/v1/transfer-out`) instead of the spot-side universal-transfer (which can't see the futures wallet). `wallet_breakdown` USDC contract under-report fixed. Identical-error dedup via `_TRANSFER_ERROR_CACHE`. Resolved the 112002 deferred item. |
+| 2026-05-11 | #30 | §7.2, §10 | Don't render fake perp leg for `naked_spot`; auto-close stale naked rows. |
+| 2026-05-11 | #27 | §8, §11, §12 | Heartbeat-model diagnostics tracker. Monitor always knows the cron ran. |
 | 2026-05-11 | #26 | §2 | Vultr specs + KuCoin permissions clarification + backup-risk callout. |
 | 2026-05-11 | #25 | §2, §4 | Operator-provided setup details rolled in. |
 | 2026-05-11 | #24 | new | SYSTEM.md v0.1 first cut. |
-| 2026-05-11 | #21 | §3.1, §9 | Auto-convert dust to BNB/KCS via venue dust endpoints. |
-| 2026-05-11 | #20 | §8.3, §9 | Fix `total_funding_income` NameError. Silence dust spam. LDUSDT filter. Workflow label fallback. |
-| 2026-05-11 | #18 | §7 | `/api/diagnostics` endpoint + GitHub Actions cron + tracker. |
-| 2026-05-11 | #17 | §6.2, §8 | Naked positions are first-class in dashboard + transactions. |
+| 2026-05-11 | #21 | §3.1, §10 | Auto-convert dust to BNB/KCS via venue dust endpoints. |
+| 2026-05-11 | #20 | §9.3, §10 | Fix `total_funding_income` NameError. Silence dust spam. LDUSDT filter. Workflow label fallback. |
+| 2026-05-11 | #18 | §8 | `/api/diagnostics` endpoint + GitHub Actions cron + tracker. |
+| 2026-05-11 | #17 | §7.2, §9 | Naked positions are first-class in dashboard + transactions. |
 | 2026-05-11 | #16 | §3.1 math | Charge auto-swap fees in profitability gate. |
-| 2026-05-11 | #15 | §5.2, §9 | Hedge phantom spot via perp when profitable. KuCoin futures per-currency fetch. |
-| 2026-05-11 | #14 | §3.1 SOP, §9 | Recover orphaned spot positions + partial-fill detection. |
-| 2026-05-11 | #13 | §5.2 | KuCoin sweep margin/isolated + `wallet_breakdown` diagnostic. |
-| 2026-05-11 | #12 | §3.1, §5, §6 | Audit cleanups: reservation clamp in walk loop, exit funding refresh, sign math, migration v1, dead-config purge. |
-| 2026-05-11 | #11 | §8 | `below_threshold` log shows net APY (the number actually compared). |
+| 2026-05-11 | #15 | §6.2, §10 | Hedge phantom spot via perp when profitable. KuCoin futures per-currency fetch. |
+| 2026-05-11 | #14 | §3.1 SOP, §10 | Recover orphaned spot positions + partial-fill detection. |
+| 2026-05-11 | #13 | §6.2 | KuCoin sweep margin/isolated + `wallet_breakdown` diagnostic. |
+| 2026-05-11 | #12 | §3.1, §6, §7 | Audit cleanups: reservation clamp in walk loop, exit funding refresh, sign math, migration v1, dead-config purge. |
+| 2026-05-11 | #11 | §9 | `below_threshold` log shows net APY (the number actually compared). |
 | 2026-05-10 | #10 | §3.1 math | Reservation-aware target_qty clamp. |
 | 2026-05-10 | #9 | §3.1, §4 | Dropped `basis_dislocated` gate; profitability-only economic check. |
-| 2026-05-10 | #8 | §3.1, §8 | KuCoin book-walk limit fix, sign-aware basis, funding APY diagnostic. |
-| 2026-05-10 | #7 | §5.2 | KuCoin Classic spot-wallet consolidation. |
+| 2026-05-10 | #8 | §3.1, §9 | KuCoin book-walk limit fix, sign-aware basis, funding APY diagnostic. |
+| 2026-05-10 | #7 | §6.2 | KuCoin Classic spot-wallet consolidation. |
 
 (Older history in `git log`.)
 
 ---
 
-> **For the monitor chat:** Always read this doc from the latest `main` before judging anomalies. The definitions (§0), strategy SOP + math (§3), rejection categories (§8), failure modes (§9), and response policy (§10) are your operating manual.
+> **For the monitor chat:** Always read this doc from the latest `main` before judging anomalies. The definitions (§0), strategy SOP + math (§3), rejection categories (§9), failure modes (§10), and response policy (§11) are your operating manual.
