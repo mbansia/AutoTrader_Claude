@@ -28,6 +28,7 @@ The single living source of truth for what this bot does and how it works. Every
 - [14. Known fragile / deferred](#14-known-fragile--deferred)
 - [15. Changelog](#15-changelog)
 - [16. Learnings](#16-learnings)
+- [17. Rewrite plan](#17-rewrite-plan-core--ui-from-scratch)
 
 ---
 
@@ -649,19 +650,155 @@ SQLite by default (configurable via `DATABASE_URL`). Schema is defined declarati
 
 ### 7.1 Tables
 
+**This schema is a frozen contract.** The rewrite must preserve every table + column listed below by name and semantic. Adding new columns is fine (additive policy). Renaming or dropping anything breaks the doc-update history, the in-flight migration cursor, and any external tooling reading the SQLite file directly.
+
 | Table | Purpose |
 |---|---|
-| `strategy_config` | Singleton, operator-tuned config. See §4. |
-| `mode_state` | Per-mode (paper/live) toggles: `entry_enabled`, `exit_enabled`, `maintenance_mode`. |
-| `strategy_state` | Per-(mode, trade_type) toggles: `entry_enabled`, `exit_all_pending`. |
-| `positions` | Lifecycle: `open → naked_spot → closed`. Carries entry prices, funding accruals, last error. |
-| `trades` | One row per fill. Tagged to a Position. Used by P&L + transactions tab. |
-| `bot_events` | Logs at INFO / WARN / ERROR. Source of the `/logs` page and `recent_events` in diagnostics. |
-| `rejected_candidates` | Scan rejections — what failed which gate, with reason category. |
-| `balance_snapshots` | Per-cycle wallet snapshot per venue. |
-| `equity_curve` | Per-cycle equity history per venue. |
-| `capital_flows` | Deposits / withdrawals / sub-transfers, ingested from venue history for XIRR. |
-| `scan_results` | Per-cycle scan summary. |
+| `strategy_config` | Singleton, global runtime config (account/process/mode-level fields). See §4. Row id always `1`. |
+| `strategy_config_per_strategy` | One row per strategy (`trade_type`). Holds strategy-specific runtime config. Unique key on `trade_type`. |
+| `mode_state` | Per-mode (paper/live) master toggles: `entry_enabled`, `exit_enabled`, `maintenance_mode`. PK: `mode`. |
+| `strategy_state` | Per-(mode, trade_type) strategy-level toggles: `entry_enabled`, `exit_all_pending`. PK: composite (`mode`, `trade_type`). |
+| `positions` | Lifecycle: `open → naked_spot → closed`. Carries entry prices, funding accruals, last close error. |
+| `trades` | One row per fill. Tagged to a `position_id` (nullable). Used by P&L + transactions UI. |
+| `bot_events` | Logs at INFO / WARN / ERROR. Source of the `/logs` UI and `recent_events` in `/api/diagnostics`. Timestamp column is `ts`. |
+| `rejected_candidates` | Scan rejections — symbol, reason, funding APR at scan time, ts. Source of the `/logs` UI and `rejections_grouped` in `/api/diagnostics`. |
+| `balance_snapshots` | Per-cycle wallet snapshot per (mode, venue). Source of trailing equity. |
+| `equity_curve` | Per-cycle equity history per (mode, venue). |
+| `capital_flows` | Deposits / withdrawals / sub-transfers, ingested from venue history. Source of net-injected-capital figure + XIRR. Unique key on `external_id` for idempotent ingestion. |
+| `scan_results` | Per-cycle scan summary (action, candidate counts, top candidates). |
+
+### 7.1.1 Frozen column contracts
+
+Only the columns the rewrite MUST preserve are listed here. Additional columns may have accumulated over time (see additive policy in §7.3); the rewrite can carry them as-is or ignore them, but should not drop them.
+
+**`strategy_config`** (singleton with `id = 1`):
+
+| Column | Type | Semantics |
+|---|---|---|
+| `id` | integer PK | Always `1`. |
+| `config_schema_version` | integer, default 0 | Persisted migration cursor. Gates one-shot value transforms. |
+| `max_open_positions` | integer, default 1 | Account-level cap across all strategies / venues per mode. |
+| `max_trades_per_day` | integer, default 8 | Soft per-mode entry cap (UTC day). |
+| `loop_seconds` | integer, default 30 | Cycle period. |
+| `paper_starting_equity` | float, default 1000 | Paper virtual capital. |
+| `paper_slippage_bps` | float, default 5 | Paper synthetic slippage. |
+| `paper_fee_bps` | float, default 4 | Paper synthetic fee. |
+| `enforce_hedge_check` | bool, default true | Phase-A hedge integrity verification toggle. |
+| `delisting_check` | bool, default true | Phase-A market-health verification toggle. |
+| `updated_at` | datetime | Auto-updated. |
+
+Legacy columns retained for back-compat (no longer read): `entry_funding_threshold`, `exit_funding_threshold` (renamed → `entry_min_net_apy`, `exit_min_net_apy` on the per-strategy table); deprecated columns enumerated in §4.
+
+**`strategy_config_per_strategy`** (one row per active `trade_type`):
+
+| Column | Type | Semantics |
+|---|---|---|
+| `id` | integer PK | Auto-increment. |
+| `trade_type` | string, unique | Strategy identifier (e.g. `binance_same_venue_funding_arb`). |
+| `entry_min_net_apy` | float, default 0.20 | Open only when net APY ≥ this. |
+| `exit_min_net_apy` | float, default 0.05 | Forward net APY below this → close. |
+| `exit_basis_buffer_multiple` | float, default 3.0 | Worst-case-exit-basis multiplier (`m` in §3.1 math). |
+| `max_exit_basis_bps` | float, default 5.0 | Defer voluntary exits until live basis ≤ this. |
+| `stop_loss_pct` | float, default −0.02 | Mandatory exit when `unrealized_PnL / notional ≤ this`. |
+| `max_hold_hours` | integer, default 72 | Time-based exit. |
+| `min_position_pct` | float, default 0.005 | Sizing floor as fraction of equity. |
+| `max_position_pct` | float, default 0.10 | Sizing ceiling. |
+| `entry_tick_buffer_bps` | float, default 1.0 | Limit-IOC entry price padding above worst-fill. |
+| `exit_tick_buffer_bps` | float, default 2.0 | Same on exit. |
+| `perp_leverage` | integer, default 1 | Only safe value for delta-neutral. |
+| `max_perp_leverage` | integer, default 1 | Hard cap (also displayed on dashboard). |
+| `auto_transfer_enabled` | bool, default true | Pre-trade spot↔futures rebalance toggle. |
+| `auto_quote_swap_enabled` | bool, default true | Auto-swap USDT↔USDC pre-trade toggle. |
+| `futures_buffer_pct` | float, default 0.20 | Margin buffer kept on futures wallet during post-cycle drain. |
+| `updated_at` | datetime | Auto-updated. |
+
+**`positions`**:
+
+| Column | Type | Semantics |
+|---|---|---|
+| `id` | integer PK | Auto-increment. |
+| `mode` | string, indexed | `'paper'` or `'live'`. |
+| `exchange` | string, indexed | Venue id (`binance`, `kucoin`). |
+| `trade_type` | string, indexed | Strategy identifier. |
+| `status` | string, indexed | `'open'` \| `'naked_spot'` \| `'closed'`. Open-statuses tuple: `('open', 'naked_spot')`. |
+| `symbol` | string, indexed | Base asset (`BTC`, `ETH`). |
+| `spot_symbol` | string | e.g. `BTC/USDT`. |
+| `perp_symbol` | string | e.g. `BTC/USDT:USDT`. |
+| `quote_currency` | string, indexed | Perp's quote (e.g. `USDT`). |
+| `spot_quote_currency` | string, indexed | Spot's quote (differs from `quote_currency` for cross-stable arbs). |
+| `quantity` | float | Base-asset qty. |
+| `opened_at` | datetime | Set at first leg fill. |
+| `entry_funding_rate` | float | At entry (decimal per window). |
+| `last_funding_rate` | float | Refreshed every cycle while open. |
+| `spot_entry_price` | float | Real for `open`; current-mid estimate for reconstructed `naked_spot`. |
+| `perp_entry_price` | float | Real for `open`; `0` sentinel for `naked_spot` (UI must suppress display). |
+| `funding_interval_hours` | float, default 8 | Read from contract metadata. |
+| `funding_income_accrued` | float, default 0 | Paper-mode accrual; live mode infers from balance delta. |
+| `last_funding_accrual_ts` | datetime | Last accrual touch. |
+| `last_close_error` | text, default empty | Stuck-close diagnostic; empty when none. |
+| `closed_at` | datetime, nullable | Set when status → `'closed'`. |
+
+**`trades`**:
+
+| Column | Type | Semantics |
+|---|---|---|
+| `id` | integer PK | |
+| `mode` | string, indexed | |
+| `exchange` | string, indexed | |
+| `trade_type` | string, indexed | Mirrored from the parent position. |
+| `position_id` | integer, indexed, nullable | NULL for ghost-entries reconstructed during naked-spot recovery. |
+| `symbol` | string, indexed | |
+| `venue` | string | `'spot'` or `'futures'` — the leg. |
+| `side` | string | `'buy'` or `'sell'`. |
+| `quantity` | float | |
+| `price` | float | |
+| `fee` | float, default 0 | |
+| `ts` | datetime, indexed | |
+
+**`bot_events`**:
+
+| Column | Type | Semantics |
+|---|---|---|
+| `id` | integer PK | |
+| `mode` | string, indexed | |
+| `exchange` | string, indexed | `'binance'`, `'kucoin'`, or `'system'` for cross-venue events. |
+| `level` | string | `'INFO'` \| `'WARN'` \| `'ERROR'`. |
+| `message` | text | |
+| `ts` | datetime, indexed | |
+| `requires_action` | bool, default false | Flag for the UI to highlight. |
+
+**`rejected_candidates`**:
+
+| Column | Type | Semantics |
+|---|---|---|
+| `id` | integer PK | |
+| `mode` | string, indexed | |
+| `exchange` | string, indexed | |
+| `symbol` | string, indexed | Usually the perp symbol. |
+| `reason` | text | Free-form: `<category> (<detail>)`. The category before the parenthesis drives `rejections_grouped` in diagnostics. |
+| `funding_rate` | float | APR at scan time (for sorting / display). |
+| `ts` | datetime | |
+
+**`mode_state`**:
+
+| Column | Type | Semantics |
+|---|---|---|
+| `mode` | string PK | `'paper'` or `'live'`. |
+| `entry_enabled` | bool, default true | Master entry switch for this mode. |
+| `exit_enabled` | bool, default true | Master exit switch. |
+| `maintenance_mode` | bool, default false | When true: block new entries, force-close existing positions. |
+| `updated_at` | datetime | |
+
+**`strategy_state`**:
+
+| Column | Type | Semantics |
+|---|---|---|
+| `mode` | string, PK part | |
+| `trade_type` | string, PK part | |
+| `entry_enabled` | bool, default true | Per-strategy entry toggle. |
+| `exit_all_pending` | bool, default false | When true: force-close every open position of this strategy + disable entries. |
+
+**`balance_snapshots`**, **`equity_curve`**, **`capital_flows`**, **`scan_results`**: structurally simpler tables; preserve `ts`, `mode`, `exchange`, and the obvious value columns. `capital_flows.external_id` must remain `UNIQUE` so re-ingestion of venue history is idempotent.
 
 ### 7.2 Position lifecycle
 
@@ -700,25 +837,123 @@ SQLite by default (configurable via `DATABASE_URL`). Schema is defined declarati
 
 Auth: `?token=...` matched against the `DIAGNOSTICS_TOKEN` env var. Returns `503` if the env var is unset (refuses to be silently public).
 
-Returns JSON with these top-level keys:
+**This shape is a frozen contract.** The external diagnostics cron, the tracker-issue post script, and any monitor chat that subscribes to the tracker all rely on it. The rewrite MUST preserve it byte-for-byte; any field added is fine, any field removed or renamed breaks downstream.
+
+Response shape (all timestamps are ISO-8601 UTC strings ending in `Z`):
 
 ```
-generated_at_utc       ISO-8601 UTC timestamp
-window_hours           the lookback window the caller requested
+{
+  "generated_at_utc":   string,    // when this snapshot was produced
+  "window_hours":       integer,   // lookback applied to event / trade / rejection counts (caller's ?hours= clamped to [1,168])
 
-cycle_health           { last_event_ts, last_event_msg, seconds_since_last_event,
-                         error_count, warn_count }
-positions              { by_status: {open: N, naked_spot: N, closed: N},
-                         open: [...], naked: [...] }
-wallets                { <venue>: { <asset>: { <wallet_type>: { free, total } } } }
-rejections_grouped     { "<venue>/<mode>": { reason_category: count, ... } }
-rejections_total       int
-recent_events          [ {ts, level, exchange, mode, msg}, ... ]  ≤ 50 WARN/ERROR
-recent_trades          [ {ts, mode, exchange, symbol, venue_leg, side, qty, price, fee}, ... ]
-recent_trades_count    int
-anomalies              [ {severity, rule, detail}, ... ]
-anomalies_count        int
+  "cycle_health": {
+    "last_event_ts":            string | null,   // ISO-8601 UTC or null if no events ever
+    "last_event_msg":           string | null,   // truncated to 240 chars
+    "seconds_since_last_event": number | null,   // float seconds, or null
+    "error_count":              integer,         // count of ERROR-level events in window
+    "warn_count":               integer          // count of WARN-level events in window
+  },
+
+  "positions": {
+    "by_status": { string: integer },            // e.g. {"open": 2, "naked_spot": 1, "closed": 14}
+    "open":   [ OpenPosition ],                  // every Position with status == "open"
+    "naked":  [ NakedPosition ]                  // every Position with status == "naked_spot"
+  },
+
+  "wallets": {
+    venue_id: {                                  // e.g. "binance", "kucoin"
+      asset: {                                   // e.g. "USDT", "USDC"
+        wallet_type: {                           // e.g. "main", "trade", "contract", "margin", "isolated", "pool"
+          "free":  number,
+          "total": number
+        }
+        OR
+        wallet_type: { "error": string }         // when the per-wallet probe failed
+      }
+    }
+  },
+
+  "rejections_grouped": {
+    "<venue>/<mode>": {                          // e.g. "binance/live": { ... }
+      reason_category: integer                   // count per Tier-1/2/3 reject reason
+    }
+  },
+  "rejections_total":      integer,              // sum across all (venue, mode, reason)
+
+  "recent_events": [                             // ≤ 50, newest first, WARN + ERROR only
+    {
+      "ts":       string,                        // ISO-8601 UTC
+      "level":    "WARN" | "ERROR",
+      "exchange": string,                        // e.g. "binance", "kucoin", "system"
+      "mode":     "paper" | "live",
+      "msg":      string                         // truncated to 400 chars
+    }
+  ],
+
+  "recent_trades": [                             // ≤ 50, newest first
+    {
+      "ts":        string,
+      "mode":      "paper" | "live",
+      "exchange":  string,
+      "symbol":    string,                       // venue-shape symbol (e.g. "BTC/USDT" for spot, "BTC/USDT:USDT" for perp)
+      "venue_leg": "spot" | "futures",
+      "side":      "buy" | "sell",
+      "qty":       number,
+      "price":     number,
+      "fee":       number
+    }
+  ],
+  "recent_trades_count":  integer,               // length of recent_trades
+
+  "anomalies": [
+    {
+      "severity": "critical" | "warn" | "info",
+      "rule":     string,                        // anomaly rule identifier from §8.2
+      "detail":   string                         // human-readable explanation
+    }
+  ],
+  "anomalies_count":      integer                // length of anomalies
+}
+
+OpenPosition: {
+  "id":                  integer,
+  "mode":                "paper" | "live",
+  "exchange":            string,
+  "symbol":              string,                 // base asset (e.g. "BTC")
+  "perp_symbol":         string,
+  "quote_currency":      string,                 // perp's quote (e.g. "USDT")
+  "quantity":            number,                 // in base units
+  "spot_entry_price":    number,
+  "perp_entry_price":    number,
+  "last_funding_rate":   number,                 // decimal (e.g. 0.001 = 0.1% per window)
+  "funding_interval_h":  number,                 // hours per funding window (4 or 8)
+  "last_close_error":    string,                 // empty string if no close error
+  "age_hours":           number
+}
+
+NakedPosition: {
+  "id":                  integer,
+  "mode":                "paper" | "live",
+  "exchange":            string,
+  "symbol":              string,                 // base asset
+  "spot_symbol":         string,
+  "quantity":            number,
+  "spot_entry_price":    number,                 // current-mid estimate when reconstructed
+  "notional_est":        number,                 // quantity × spot_entry_price
+  "age_minutes":         number
+}
 ```
+
+Constraints / invariants the rewrite must preserve:
+
+- Endpoint path is exactly `/api/diagnostics`.
+- Authentication is exactly `?token=<value>` matched against the `DIAGNOSTICS_TOKEN` env var. No 401 leaks. No alternative auth (no header, no cookie).
+- `503` when the env var is unset (with a body that says so).
+- `401` when the env var is set but the token is wrong/missing.
+- Response is JSON-serializable in one pass; no streaming.
+- `generated_at_utc` is freshly produced per request, not cached.
+- Anomaly detection runs on every request (it's a derived quantity, not stored).
+- Default `hours=24`, max `hours=168`, min `hours=1`. Clamping rather than rejecting.
 
 ### 8.2 Anomaly rules
 
@@ -996,4 +1231,185 @@ The hard lessons distilled from the first implementation. **Read this section be
 
 ---
 
-> **For the monitor chat:** Always read this doc from the latest `main` before judging anomalies. The definitions (§0), strategy SOP + math (§3), rejection categories (§9), failure modes (§10), response policy (§11), and learnings (§16) are your operating manual. When a new pattern emerges in production, add a learning to §16 in the same PR that ships the fix.
+## 17. Rewrite plan (core + UI from scratch)
+
+This section is a **plan**, not a description. It captures the order of operations for replacing the entire codebase while preserving the contracts in §7 (DB schema), §8 (diagnostics endpoint), and the learnings in §16. Update it as the rewrite progresses; collapse completed stages.
+
+### 17.1 Goals
+
+- **Same observable behaviour** through the four external surfaces: HTTP UI, `/api/diagnostics` JSON, SQLite DB on disk, venue API calls. A user / monitor / cron should not be able to tell the rewrite happened (until they read the changelog).
+- **All §16 learnings encoded** in the new code structure or test suite. The new code should fail-fast on every regression listed; ideally with a unit test per learning.
+- **Cleaner module boundaries** so future strategies (cross-venue, onchain) are additive, not invasive.
+- **Lossless data migration.** Existing positions, trades, equity curve, capital flows carry over to the new code without conversion.
+
+### 17.2 Non-goals
+
+- Deployment infrastructure (Vultr host, Coolify pipeline, GitHub workflow) stays. The rewrite is application code only.
+- The `/api/diagnostics` JSON contract stays byte-for-byte (§8.1). The monitor cron + tracker issue + dependent automation must keep working through the cutover.
+- The DB schema contract stays (§7.1.1). Additive changes are fine; renames or drops are not.
+- The page taxonomy and operator vocabulary in §5 stay. URL paths stay (`/dashboard`, `/config`, `/safety`, `/logs`, `/transactions`, `/monitoring`).
+- The doc-update policy in §13 stays binding through the rewrite — including changes to this rewrite plan section.
+
+### 17.3 Scope
+
+- **Bot core**: cycle loop, scanner, gates, executor, position state machine, recovery flows, venue adapters.
+- **UI surface**: HTTP routes, HTML pages, form handlers, action endpoints, diagnostics endpoint, monitoring/safety surfaces.
+
+Out of scope for this rewrite (separate efforts):
+- Cross-venue arb strategy implementation (planned, but separate PR).
+- Onchain strategy implementation (planned, but separate PR).
+- Schema-level changes (e.g. per-strategy split of mode_state) — additive if needed, but not a goal here.
+
+### 17.4 Stages
+
+The rewrite proceeds in ordered stages. Each stage has explicit **entry criteria** (what must be true before starting) and **exit criteria** (what must be true to advance). Don't skip — each gate exists to catch a class of regression.
+
+#### Stage 0 — Freeze + snapshot
+
+**Entry criteria:** none.
+
+**Work:**
+1. Tag the current main branch `pre-rewrite-2026-05-12` (or similar). This is the rollback anchor.
+2. Snapshot the production DB (off-host backup). Tag it.
+3. Confirm §7.1.1 + §8.1 contracts are accurate against the running code. Any divergence → fix the doc OR add an additive column to the contract, not the other way around.
+4. Write a parity-test harness: a script that hits the current `/api/diagnostics`, dumps the response, then will hit the new endpoint and diff. The diff must be empty modulo timestamps for cutover.
+
+**Exit criteria:**
+- Tag exists in git. Snapshot exists off-host (Vultr backup OR scp to a second host — see §16 L29).
+- Parity-test harness runs against the current bot and produces a baseline dump.
+- §7 + §8 contracts confirmed accurate.
+
+#### Stage 1 — New repo skeleton + DB layer
+
+**Entry criteria:** Stage 0 done.
+
+**Work:**
+1. Greenfield directory layout. Suggested boundaries (revise as needed):
+   - `core/` — domain entities (Position, Trade, Strategy config), pure-logic math (gates, basis formulas).
+   - `gateways/` — one module per venue, implementing the same protocol (read funding, walk book, place order, transfer, dust-convert). Per-venue learnings (L11) encoded as comments + per-venue tests.
+   - `loop/` — cycle orchestrator: Phase A safety → Phase B exits → Phase C entries → post-cycle. Idle-cycle gating (L19) built in.
+   - `state/` — DB models + migrations. Schema matches §7.1.1.
+   - `web/` — FastAPI app, routes, templates. Imports core + state.
+   - `diagnostics/` — `/api/diagnostics` endpoint + anomaly rules. Imports state.
+2. Reimplement the DB layer matching §7.1.1 byte-for-byte. Include the additive migration pattern from §7.3.
+3. Verify against the production snapshot from Stage 0: load it into a fresh deployment of the new code, assert that the bot can read every existing row without coercion.
+
+**Exit criteria:**
+- New repo passes lint + typecheck.
+- New DB layer round-trips the Stage-0 snapshot losslessly.
+- Bot can boot to "idle, waiting for cycle" with the snapshot loaded — no exceptions.
+
+#### Stage 2 — Gateways (one venue at a time)
+
+**Entry criteria:** Stage 1 done.
+
+**Work, per venue:**
+1. Implement the venue gateway protocol: read funding rates, simulate fill, place limit-IOC (spot + perp), transfer (spot↔futures), consolidate wallets, dust-convert, account-mode probe.
+2. Bake in the per-venue quirks documented in §6 + §16 L11:
+   - **Binance**: PM-only routing, per-currency futures balance, dust → BNB endpoint, `crossMarginFree + umWalletBalance + cmWalletBalance` aggregation, NEVER use OR-chain on string fields (L15).
+   - **KuCoin**: Classic wallet model (main/trade/margin/isolated/contract/pool), futures-side transfer for OUT direction (L11), two-hop drain (§6.2), per-currency futures balance fetch, book-depth limit must be 20 or 100, dust → KCS endpoint.
+3. Unit tests covering the failure modes in §10 + §16 L11–L15 + L18.
+
+**Exit criteria, per venue:**
+- Read-only paper-mode cycle runs cleanly against the venue (no orders placed).
+- All §16 venue-specific learnings have a corresponding test or assertion.
+- Diff against the Stage-0 parity dump: `/api/diagnostics` `wallets` section matches the old bot's output for the same account state.
+
+Do Binance first (smaller wallet surface), KuCoin second (Classic wallet quirks).
+
+#### Stage 3 — Cycle orchestrator (paper mode)
+
+**Entry criteria:** Stage 2 done for both venues.
+
+**Work:**
+1. Implement the cycle in §3.1 SOP, phase by phase. Each phase is a function the orchestrator calls in order.
+2. Implement the math in §3.1 — gates, signed basis, worst-case adverse swing, reservation clamp. Unit tests for every formula in §3.1 math (use the worked examples in the doc as test vectors).
+3. Tier separation (L10): Tier-1 in the scanner, Tier-2 in the book walk, Tier-3 in the gate.
+4. Idle-cycle gating (L19): wallet rebalance only runs when at least one candidate passed Tier-1.
+5. Position state machine: open ↔ naked_spot ↔ closed, transitions per §7.2.
+6. Naked-spot recovery (L16, L21): hedge-before-sell + stale reconciliation + dust sweep.
+7. Outer exception handler that logs `Loop iteration error` and continues — BUT also a NameError-prevention measure: every cycle entry-point function has at least one import-time symbol resolution check (L02).
+
+**Exit criteria:**
+- Paper mode runs cleanly for 24h on the parity test harness.
+- All §3.1 math tests pass.
+- All §10 failure modes have a corresponding handler + test.
+- Diff against Stage-0 paper-mode snapshot: every per-cycle event in `bot_events` is reproducible (same gate decisions, same rejection categories with same reasons).
+
+#### Stage 4 — UI
+
+**Entry criteria:** Stage 3 done.
+
+**Work:**
+1. FastAPI routes matching §5 paths (`/health`, `/dashboard`, `/transactions`, `/logs`, `/monitoring`, `/config`, `/safety`, `/api/diagnostics`).
+2. HTTP Basic auth on everything except `/health` and `/api/diagnostics`. Auth dependency-injected, never inlined.
+3. Templates matching §5.2 purposes. Naked-spot rendering rule (L03, L32). Per-position thresholds shown inline (L34). Gate-math displayed in rejection messages (L33).
+4. Form-handling conventions (§5.4): `303 See Other` redirects, percent fields, back-compat alias accepts.
+5. Action endpoints (§5.5).
+6. `/api/diagnostics` endpoint matching §8.1 byte-for-byte.
+
+**Exit criteria:**
+- Every route in §5.2 returns `200` smoke-tested.
+- Parity test harness: `/api/diagnostics` response from new code equals old code's response on the same DB snapshot (modulo timestamps).
+- HTML pages render correctly with naked-spot, multi-strategy, and various edge-case states present.
+
+#### Stage 5 — Live mode validation (paper-only first, then dry-run)
+
+**Entry criteria:** Stage 4 done.
+
+**Work:**
+1. Deploy new code in PAPER mode only. Run alongside the production bot (read-only on live wallets — paper sends no real orders).
+2. Compare paper-mode decisions across the two bots for 48 hours. Differences must be intentional (e.g. fixed bugs in the new code) or zero.
+3. After 48h clean: enable live mode on a single venue, single strategy. Monitor closely.
+4. After 48h clean live: enable the second venue.
+
+**Exit criteria:**
+- 48h paper-mode parity (or all deltas intentional + documented).
+- 48h live single-venue clean: no naked positions accumulated, no error bursts, all trades reconcile.
+- 48h live both-venue clean.
+
+#### Stage 6 — Cutover + decommission
+
+**Entry criteria:** Stage 5 done.
+
+**Work:**
+1. Switch the public URL / Coolify deployment to the new code as the primary.
+2. Keep the old code running in a second Coolify service for 7 days, read-only on the same DB, as a fallback.
+3. After 7 days clean: archive the old service.
+4. Delete `pre-rewrite-2026-05-12` branch from local; keep the tag.
+5. Update SYSTEM.md §15 changelog with the cutover entry. Collapse the rewrite plan in §17 to a one-paragraph "completed YYYY-MM-DD; see git log".
+
+**Exit criteria:**
+- Old service decommissioned.
+- Doc updated.
+
+### 17.5 Risk management
+
+- **Data loss**: addressed by Stage 0 snapshot + parallel-run in Stage 5.
+- **Mid-rewrite behavior drift**: the production code keeps running on `main`; the rewrite lives on a long branch (`claude/rewrite-2026-05-12` or similar). Only Stage 6 cuts traffic over. Rolling back = redeploying the pre-rewrite tag.
+- **Monitor chat blind spot**: keep the diagnostics cron + tracker issue pointed at the production bot through Stage 5. The new bot's `/api/diagnostics` is parity-tested but not the primary alert source until Stage 6.
+- **Capital loss from a regression**: Stage 5 enforces 48h paper-mode parity before any live orders. Single-venue, single-strategy first.
+- **Doc-rot during the rewrite**: every stage exit criterion includes "SYSTEM.md updated to reflect what's now live". §13 applies through the rewrite.
+
+### 17.6 Estimated effort (rough)
+
+| Stage | Effort estimate |
+|---|---|
+| 0 — Freeze + snapshot + parity harness | 0.5 day |
+| 1 — Repo skeleton + DB layer | 1 day |
+| 2 — Gateways (Binance + KuCoin) | 2 days |
+| 3 — Cycle orchestrator paper-mode | 2 days |
+| 4 — UI | 1.5 days |
+| 5 — Live validation (mostly wait time) | 3 days clock (operator-attended) |
+| 6 — Cutover + decommission | 0.5 day |
+| **Total** | **~10 working days** + 7 days fallback retention |
+
+Estimates assume the rewrite is the only ongoing work. Concurrent feature development extends accordingly.
+
+### 17.7 Status
+
+Pre-Stage-0. Awaiting operator go-ahead.
+
+---
+
+> **For the monitor chat:** Always read this doc from the latest `main` before judging anomalies. The definitions (§0), strategy SOP + math (§3), rejection categories (§9), failure modes (§10), response policy (§11), and learnings (§16) are your operating manual. When a new pattern emerges in production, add a learning to §16 in the same PR that ships the fix. If a rewrite is in progress (§17), be aware that the new code may behave differently from the old in documented ways — check the changelog before flagging differences as anomalies.
