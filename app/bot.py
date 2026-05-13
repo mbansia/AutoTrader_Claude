@@ -978,9 +978,15 @@ def recover_phantom_spot(db, gateway: VenueGateway, mode: str, cfg: StrategyConf
             db.flush()
             log_event(db, f'Dust sweep CLOSED {len(dust_naked)} naked_spot position(s): converted {", ".join(dust_assets)} → {native_received:.6f} {"BNB" if gateway.venue_id == "binance" else "KCS"} via venue dust endpoint', mode=mode, level='WARN', exchange=gateway.venue_id)
         elif conv_err and 'not available' not in conv_err.lower():
-            # Endpoint exists but conversion didn't transfer anything —
-            # log once so the operator sees the venue response.
-            log_event(db, f'Dust sweep no-op on {gateway.name}: {conv_err[:200]} (assets tried: {", ".join(dust_assets)})', mode=mode, level='WARN', exchange=gateway.venue_id)
+            # Endpoint was found and called, but rejected the request.
+            # The asset is sub-MIN_NOTIONAL AND ineligible for dust
+            # conversion — permanently unrecoverable by the bot.
+            # Mark closed and log once so the operator sees why.
+            for p in dust_naked:
+                p.status = 'closed'
+                p.last_close_error = f'dust_convert_ineligible: {conv_err[:140]}'
+            db.flush()
+            log_event(db, f'Dust sweep INELIGIBLE on {gateway.name} — marking {len(dust_naked)} position(s) closed (assets: {", ".join(dust_assets)}): {conv_err[:200]}', mode=mode, level='WARN', exchange=gateway.venue_id)
 
 
 def reconcile_positions(gateway: VenueGateway) -> None:
