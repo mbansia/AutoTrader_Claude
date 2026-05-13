@@ -2449,11 +2449,18 @@ class KuCoinGateway(VenueGateway):
     def convert_dust_to_native(self, assets: list[str], paper_mode: bool = False) -> tuple[float, str]:
         """Convert eligible dust on KuCoin to KCS via the dust collection
         endpoint. ccxt's binding for this varies by version; we probe a
-        few candidate method names. Returns (kcs_received, err)."""
+        few candidate method names. Returns (kcs_received, err).
+
+        Distinguishes two failure modes:
+        - "not available": no callable method found in this ccxt build.
+        - anything else: endpoint was found and called but rejected the
+          request (e.g. asset ineligible for dust conversion). The caller
+          uses this distinction to decide whether to mark positions closed."""
         if paper_mode:
             return 0.0, 'paper'
         if not assets:
             return 0.0, 'no assets passed'
+        first_rejection: str | None = None  # error from the first callable endpoint
         for name in (
             'privatePostApiV3DustConvert', 'private_post_api_v3_dust_convert',
             'privatePostAccountsTransferOut', 'private_post_accounts_transfer_out',
@@ -2465,13 +2472,18 @@ class KuCoinGateway(VenueGateway):
             try:
                 resp = fn({'currency': ','.join(assets)})
             except Exception as e:
-                last_err = str(e)[:160]
+                if first_rejection is None:
+                    first_rejection = str(e)[:160]
                 continue
             try:
                 total = float((resp or {}).get('totalKcsAmount') or (resp or {}).get('totalAmount') or 0)
             except (TypeError, ValueError):
                 total = 0.0
             return total, '' if total > 0 else str(resp)[:160]
+        if first_rejection is not None:
+            # At least one method was callable — the endpoint exists but
+            # rejected our request (asset ineligible, account restriction, …).
+            return 0.0, first_rejection
         # Fallback: explicit per-asset inner-transfer-then-market-sell can
         # work for some KuCoin dust but the dedicated endpoint is the
         # right path. Surface the missing-endpoint error so the operator
