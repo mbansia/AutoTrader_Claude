@@ -29,14 +29,13 @@ class IllegalTransition(Exception):
 
 
 _TRANSITIONS: dict[tuple[PositionStatus, LifecycleEvent], PositionStatus] = {
-    # Entry success
     (PositionStatus.OPEN, LifecycleEvent.FLAT_CLOSED): PositionStatus.CLOSED,
-    # Entry partial → naked
     (PositionStatus.OPEN, LifecycleEvent.OPEN_ONLY_SPOT_FILLED): PositionStatus.NAKED_SPOT,
     (PositionStatus.OPEN, LifecycleEvent.OPEN_ONLY_PERP_FILLED): PositionStatus.NAKED_PERP,
-    # Phantom-leg discovery: NEW rows are created by side effect; the function returns
-    # the target status when the caller persists.
-    # Recovery
+    # Mid-life hedge-integrity discovery: a live open row finds one leg
+    # vanished on the venue. The surviving leg is whichever didn't disappear.
+    (PositionStatus.OPEN, LifecycleEvent.DISCOVER_ORPHAN_SPOT): PositionStatus.NAKED_SPOT,
+    (PositionStatus.OPEN, LifecycleEvent.DISCOVER_ORPHAN_PERP): PositionStatus.NAKED_PERP,
     (PositionStatus.NAKED_SPOT, LifecycleEvent.HEDGE_RECOVERED): PositionStatus.OPEN,
     (PositionStatus.NAKED_PERP, LifecycleEvent.HEDGE_RECOVERED): PositionStatus.OPEN,
     (PositionStatus.NAKED_SPOT, LifecycleEvent.FLAT_CLOSED): PositionStatus.CLOSED,

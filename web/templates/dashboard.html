@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — AutoTrader_Codex{% endblock %}
+{% block content %}
+<h1>Dashboard ({{ view_mode }})</h1>
+
+<section class="kpis">
+  <div class="kpi"><div class="kpi-label">Current equity</div><div class="kpi-value">${{ "%.2f"|format(kpis.equity) }}</div></div>
+  <div class="kpi"><div class="kpi-label">Net injected capital</div><div class="kpi-value">${{ "%.2f"|format(kpis.net_injected) }}</div></div>
+  <div class="kpi"><div class="kpi-label">Total PnL</div><div class="kpi-value">${{ "%.2f"|format(kpis.total_pnl) }}</div></div>
+  <div class="kpi"><div class="kpi-label">Open positions</div><div class="kpi-value">{{ kpis.open_count }}</div></div>
+  <div class="kpi"><div class="kpi-label">Total fees</div><div class="kpi-value">${{ "%.2f"|format(kpis.total_fees) }}</div></div>
+  <div class="kpi"><div class="kpi-label">Free deployable</div><div class="kpi-value">${{ "%.2f"|format(kpis.free_deployable) }}</div></div>
+</section>
+
+{% if alerts %}
+<section class="alerts">
+  {% for a in alerts %}<div class="alert {{ a.severity }}">{{ a.message }}</div>{% endfor %}
+</section>
+{% endif %}
+
+<section>
+  <h2>Open positions</h2>
+  {% if open_positions %}
+  <table class="positions">
+    <thead><tr><th>Venue</th><th>Strategy</th><th>Symbol</th><th>Status</th><th>Qty</th><th>Spot entry</th><th>Perp entry</th><th>Funding</th><th>Age (h)</th></tr></thead>
+    <tbody>
+    {% for p in open_positions %}
+      <tr class="{{ p.status }}">
+        <td>{{ p.exchange }}</td>
+        <td>{{ p.trade_type }}</td>
+        <td>{{ p.symbol }}</td>
+        <td>{{ p.status }}</td>
+        <td>{{ "%.6f"|format(p.quantity) }}</td>
+        <td>{% if p.status == 'naked_perp' %}—{% else %}{{ "%.4f"|format(p.spot_entry_price) }}{% endif %}</td>
+        <td>{% if p.status == 'naked_spot' %}—{% else %}{{ "%.4f"|format(p.perp_entry_price) }}{% endif %}</td>
+        <td>{{ "%.4f%%"|format(p.last_funding_rate * 100) }}</td>
+        <td>{{ "%.1f"|format(p.age_hours) }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p>No open positions.</p>{% endif %}
+</section>
+
+<section>
+  <h2>Closed positions (recent)</h2>
+  {% if closed_positions %}
+  <table class="positions">
+    <thead><tr><th>Venue</th><th>Symbol</th><th>Qty</th><th>Closed at</th><th>Last close error</th></tr></thead>
+    <tbody>
+    {% for p in closed_positions %}
+      <tr>
+        <td>{{ p.exchange }}</td>
+        <td>{{ p.symbol }}</td>
+        <td>{{ "%.6f"|format(p.quantity) }}</td>
+        <td>{{ p.closed_at }}</td>
+        <td>{{ p.last_close_error }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p>No closed positions yet.</p>{% endif %}
+</section>
+{% endblock %}

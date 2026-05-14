@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Transactions{% endblock %}
+{% block content %}
+<h1>Transactions ({{ view_mode }})</h1>
+<form method="get" action="/transactions" class="filters">
+  <label>Symbol: <input type="text" name="symbol" value="{{ filter_symbol }}"></label>
+  <label>Days: <input type="number" name="days" value="{{ filter_days }}" min="1" max="365"></label>
+  <button type="submit">Filter</button>
+</form>
+{% if trades %}
+<table class="trades">
+  <thead><tr><th>TS</th><th>Mode</th><th>Venue</th><th>Strategy</th><th>Symbol</th><th>Leg</th><th>Side</th><th>Qty</th><th>Price</th><th>Fee</th></tr></thead>
+  <tbody>
+    {% for t in trades %}
+    <tr>
+      <td>{{ t.ts }}</td><td>{{ t.mode }}</td><td>{{ t.exchange }}</td>
+      <td>{{ t.trade_type }}</td><td>{{ t.symbol }}</td>
+      <td>{{ t.venue }}</td><td>{{ t.side }}</td>
+      <td>{{ "%.6f"|format(t.quantity) }}</td>
+      <td>{{ "%.4f"|format(t.price) }}</td>
+      <td>{{ "%.6f"|format(t.fee) }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}<p>No trades match the filter.</p>{% endif %}
+{% endblock %}

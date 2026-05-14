@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}AutoTrader_Codex{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <nav class="topbar">
+    <span class="logo">AutoTrader_Codex</span>
+    <form method="post" action="/view/{{ 'live' if view_mode == 'paper' else 'paper' }}" class="view-toggle">
+      <button type="submit" class="view-btn">{{ view_mode|upper }} ▾</button>
+    </form>
+    <ul class="navlinks">
+      <li><a href="/dashboard">Dashboard</a></li>
+      <li><a href="/transactions">Transactions</a></li>
+      <li><a href="/logs">Logs</a></li>
+      <li><a href="/monitoring">Monitoring</a></li>
+      <li><a href="/config">Configuration</a></li>
+      <li><a href="/safety">Safety</a></li>
+    </ul>
+  </nav>
+  <main>
+    {% if saved %}<div class="banner saved">Saved.</div>{% endif %}
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

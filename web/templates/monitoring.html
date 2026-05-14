@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block title %}Monitoring{% endblock %}
+{% block content %}
+<h1>Monitoring</h1>
+{% if gateways %}
+{% for g in gateways %}
+<section class="gateway-card">
+  <h2>{{ g.exchange_id }} ({{ g.mode }})</h2>
+  <table>
+    <tr><th>Probe</th><th>Result</th></tr>
+    {% for probe, ok in g.probes.items() %}
+    <tr class="{{ 'ok' if ok else 'fail' }}"><td>{{ probe }}</td><td>{{ '✓' if ok else '✗' }}</td></tr>
+    {% endfor %}
+    <tr><td>Account ID expected</td><td>{{ g.expected_account_id }}</td></tr>
+    <tr><td>Account ID actual</td><td>{{ g.actual_account_id }}</td></tr>
+    <tr><td>Account mode</td><td>{{ g.account_mode }}</td></tr>
+  </table>
+</section>
+{% endfor %}
+{% else %}
+<p>No gateways registered. Bot is in skeleton mode — no live or paper loop is running.</p>
+{% endif %}
+{% endblock %}

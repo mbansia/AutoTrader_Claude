@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from core.lifecycle import LifecycleEvent, initial_status
+from core.lifecycle import LifecycleEvent, initial_status, transition
 from core.math import (
     basis_bps,
     basis_dislocation_triggered,
@@ -140,7 +140,10 @@ def _phase_a_safety(
         }:
             continue
         if _is_underlying_gone(gateway, pos):
-            _mark_closed(session, pos, mode, "stale_reconciled")
+            _mark_closed(
+                session, pos, mode, "stale_reconciled",
+                event=LifecycleEvent.STALE_RECONCILED,
+            )
             res.actions.append(f"stale_reconciled:{pos.symbol}")
 
     # 2. hedge-integrity for open rows.
@@ -207,7 +210,7 @@ def _recover_naked_spot(
         coid = f"hedge-{pos.id}-perp"
         fill = gateway.place_market_fok(pos.perp_symbol, "futures", "sell", qty, coid)
         if fill.accepted:
-            pos.status = PositionStatus.OPEN.value
+            _mark_status(session, pos, LifecycleEvent.HEDGE_RECOVERED)
             pos.perp_entry_price = fill.avg_price
             pos.entry_funding_rate = funding.predicted_rate
             pos.last_funding_rate = funding.predicted_rate
@@ -292,7 +295,7 @@ def _recover_naked_perp(
         coid = f"hedge-{pos.id}-spot"
         fill = gateway.place_market_fok(pos.spot_symbol, "spot", "buy", qty, coid)
         if fill.accepted:
-            pos.status = PositionStatus.OPEN.value
+            _mark_status(session, pos, LifecycleEvent.HEDGE_RECOVERED)
             pos.spot_entry_price = fill.avg_price
             session.flush()
             repo.insert_trade(
@@ -361,7 +364,7 @@ def _check_hedge_integrity(
             _mark_closed(session, pos, mode, "hedge_integrity:both_legs_missing")
             res.actions.append(f"closed:{pos.symbol}:hedge_both_missing")
         elif not spot_present:
-            _mark_status(session, pos, PositionStatus.NAKED_PERP.value)
+            _mark_status(session, pos, LifecycleEvent.DISCOVER_ORPHAN_PERP)
             repo.log_event(
                 session,
                 mode=mode,
@@ -371,7 +374,7 @@ def _check_hedge_integrity(
             )
             res.actions.append(f"naked_perp:{pos.symbol}")
         elif not perp_present:
-            _mark_status(session, pos, PositionStatus.NAKED_SPOT.value)
+            _mark_status(session, pos, LifecycleEvent.DISCOVER_ORPHAN_SPOT)
             repo.log_event(
                 session,
                 mode=mode,
@@ -781,17 +784,36 @@ def _tier1_scan(gateway: Gateway, config: MergedConfig) -> list[ScanCandidate]:
 
 # ─── helpers ────────────────────────────────────────────────────────────────
 
-def _mark_closed(session: Session, pos: m.Position, mode: Mode, reason: str) -> None:
+def _mark_closed(
+    session: Session,
+    pos: m.Position,
+    mode: Mode,
+    reason: str,
+    *,
+    event: LifecycleEvent = LifecycleEvent.FLAT_CLOSED,
+) -> None:
+    """Lifecycle-validated close. Passes the event through `transition()`
+    so an illegal close raises and surfaces a bug rather than silently
+    corrupting state. §0.4 + §16 L37.
+    """
     from datetime import datetime, timezone
 
-    pos.status = PositionStatus.CLOSED.value
+    current = PositionStatus(pos.status)
+    next_status = transition(current, event)
+    assert next_status == PositionStatus.CLOSED, f"unexpected next_status={next_status}"
+    pos.status = next_status.value
     pos.closed_at = datetime.now(timezone.utc)
     pos.last_close_error = reason
     session.flush()
 
 
-def _mark_status(session: Session, pos: m.Position, status_value: str) -> None:
-    pos.status = status_value
+def _mark_status(
+    session: Session, pos: m.Position, event: LifecycleEvent
+) -> None:
+    """Apply a state transition by event, validated against the state machine."""
+    current = PositionStatus(pos.status)
+    next_status = transition(current, event)
+    pos.status = next_status.value
     session.flush()
 
 

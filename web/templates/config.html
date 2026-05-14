@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block title %}Configuration{% endblock %}
+{% block content %}
+<h1>Configuration</h1>
+<div class="strategy-tabs">
+  {% for st in strategies %}
+  <a href="/config?strategy={{ st }}" class="tab {{ 'active' if st == active_strategy else '' }}">{{ st }}</a>
+  {% endfor %}
+</div>
+
+<form method="post" action="/config" class="config-form">
+  <input type="hidden" name="strategy" value="{{ active_strategy }}">
+  <fieldset>
+    <legend>Per-strategy ({{ active_strategy }})</legend>
+    <label>Entry minimum net APY % <input type="number" step="0.01" name="entry_min_net_apy_pct" value="{{ '%.2f'|format(per_strategy.entry_min_net_apy * 100) }}"></label>
+    <label>Exit minimum net APY % <input type="number" step="0.01" name="exit_min_net_apy_pct" value="{{ '%.2f'|format(per_strategy.exit_min_net_apy * 100) }}"></label>
+    <label>Exit-basis buffer multiplier <input type="number" step="0.1" name="exit_basis_buffer_multiple" value="{{ per_strategy.exit_basis_buffer_multiple }}"></label>
+    <label>Max exit basis bps <input type="number" step="0.1" name="max_exit_basis_bps" value="{{ per_strategy.max_exit_basis_bps }}"></label>
+    <label>Stop-loss % <input type="number" step="0.01" name="stop_loss_pct" value="{{ per_strategy.stop_loss_pct }}"></label>
+    <label>Basis dislocation exit bps <input type="number" step="1" name="basis_dislocation_exit_bps" value="{{ per_strategy.basis_dislocation_exit_bps }}"></label>
+    <label>Min position % <input type="number" step="0.001" name="min_position_pct" value="{{ per_strategy.min_position_pct }}"></label>
+    <label>Max position % <input type="number" step="0.01" name="max_position_pct" value="{{ per_strategy.max_position_pct }}"></label>
+    <label>Sub-target sizing factor <input type="number" step="0.05" name="sub_target_sizing_factor" value="{{ per_strategy.sub_target_sizing_factor }}"></label>
+    <label>Perp leverage <input type="number" step="1" name="perp_leverage" value="{{ per_strategy.perp_leverage }}"></label>
+    <label>Futures buffer % <input type="number" step="0.01" name="futures_buffer_pct" value="{{ per_strategy.futures_buffer_pct }}"></label>
+    <label>Depeg guard bps <input type="number" step="1" name="depeg_guard_bps" value="{{ per_strategy.depeg_guard_bps }}"></label>
+    <label>Auto-transfer <input type="checkbox" name="auto_transfer_enabled" value="1" {{ 'checked' if per_strategy.auto_transfer_enabled }}></label>
+    <label>Auto-quote-swap <input type="checkbox" name="auto_quote_swap_enabled" value="1" {{ 'checked' if per_strategy.auto_quote_swap_enabled }}></label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Global</legend>
+    <label>Max open positions <input type="number" step="1" name="max_open_positions" value="{{ global_cfg.max_open_positions }}"></label>
+    <label>Max trades per day <input type="number" step="1" name="max_trades_per_day" value="{{ global_cfg.max_trades_per_day }}"></label>
+    <label>Loop seconds <input type="number" step="1" name="loop_seconds" value="{{ global_cfg.loop_seconds }}"></label>
+    <label>Cycle error rate threshold <input type="number" step="0.01" name="cycle_error_rate_threshold" value="{{ global_cfg.cycle_error_rate_threshold }}"></label>
+  </fieldset>
+
+  <button type="submit">Save</button>
+</form>
+{% endblock %}
