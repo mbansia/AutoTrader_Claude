@@ -2,7 +2,7 @@
 
 The single living source of truth for what this bot does and how it works. Every behavior-changing PR updates the relevant section in the same commit. The diagnostics-monitor chat re-reads this on every wake-up before judging anomalies; any new dev reads it once to onboard.
 
-> Status: **v1.2** — 2026-05-12 implementer-gap audit (v1.1 → v1.2). Tier-A gaps closed inline; Tier B + C catalogued in §18. See changelog §15.
+> Status: **v1.3** — 2026-05-13 exit-logic refactor (v1.2 → v1.3): removed time-based `max_hold_hours` exit; added `basis_dislocation_exit_bps` mandatory exit. Pure-economic exits only. See changelog §15.
 
 ## How to read this doc
 
@@ -165,7 +165,7 @@ Different venues bundle balances differently. The bot abstracts over this but th
 | **Target quantity** (target_qty in formulas) | The base-asset quantity the bot is trying to fill. Initially `sized_notional / spot_mid_price`; clamped down in the book-walk loop by both fillable depth and reservation limits at the final limit price. |
 | **Reservation** | When a limit-buy is placed for `qty × limit_price`, the venue immediately reserves that much from the trade wallet. The clamp ensures `qty × limit_price ≤ wallet_free × safety_factor` so the venue never rejects mid-fill. See §16 L07. |
 | **Safety factor** | A multiplier (~0.99) applied to free-balance ceilings to absorb fee accrual, rounding, and last-millisecond balance shifts. Trades a tiny bit of headroom for reservation-rejection insurance. |
-| **Mandatory vs voluntary exit** | **Voluntary** exits (forward profitability dropped, max-hold reached) are deferred for one cycle if closing right now would print an extra cost (unfavourable live basis). **Mandatory** exits (stop-loss, hedge integrity, market unhealthy) close immediately regardless. |
+| **Mandatory vs voluntary exit** | **Voluntary** exits (forward profitability dropped below exit threshold) are deferred for one cycle if closing right now would print an extra cost (unfavourable live basis). **Mandatory** exits (stop-loss, hedge integrity, market unhealthy, basis dislocation) close immediately regardless. |
 
 ### 0.9 Operational concepts
 
@@ -281,7 +281,7 @@ This bot is multi-strategy by design — each strategy has its own SOP and per-s
 
 Perpetual futures don't expire, so the venue needs a mechanism to keep the perp's price close to the spot price. That mechanism is the **funding rate** — every funding window (typically 4 or 8 hours), one side of the perp's order book pays the other side. When the perp is trading above spot, longs pay shorts; when below, shorts pay longs.
 
-This bot's only active trade: pick a perp paying high positive funding, **buy the base asset on spot** and simultaneously **short the same base on the perp** in equal quantity. Net price exposure is zero (whatever spot does, the short perp does the opposite), so the position doesn't care if the underlying goes up or down. Each funding window, the short perp **receives** the funding payment from the long perp side. The position holds until either the funding rate falls below a threshold or 72 hours pass.
+This bot's only active trade: pick a perp paying high positive funding, **buy the base asset on spot** and simultaneously **short the same base on the perp** in equal quantity. Net price exposure is zero (whatever spot does, the short perp does the opposite), so the position doesn't care if the underlying goes up or down. Each funding window, the short perp **receives** the funding payment from the long perp side. The position holds until either the **forward profitability** falls below the exit threshold (voluntary exit) or the **spot↔perp price differential dislocates** beyond the configured ceiling (mandatory exit). There is no time-based exit.
 
 #### Where the money comes from (and where it leaks)
 
@@ -406,13 +406,21 @@ Phase B — Exits (when exit is enabled for this mode/strategy)
       compute forward-looking net APY at LIVE funding + live basis (math below)
       exit triggers (whichever fires first):
          forward_profit_below_threshold   (forward net APY < exit threshold)
-         max_hold                         (age > max-hold hours)
-         stop_loss                        (mark-to-market PnL / entry notional ≤ stop-loss-pct)
-                                          → MANDATORY (not deferrable below)
-      Voluntary exits (forward-profit, max-hold) DEFER for one cycle if the
-      live basis is currently unfavourable for closing (would print extra cost).
-      Mandatory exits (stop-loss, hedge integrity, market unhealthy) close
-      immediately regardless.
+                                          → VOLUNTARY (deferrable on unfavourable basis)
+         basis_dislocation                (|live_basis − entry_basis|
+                                          > basis_dislocation_exit_bps)
+                                          → MANDATORY: the cost model that
+                                          approved entry no longer holds; exit
+                                          before the assumption breaks worse.
+         stop_loss                        (mark-to-market PnL / entry notional
+                                          ≤ stop-loss-pct)
+                                          → MANDATORY
+      Voluntary exits DEFER for one cycle if the live basis is currently
+      unfavourable for closing (would print extra cost beyond max_exit_basis_bps).
+      Mandatory exits (stop-loss, basis-dislocation, hedge integrity, market
+      unhealthy, maintenance-mode) close immediately regardless of live basis.
+      There is NO time-based / max-hold exit — the strategy holds as long as
+      forward economics + basis sanity both pass.
 
 Phase C — Entries (when entry enabled for this mode/strategy AND at-capacity check passes)
    Scan funding rates across every perp on the venue:
@@ -540,12 +548,14 @@ EXIT iff    fwd_net_APY < T_out
 
 Interpretation: "If I were opening this trade fresh **right now** at the current funding rate and basis, would my entry-style gate approve it at the more lenient exit threshold? If no → close." The two thresholds are directly comparable.
 
-Two additional exit triggers, evaluated alongside:
+Two additional **mandatory** exit triggers, evaluated alongside:
 
-- **Max-hold**: position age > max-hold hours → exit.
+- **Basis dislocation**: `(b_l − b_e) > basis_dislocation_exit_bps` → MANDATORY exit. Rationale: the entry gate's worst-case basis cost is `m × |b_e|`. When the live basis has actually moved that far adverse (or close to it), the cost model that approved entry no longer describes the trade. Exit while the dislocation is bounded rather than wait for it to widen further. Default `basis_dislocation_exit_bps = 50.0` bps; calibrated to fire at roughly the gate's `m × |b_e|` worst-case for a typical 15-bp entry basis. Operators can tune per strategy.
 - **Stop-loss**: `unrealized_PnL / spot_entry_notional ≤ stop-loss-pct` → MANDATORY exit (not deferrable on adverse basis).
 
-Voluntary exits (forward profit, max-hold) **defer** for one cycle when the live basis would print a closing cost above the configured exit-basis ceiling. The deferred exit retries every cycle until basis becomes favourable. Stop-loss, hedge-integrity, and market-unhealthy exits are NOT deferrable.
+**There is no time-based / max-hold exit.** A position holds for exactly as long as forward economics and basis sanity both pass. A position with persistent high funding and stable basis can run for weeks; a position whose funding decays in hours exits in hours. Time is not a meaningful axis here — money is.
+
+Voluntary exits (forward-profit) **defer** for one cycle when the live basis would print a closing cost above the configured exit-basis ceiling (`max_exit_basis_bps`). The deferred exit retries every cycle until basis becomes favourable. Mandatory exits (basis-dislocation, stop-loss, hedge-integrity, market-unhealthy, maintenance-mode) are NOT deferrable.
 
 #### Reservation-aware sizing (inside the walk loop)
 
@@ -582,7 +592,7 @@ The safety factor (~0.99) absorbs fee accrual and rounding. Up to 4 passes; walk
 
 #### Per-strategy config that applies
 
-See [§4 Configuration](#4-configuration) for the layered split. Per-strategy fields used here: entry/exit net-APY thresholds, exit-basis buffer multiplier, exit-basis ceiling, stop-loss percent, max-hold hours, min/max position percent of equity, entry/exit tick-buffer bps, perp leverage, auto-transfer flag, auto-quote-swap flag, futures-buffer percent. Global fields used: max open positions, max trades per day, loop seconds, paper-mode synthetic costs, hedge integrity check, delisting check.
+See [§4 Configuration](#4-configuration) for the layered split. Per-strategy fields used here: entry/exit net-APY thresholds, exit-basis buffer multiplier, exit-basis ceiling, basis-dislocation exit threshold, stop-loss percent, min/max position percent of equity, entry/exit tick-buffer bps, perp leverage, auto-transfer flag, auto-quote-swap flag, futures-buffer percent. Global fields used: max open positions, max trades per day, loop seconds, paper-mode synthetic costs, hedge integrity check, delisting check.
 
 ### 3.2 Cross-venue funding arb [PLANNED]
 
@@ -636,7 +646,7 @@ The bot, when running on a given strategy, reads a **merged view** of the two ta
 | Field category | Per-strategy? | Why |
 |---|---|---|
 | **Thresholds** (entry/exit min net APY, exit-basis buffer multiplier, max-exit-basis bps, stop-loss percent) | **Yes** | Different strategies, different risk profiles. |
-| **Sizing** (min/max position percent, max-hold hours) | **Yes** | Strategies size differently. |
+| **Sizing** (min/max position percent) | **Yes** | Strategies size differently. |
 | **Execution** (entry/exit tick buffer bps, perp leverage, max perp leverage) | **Yes** | Venue tick density and leverage policy diverge. |
 | **Wallet** (auto-transfer flag, auto-quote-swap flag, futures-buffer percent) | **Yes** | Unified-margin venues don't need these; Classic does. |
 | **Account-level caps** (max open positions, max trades per day) | **No** (global) | These cap portfolio risk across the entire account. |
@@ -656,7 +666,7 @@ The bot, when running on a given strategy, reads a **merged view** of the two ta
 | Exit-basis buffer multiplier | 3.0 | The `m` in the worst-case-exit-basis formula. |
 | Max exit basis bps | 5.0 | Defer voluntary exits until live basis ≤ this. |
 | Stop-loss percent | −0.02 (= −2%) | Mandatory exit when unrealized PnL / notional ≤ this. |
-| Max-hold hours | 72 | Time-based exit. |
+| Basis dislocation exit bps | 50.0 | Mandatory exit when `(live_basis − entry_basis)` exceeds this — the live basis has moved farther adverse than our cost model assumed at entry, so the position's economics are no longer the ones the gate approved. |
 | Min position percent | 0.005 (= 0.5%) | Sizing floor as fraction of equity. |
 | Max position percent | 0.10 (= 10%) | Sizing ceiling. |
 | Entry tick-buffer bps | 1.0 | Limit-IOC entry price padding above worst-walked fill. |
@@ -706,6 +716,7 @@ Earlier iterations carried fields that were retired as the strategy matured. A f
 - **Imbalance-threshold knob for rebalance**. The rebalance trigger should be "candidates exist that need both wallets funded", not a static USDT threshold. See §16 Learning L19.
 - **Master entry/exit toggles on the strategy config**. Those belong on the mode-state and per-strategy-state tables, not on the runtime config singleton. Mixing them invited stale-read bugs.
 - **Names that promise raw funding** for thresholds that are actually net APY. The names lied for months. See §16 Learning L01.
+- **Time-based exits (`max_hold_hours`).** Removed v1.3. Time is not a meaningful exit axis for this strategy — money is. Forward-profitability decay and basis dislocation cover every case the time cap was approximating, and they're directly economic rather than proxy. The column is retained on the schema per additive-only policy but the exit logic no longer consults it. See §16 Learning L37.
 
 ---
 
@@ -920,7 +931,8 @@ Legacy columns retained for back-compat (no longer read): `entry_funding_thresho
 | `exit_basis_buffer_multiple` | float, default 3.0 | Worst-case-exit-basis multiplier (`m` in §3.1 math). |
 | `max_exit_basis_bps` | float, default 5.0 | Defer voluntary exits until live basis ≤ this. |
 | `stop_loss_pct` | float, default −0.02 | Mandatory exit when `unrealized_PnL / notional ≤ this`. |
-| `max_hold_hours` | integer, default 72 | Time-based exit. |
+| `basis_dislocation_exit_bps` | float, default 50.0 | Mandatory-exit trigger: `(b_l − b_e) > this` → close. |
+| `max_hold_hours` | integer, default 72 | **DEPRECATED** (v1.3). Column retained per additive-only policy (§7.3) but no longer read by the exit logic. Time-based exit was removed in favor of pure-economic exits (profitability + basis-dislocation). |
 | `min_position_pct` | float, default 0.005 | Sizing floor as fraction of equity. |
 | `max_position_pct` | float, default 0.10 | Sizing ceiling. |
 | `entry_tick_buffer_bps` | float, default 1.0 | Limit-IOC entry price padding above worst-fill. |
@@ -1390,7 +1402,8 @@ Append-only. Format: `YYYY-MM-DD · PR# · §sections touched · summary`.
 
 | Date | PR | Sections | Summary |
 |---|---|---|---|
-| 2026-05-13 | (this PR) | §10 | Dust-convert ineligible fallback. `KuCoinGateway.convert_dust_to_native` now returns the actual API rejection error when a callable endpoint raises (rather than the misleading "not available" fallback). Dust-sweep in `recover_phantom_spot` marks positions `closed` with `last_close_error='dust_convert_ineligible: …'` when the endpoint exists but rejects the asset (e.g. DOGE). Resolves the DOGE $0.19 naked_spot stuck since 2026-05-11T19h. |
+| 2026-05-13 | doc | §0.3, §3.1 SOP + math, §4, §7.1.1, §16 L37 (new) | Exit-logic refactor (v1.2 → v1.3). **Removed `max_hold_hours`** time-based exit (column retained per additive-only policy; exit logic no longer reads it). **Added `basis_dislocation_exit_bps`** (default 50.0 bps) as a mandatory exit trigger: `(b_l − b_e) > threshold` → close. Rationale: the gate's worst-case cost is `m × \|b_e\|`; when the live basis has actually moved that far adverse, the position's economics no longer match what the gate approved. Pure-economic exits only — no time proxy. New L37: "Exit on economics, not on time." |
+| 2026-05-13 | (merged-parallel) | §10 | Dust-convert ineligible fallback. `KuCoinGateway.convert_dust_to_native` now returns the actual API rejection error when a callable endpoint raises (rather than the misleading "not available" fallback). Dust-sweep in `recover_phantom_spot` marks positions `closed` with `last_close_error='dust_convert_ineligible: …'` when the endpoint exists but rejects the asset (e.g. DOGE). Resolves the DOGE $0.19 naked_spot stuck since 2026-05-11T19h. |
 | 2026-05-12 | doc | §0.10, §3.1 SOP + math, §7.3/4/5, §18 (new) | Implementer-gap audit (v1.1 → v1.2). Added §0.10 stack assumptions (Python / FastAPI / ccxt / SQLAlchemy / UTC-aware datetimes). Math: defined "worst-walked price"; mandated tick-rounding + lot-step flooring with explicit conservative-rounding direction per side. SOP: detailed hedge-integrity detection rule, maintenance-mode mechanics (limit-IOC, never market), paper-mode probe-vs-order delineation. §7.3 cursor placement; new §7.4 timestamp discipline; new §7.5 `external_id` construction table. New §18 enumerates Tier B (strategy-correctness) and Tier C (polish) gaps that the spec is still silent on. |
 | 2026-05-12 | doc | §0.3, §0.4, §3.1 SOP, §7.1.1, §7.2, §8.1, §8.2, §9.2, §10, §16 L03/L16/L21/L32 | Naked-direction symmetry audit. Added `naked_perp` as a first-class position status alongside `naked_spot`. Phantom-leg recovery sweep symmetrised across both directions. Dashboard rendering rule generalised: missing-leg suppression keyed on status. New `stale_naked_perp` anomaly + log patterns. `NakedPosition` JSON carries a `status` field + uses `leg_entry_price`. L21 explicitly direction-neutral. Concrete-example math cleaned up (no more "actually wait" in spec text). |
 | 2026-05-11 | #35 | §4, §14 | Per-strategy config split: new `StrategyConfigPerStrategy` table (one row per trade_type) holds strategy-specific fields (thresholds, sizing, execution, wallet). `StrategyConfig` keeps account/process/mode-level globals. `MergedConfig` proxy lets bot.py call sites read transparently — pass `trade_type` to `get_strategy_config()`. `/config` gets a strategy tab selector; POSTs route per-strategy fields to the active tab's row, global fields to the singleton. Per-strategy rows lazily seeded from global on first read. |
@@ -1489,6 +1502,10 @@ The hard lessons distilled from the first implementation. **Read this section be
 
 - **L35 — Audit-pass discipline.** Every doc rewrite goes through at least two audit passes. Round 1: full draft. Round 2: cross-check every claim against the actual code. Round 3 (optional): readability + cross-reference consistency. In this session, the round-2 audit caught a NameError regression (`rt_basis_bps`) AND three "active config fields" that were in the doc but never actually read by the bot. Doc audits find code bugs.
 - **L36 — Operator vocabulary > internal naming.** Page names ("Dashboard", "Configuration", "Safety & Rules") match how the operator thinks about the bot. Field names should too. When the developer term and the operator term diverge, the operator term wins on UI surfaces; the developer term can stay in the schema for compatibility.
+
+### Exit logic
+
+- **L37 — Exit on economics, not on time.** A max-hold timer is a proxy for "the operator doesn't trust the economic gates to fire on time." The right fix is to make the economic gates trustworthy, not to add a fallback time cap. The bot now exits voluntarily when forward net APY drops below the exit threshold (deferrable on adverse basis) and mandatorily when the live basis dislocates beyond `(b_l − b_e) > basis_dislocation_exit_bps` — directly economic, no time proxy needed. A position whose funding stays high and basis stays sane can run for weeks; one whose economics break exits within a cycle. Removed `max_hold_hours` in v1.3.
 
 ---
 
