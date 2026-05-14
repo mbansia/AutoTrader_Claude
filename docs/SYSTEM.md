@@ -2,7 +2,7 @@
 
 The single living source of truth for what this bot does and how it works. Every behavior-changing PR updates the relevant section in the same commit. The diagnostics-monitor chat re-reads this on every wake-up before judging anomalies; any new dev reads it once to onboard.
 
-> Status: **v1.3** — 2026-05-13 exit-logic refactor (v1.2 → v1.3): removed time-based `max_hold_hours` exit; added `basis_dislocation_exit_bps` mandatory exit. Pure-economic exits only. See changelog §15.
+> Status: **v1.4** — 2026-05-13 execution-layer refactor (v1.3 → v1.4): walk → closed-form sizing; limit-IOC → market+FOK; sequential → parallel legs; sub-target sizing factor; full execution-risk mitigation policy codified. See changelog §15.
 
 ## How to read this doc
 
@@ -69,15 +69,19 @@ Every term used downstream in the doc lives here. Grouped to build up from primi
 
 | Term | Definition |
 |---|---|
-| **Market order** | "Buy/sell now at whatever price the book offers." Fills immediately, but at potentially poor prices on thin books. **The bot never uses market orders** — too much slippage risk on thinly-traded pairs. |
+| **Market order** | "Buy/sell the full quantity now at whatever price the book offers." Fills immediately at the volume-weighted average of the book up to the requested size. **The bot's primary order type** (v1.4): combined with pre-trade closed-form depth analysis (§3.1 math) and **FOK** semantics, the market order's slippage is bounded by the same depth the sizing math already saw, and the order fires with **zero latency window** for other actors to react. The historical concern about market orders ("too much slippage on thin books") is resolved by sizing to the available depth first. |
 | **Limit order** | "Buy/sell at price X or better." Fills against existing orders that cross your limit. Can rest on the book waiting if nothing crosses. |
 | **IOC** (Immediate-Or-Cancel) | A time-in-force flag. Order fills whatever depth it can against existing book at the moment of arrival, then immediately cancels any unfilled remainder. **Never** leaves a resting order. |
-| **Limit-IOC** | The bot's only order type. Combines limit + IOC: "fill against the book up to my limit price, right now, and cancel anything left." Predictable cost, predictable fill quantity, no resting-order risk. |
-| **Taker fee** | The fee charged when an order crosses the existing book (i.e. removes liquidity). Limit-IOC orders are always takers. Typically 0.06–0.10% per fill on these venues. |
-| **Maker fee** | The fee (sometimes a rebate) for an order that rests on the book waiting to be crossed. The bot does NOT use maker orders — see §16 L11 / L21. |
-| **Reservation** | When you submit a limit-buy for `qty × limit_price`, the venue immediately **reserves** that much cash from your wallet. If your wallet's free balance is less, the venue rejects the order mid-fill. Crucial because the reservation uses the LIMIT price (always worse than the average fill price), not the average. |
-| **Tick size** | The minimum price increment a venue accepts for an order on a given symbol. E.g. 0.0001 USDT. Orders priced off-tick are rejected. |
+| **FOK** (Fill-Or-Kill) | A time-in-force flag. Order fills the **entire** requested quantity at once, or cancels with zero fill. No partial fills, ever. **The bot's preferred TIF on every leg** (v1.4): a partial fill creates a naked-leg recovery problem; FOK eliminates the partial-fill class by construction. Trade-off: more clean rejects on thin books, but every accepted order is guaranteed hedged. **Venue support is uneven**: Binance USDM-futures + KuCoin futures accept `type=market, timeInForce=FOK` directly. **Binance spot does not** accept `timeInForce` on `type=market`; the standard arb-trader fallback is "**marketable-limit + FOK**" — submit a limit order with a price set far beyond top-of-book (e.g. 1% above ask for a buy) and `timeInForce=FOK`. Effectively a market order with FOK semantics. The gateway abstraction must transparently choose `market+FOK` or `marketable-limit+FOK` per venue+symbol. |
+| **OCO / atomic bracket** | A multi-leg order primitive where two or more legs are accepted as a single ticket and settle (or reject) together. **Preferred wherever the venue supports it** for spot-leg + perp-leg pairing, because it eliminates the inter-leg gap entirely. Today's reality: most CEX APIs expose OCO only within a single book (e.g. perp with stop + target), not across spot ↔ perp on the same account. Use it when the venue offers it; fall back to **parallel market+FOK** legs otherwise. |
+| **Limit-IOC** | **DEPRECATED (v1.4).** Was the bot's only order type pre-v1.4. Replaced by market+FOK because: (a) limit-IOC's price guarantee requires a tick buffer that on thin books exceeds typical market slippage; (b) limit-IOC produces partial fills under thin-book or mid-fill-error conditions, which create naked legs (§10); (c) limit-IOC orders are still always takers (no fee benefit) and the round-trip latency from book-walk → limit-construction → submission gives front-running actors a window market+FOK closes. See §16 L39. |
+| **Taker fee** | The fee charged when an order crosses the existing book (i.e. removes liquidity). All bot orders (market or any IOC variant) are takers. Typically 0.06–0.10% per fill on these venues. |
+| **Maker fee** | The fee (sometimes a rebate) for an order that rests on the book waiting to be crossed. The bot does NOT use maker orders — incompatible with the same-cycle entry/exit discipline. |
+| **Reservation** | When a venue accepts an order, it immediately reserves the cash the order could spend. For market-buys with FOK, reservation = `qty × top_of_book_ask` (some venues add a small buffer). The reservation is released atomically when the order completes or cancels. Sub-target sizing (§3.1 math) ensures reservation never overflows. |
+| **Tick size** | The minimum price increment a venue accepts for orders on a given symbol. E.g. 0.0001 USDT. Limit prices off-tick are rejected; market orders are immune. |
+| **Lot step / step size** | The minimum quantity increment for a symbol. Quantities off-step are rejected. The closed-form sizing math (§3.1) floors target_qty to this. |
 | **MIN_NOTIONAL** | The venue's per-symbol minimum order value in quote currency. Below this, the venue rejects the order. Roughly $5 on Binance, $1 on KuCoin. Dust below this can't be sold through normal orders — must use the venue's dedicated dust-conversion endpoint. |
+| **Sub-target sizing factor** | A multiplier `< 1.0` applied to the closed-form max fill size before order submission (default 0.75, v1.4). Leaves headroom for: (a) the matching engine reserving slightly more than our model expects, (b) book moves between our snapshot and the order, (c) other actors' orders landing in our reservation gap. Trade-off: ~25% smaller positions for near-zero reject rate. |
 
 ### 0.3 The bot's strategy (long-spot / short-perp funding arbitrage)
 
@@ -161,9 +165,9 @@ Different venues bundle balances differently. The bot abstracts over this but th
 | **Tier-3 gate** | The real economic check. Uses the actual fill prices from Tier-2, live per-symbol taker fees from the venue's fee API, signed basis P&L with worst-case adverse exit, plus a stablecoin-swap surcharge if needed. The candidate must clear net APY ≥ entry threshold to reach order placement. |
 | **Candidate** | A perp the scan considers a potential trade for this cycle. Becomes a candidate after passing Tier-1 and having a viable spot pair. Top candidates by net APY then face Tier-2 and Tier-3. |
 | **Sized notional** | The dollar amount of equity the bot wants to commit to this trade, computed before the book walk. Bounded below by `min_position_pct × equity` and above by `max_position_pct × equity`, then further capped by the smaller of the two leg wallets' free balances. |
-| **Wallet cap** | The hard ceiling on a trade's size imposed by available cash: `min(spot_leg_free, perp_leg_free) × safety_factor` (safety factor ≈ 0.97 covers limit-vs-mid price spread + fees). The bot will never try to commit more than this even if `max_position_pct × equity` is larger. |
-| **Target quantity** (target_qty in formulas) | The base-asset quantity the bot is trying to fill. Initially `sized_notional / spot_mid_price`; clamped down in the book-walk loop by both fillable depth and reservation limits at the final limit price. |
-| **Reservation** | When a limit-buy is placed for `qty × limit_price`, the venue immediately reserves that much from the trade wallet. The clamp ensures `qty × limit_price ≤ wallet_free × safety_factor` so the venue never rejects mid-fill. See §16 L07. |
+| **Wallet cap** | The hard ceiling on a trade's size imposed by available cash. Post-v1.4 the cap is computed per-side in the closed-form sizing math (§3.1 math) — for buy-spot the cap is price-dependent (per-level); for sell-spot and perp legs it's a flat cap derived from base balance or mark-price margin. The `sub_target_sizing_factor` then reduces the result by ~25% to absorb book moves and reservation buffers. |
+| **Target quantity** (target_qty in formulas) | The base-asset quantity the bot will submit on the next order. Computed in a single closed-form pass per book (§3.1 math) — no iteration. |
+| **Reservation** | The cash a venue holds against an in-flight order. For market+FOK (post-v1.4) this is approximately `qty × top_of_book_price + small_venue_buffer`; held for the few hundred ms the FOK takes to resolve, then released. Sub-target sizing keeps the reservation comfortably under wallet_free. See §16 L07 (legacy context). |
 | **Safety factor** | A multiplier (~0.99) applied to free-balance ceilings to absorb fee accrual, rounding, and last-millisecond balance shifts. Trades a tiny bit of headroom for reservation-rejection insurance. |
 | **Mandatory vs voluntary exit** | **Voluntary** exits (forward profitability dropped below exit threshold) are deferred for one cycle if closing right now would print an extra cost (unfavourable live basis). **Mandatory** exits (stop-loss, hedge integrity, market unhealthy, basis dislocation) close immediately regardless. |
 
@@ -342,9 +346,8 @@ Phase A — Safety (live only — but paper mode still runs the READ-ONLY
       market-health check     → if the venue reports the perp's market as
                                 delisted, halted, or missing from the live
                                 markets list, force-close both legs via the
-                                normal close path (limit-IOC at worst-walked
-                                price + exit_tick_buffer_bps — same path as a
-                                voluntary exit, never a market order)
+                                normal close path (market+FOK, parallel —
+                                same path as a voluntary exit)
       hedge-integrity check   → detection rule:
                                   spot leg present iff
                                     spot_wallet[base].free + .used ≥ qty − ε
@@ -353,7 +356,7 @@ Phase A — Safety (live only — but paper mode still runs the READ-ONLY
                                     the venue for perp_symbol with the same
                                     sign and qty within ε
                                 If exactly ONE leg is present → close the
-                                surviving leg (same limit-IOC close path);
+                                surviving leg (same market+FOK close path);
                                 mark the position closed with last_close_error
                                 describing which leg vanished.
                                 If BOTH legs missing → mark closed (orphan
@@ -361,12 +364,15 @@ Phase A — Safety (live only — but paper mode still runs the READ-ONLY
                                 external interventions).
    Maintenance-mode handling (if mode_state.maintenance_mode is true):
       For every currently-exposed position (status in OPEN_STATUSES):
-        run the normal close path (limit-IOC, profitability deferral DISABLED
-        because maintenance is a mandatory exit). Skip the profitability gate
-        and the deferral logic; the operator wants out.
-        DO NOT use market orders — slippage on thin books would burn the
-        operator. Limit-IOC with the exit tick buffer is the right tool even
-        in maintenance.
+        run the normal close path (market+FOK, parallel, profitability
+        deferral DISABLED because maintenance is a mandatory exit). Skip
+        the profitability gate and the deferral logic; the operator wants
+        out.
+        Note (v1.4): the pre-v1.4 spec banned market orders here. With
+        closed-form sizing + sub-target-sizing-factor (§3.1 math), the
+        slippage that earlier banned market orders is bounded by the same
+        depth the sizing math already saw, so market+FOK is now safe and
+        materially faster than limit-IOC. See §16 L38–L40.
         Entries are blocked for the duration (no Phase C).
    Phantom-leg recovery (sweep BOTH wallets, look for orphaned legs in either
    direction — naked spot AND naked perp are symmetric failure modes):
@@ -382,13 +388,13 @@ Phase A — Safety (live only — but paper mode still runs the READ-ONLY
                Phase 1: try to hedge by SHORTING the matching perp (if
                         forward profitability gate passes at current funding); or
                Phase 2: SELL the spot back to the quote stablecoin via
-                        limit-IOC
+                        market+FOK
       ③ Naked-perp branch — for each open perp short on the venue without a
          matching spot holding (or matching DB row):
            - persist as naked-perp, then either
                Phase 1: try to hedge by BUYING matching spot (if forward
                         profitability gate passes at current funding); or
-               Phase 2: BUY BACK the perp short via limit-IOC to flatten
+               Phase 2: BUY BACK the perp short via market+FOK to flatten
          Note: today's entry flow places spot first, perp second — so
          naked-perp is rare from entries (it would require an exit-time perp
          buy-back failure, or an externally-opened short). Recovery logic
@@ -440,25 +446,49 @@ Phase C — Entries (when entry enabled for this mode/strategy AND at-capacity c
          and the wallet for that stable is starved
    For each candidate (top N by APY):
       Skip if base asset is already held (any open or naked position).
-      Iterative book-walk loop (up to 4 passes):
-         Parallel simulate fill on spot (buy) + perp (sell) at current target qty
-         Compute provisional limit prices (worst-fill ± tick buffer)
-         Clamp target_qty by:
-            min(book-fillable qty,
-                what fits in spot leg's free balance at spot limit price,
-                what fits in perp leg's free balance × leverage at perp limit price)
-         Break when target_qty stops shrinking
+      Closed-form sizing (single pass, no iteration — see §3.1 math):
+         Snapshot both books (spot + perp) ATOMICALLY (websocket frame or
+            back-to-back REST in <50ms — see §16 L42).
+         Compute binding-level qty per book by walking each book one pass:
+            For each level i:
+               cum_qty_i      = sum of depths from level 1..i
+               max_fund_qty_i = (wallet_free × safety) / (price_i)
+               feasible_i     = min(cum_qty_i, max_fund_qty_i)
+            Binding level = the i that maximises feasible_i.
+            book_binding_qty = feasible at binding level.
+         target_qty = min(spot_book_binding, perp_book_binding × leverage,
+                          sized_notional / spot_mid) × sub_target_sizing_factor
+         Floor target_qty to lot step.
       Tier-3 profitability gate (full math below).
+         Forecast avg fill = vwap of book up to target_qty.
+         Use forecast in the profitability formula.
          REJECT insufficient_annualized_profit if net APY < entry threshold.
-      Place spot limit-IOC at the worst-walked-price + tick buffer.
-         Pre-snapshot the base-asset spot balance; on order exception, re-read
-         balance — if any quantity actually filled, synthesize a partial fill
-         dict and continue to the perp leg at the smaller actual size.
-      Persist position with status = open; record the spot fill as a Trade.
-      Place perp limit-IOC short for the spot-filled qty.
-         On exception or zero fill: roll back the spot leg (sell back); record
-         the rollback as a Trade; reject with perp_short_error.
-      If perp filled less than spot, trim the spot leg to match.
+      ORDER PLACEMENT — venue-tier preference, in order:
+        (A) Atomic spot+perp bracket (where the venue supports it
+            cross-book; rare today): submit as one ticket. Either both fill
+            or both reject. Done.
+        (B) Parallel market+FOK on each leg (default for current venues):
+            Fire BOTH orders concurrently (asyncio.gather / thread pool).
+            Each order: type=market, time_in_force=FOK, qty=target_qty.
+            Wait for both to settle (typically <500ms).
+            Outcome cases:
+               BOTH FILL    → persist position status=open; record both
+                              trades; success.
+               BOTH REJECT  → reject candidate; reason carries both errors;
+                              retry next cycle. (Common: book moved through
+                              FOK depth simultaneously on both sides — a
+                              fair signal that conditions changed.)
+               ONE FILLS    → orphan handling:
+                  - leg that filled rolls back via a same-cycle market+FOK
+                    in the reverse direction at the smallest needed size.
+                  - if rollback succeeds → reject with single_leg_orphan,
+                    no naked row persisted.
+                  - if rollback fails → persist as naked_spot or naked_perp
+                    per §0.4; phantom-leg recovery (Phase A next cycle)
+                    handles it (L21 / §3.1 Phase A).
+      Each order is submitted with a venue-side client-order-id derived
+         deterministically from (cycle_id, leg, candidate_symbol) so a
+         network-retry of the same call is idempotent (§16 L43).
       BREAK after one successful open (max 1 open per cycle per venue).
 
 Post-cycle
@@ -557,42 +587,105 @@ Two additional **mandatory** exit triggers, evaluated alongside:
 
 Voluntary exits (forward-profit) **defer** for one cycle when the live basis would print a closing cost above the configured exit-basis ceiling (`max_exit_basis_bps`). The deferred exit retries every cycle until basis becomes favourable. Mandatory exits (basis-dislocation, stop-loss, hedge-integrity, market-unhealthy, maintenance-mode) are NOT deferrable.
 
-#### Reservation-aware sizing (inside the walk loop)
+#### Closed-form sizing (v1.4 — replaces the walk loop)
 
-The matching engine on both venues reserves `qty × limit_price` (not avg-fill price) from the trade wallet when a limit-IOC buy lands. The limit price is `worst_walked_price + tick_buffer`, which is strictly above the average fill. Sizing `target_qty` purely against `sized_notional / mid_price` overflows the wallet's free balance on thin books and causes mid-fill "balance insufficient" errors with partial-fill exposure.
-
-**Worst-walked price** is defined precisely: walk the order book level-by-level until cumulative size ≥ `target_qty`; record the price at the **deepest** level touched (worst for the side being placed — highest for a buy, lowest for a sell). This is the price the matching engine will actually charge on the marginal unit, not the average fill.
-
-The walk loop converges by clamping `target_qty` every pass:
+**The iterative walk was a solver, not a strategy.** A book is a sorted list of `(price, depth)` levels; the constraint set (wallet reservation × leg + cumulative depth) is monotone in the level index; the optimum is a single binding level per side. This is solvable in one pass per book, no fixed-point iteration. The closed-form derivation:
 
 ```
-spot_limit_raw = spot_worst_price × (1 + tick_buffer / 10⁴)
-perp_limit_raw = perp_worst_price × (1 − tick_buffer / 10⁴)
+Inputs per side ("side" ∈ {spot, perp}):
+   book[]            sorted by price aggressiveness
+                       buy  → ascending  prices p_1 < p_2 < …
+                       sell → descending prices p_1 > p_2 > …
+   wallet_free       free balance in the leg's quote (or base for sell)
+   safety            safety factor (default 0.99)
+   leverage          1 for spot; configurable for perp (default 1)
+   sub_target        sub-target sizing factor (default 0.75)
 
-# Tick-rounding is MANDATORY before order submission — venues reject
-# off-tick prices outright. Round CONSERVATIVELY for each side:
-#   buy  → round UP   to next tick (overpay slightly, still IOC)
-#   sell → round DOWN to next tick (underprice slightly, still IOC)
-# "Conservative" here means "in the direction that costs us the tick".
-spot_limit  = round_up_to_tick(spot_limit_raw, spot_tick_size)
-perp_limit  = round_down_to_tick(perp_limit_raw, perp_tick_size)
+Step 1 — walk book ONCE, level by level, computing per-level feasibility:
+   cum_qty_0 = 0
+   for each level i with (price p_i, depth d_i):
+       cum_qty_i      = cum_qty_{i-1} + d_i
+       max_fund_qty_i = (wallet_free × safety × leverage) / p_i
+       feasible_i     = min(cum_qty_i, max_fund_qty_i)
 
-max_qty_by_spot_balance = (spot_leg_free × safety_factor) / spot_limit
-max_qty_by_perp_balance = (perp_leg_free × safety_factor × leverage) / perp_limit
+Step 2 — pick the binding level: i* = argmax_i feasible_i
+   book_binding_qty[side]   = feasible_{i*}
+   forecast_avg_price[side] = vwap(book[1..i*], up to feasible_{i*})
 
-target_qty = min(target_qty, spot_book_fillable, perp_book_fillable,
-                 max_qty_by_spot_balance, max_qty_by_perp_balance)
-
-# Quantity also has a venue lot-size step; floor target_qty to it
-# AFTER all clamping so reservation math uses the final submitted qty.
-target_qty = floor_to_lot_step(target_qty, lot_step)
+Step 3 — cross-leg combine:
+   target_qty_raw = min( book_binding_qty[spot],
+                         book_binding_qty[perp],          # perp's leverage
+                                                          # already baked in
+                         sized_notional / spot_mid )      # operator cap
+   target_qty     = floor_to_lot_step(target_qty_raw × sub_target, lot_step)
 ```
 
-The safety factor (~0.99) absorbs fee accrual and rounding. Up to 4 passes; walks re-execute when target_qty shrinks so the profitability gate downstream sees fill prices for the FINAL (post-clamp, post-rounded) size, not pre-clamp.
+**Why "argmax over feasible_i"?** As you walk deeper into the book, `cum_qty_i` grows monotonically (good — more depth). What `max_fund_qty_i` does depends on the side:
+
+| Side | `max_fund_qty_i` shape | Binding-level rule |
+|---|---|---|
+| **Buy spot** (entry, hedging recovery) | Strictly decreasing in `i` (worse price → less wallet can fund) | Per-level argmax of `min(cum_qty, max_fund)`. The crossing point is the optimum. |
+| **Sell spot** (exit, naked-spot recovery) | Constant: `base_balance × safety` (you already own the base; reservation is qty-only, price-independent) | `target_qty = min(cum_qty_until_filled, base_balance × safety)` — flat cap, no per-level argmax needed. |
+| **Sell perp** (entry short) | Constant in `i` (initial margin is computed off mark-price, fixed at submission): `(wallet_quote × safety × leverage) / mark_price` | Same flat-cap rule. |
+| **Buy perp** (exit, naked-perp recovery / close) | Constant in `i` (margin off mark-price): `(wallet_quote × safety × leverage) / mark_price` | Same flat-cap rule. |
+
+The walk-and-argmax form applies to the **buy-spot** case (which is the entry path's binding leg on price-dependent reservation). The other three sides are flat-cap and shortcut to `min(cum, cap)`. A single helper function takes the side as input and dispatches.
+
+**No tick-buffer, no limit-price construction.** The order type is **market** with **FOK** time-in-force (§0.2). The forecast `vwap` is what we feed into the profitability gate; the venue's actual fill comes in within tick-level slippage of that forecast on FOK semantics. `sub_target_sizing_factor` absorbs everything the safety factor used to absorb plus the small reserve-vs-mid gap the venue's reservation policy adds.
+
+**Why `sub_target = 0.75`?** Empirically chosen to absorb:
+- ~5% from venue reservation buffers above top-of-book (`reservation ≈ qty × top_ask + venue_buffer`)
+- ~10% from book moves between snapshot and order arrival
+- ~5% from other-actor orders racing into the same depth
+- ~5% from cross-leg sizing mismatches between spot lot-step and perp lot-step
+
+Operators can tune per strategy; lower factor = lower reject rate at smaller position size.
+
+**Snapshot atomicity.** Both books are snapshotted within a 50ms window (websocket frame where available, parallel REST otherwise). The closed-form result is only valid if the snapshots are co-temporal; stale snapshots → forecast diverges from fill. See §16 L42.
+
+**No iteration, no convergence concerns.** Single pass per book. The walk-loop's "4 passes" was patching the absence of closed-form derivation; with the closed-form the answer is exact in one pass and the order can be submitted immediately.
 
 #### Per-strategy config that applies
 
-See [§4 Configuration](#4-configuration) for the layered split. Per-strategy fields used here: entry/exit net-APY thresholds, exit-basis buffer multiplier, exit-basis ceiling, basis-dislocation exit threshold, stop-loss percent, min/max position percent of equity, entry/exit tick-buffer bps, perp leverage, auto-transfer flag, auto-quote-swap flag, futures-buffer percent. Global fields used: max open positions, max trades per day, loop seconds, paper-mode synthetic costs, hedge integrity check, delisting check.
+See [§4 Configuration](#4-configuration) for the layered split. Per-strategy fields used here: entry/exit net-APY thresholds, exit-basis buffer multiplier, exit-basis ceiling, basis-dislocation exit threshold, stop-loss percent, min/max position percent of equity, sub-target sizing factor, perp leverage, auto-transfer flag, auto-quote-swap flag, futures-buffer percent. Global fields used: max open positions, max trades per day, loop seconds, paper-mode synthetic costs, hedge integrity check, delisting check. The `entry_tick_buffer_bps` / `exit_tick_buffer_bps` fields are deprecated (v1.4) — market+FOK orders have no limit price to buffer.
+
+#### Execution-risk mitigation policy (v1.4)
+
+The following are now policy, not options. Each was identified as a no-new-infra, no-new-API-cost mitigation for the execution-risk catalog in §10 + §16 L11–L15 + L18 + L42–L43. Implementations must enforce these on every cycle.
+
+**Order layer:**
+- All orders are **market** with **FOK** time-in-force (§0.2). Limit-IOC is deprecated. Where a venue exposes atomic spot+perp brackets, prefer them over parallel market+FOK.
+- Both legs fire **in parallel** (concurrent async / threadpool), not sequentially. Eliminates the inter-leg gap that front-running actors exploit.
+- Each order carries a **deterministic client-order-id** = `hash(cycle_id, candidate_symbol, leg)`. Network retries of the same call are idempotent — venue rejects duplicates.
+
+**Sizing layer:**
+- Sizing is **closed-form** (single pass per book, §3.1 math), not iterative. No 4-pass walk.
+- Final qty is multiplied by **`sub_target_sizing_factor`** (default 0.75) before submission. Absorbs reservation buffers, book moves, racing actors.
+- Book snapshots for spot + perp are taken within a **<50ms window** (websocket frame where the venue exposes it; back-to-back REST otherwise).
+
+**Pre-submission freshness:**
+- Predicted funding rate is re-queried at gate time (T-0 check, max age 5s). The scanner's rate is a candidate filter; the gate's rate is the binding economic input.
+- ccxt market metadata (tick, lot, MIN_NOTIONAL) has a **per-cycle TTL**; on any venue reject mentioning tick/lot/min-notional, force-refresh the symbol's metadata and retry once next cycle.
+- Pin the ccxt version in the lockfile. Upgrade is a deliberate event with a smoke test, never silent.
+
+**Wallet layer:**
+- Cache invalidation on every mutating call (`place_order`, `transfer`, `swap`): the cached balance is discarded before the next read returns (§16 L18).
+- Wallet-consolidation is best-effort per source bucket: a per-bucket failure logs WARN and continues with the remaining buckets (partial sweep is still useful).
+- Eager-seed per-strategy config rows at process startup, not on first read. Eliminates the lazy-seed race (§18 closed item).
+
+**Account-level assertions:**
+- **Account-id assertion at boot**: read each venue's account id (or sub-account uid), compare to a new env var per venue (`BINANCE_EXPECTED_ACCOUNT_ID`, `KUCOIN_EXPECTED_ACCOUNT_ID`), refuse to start on mismatch with a clear log line. Eliminates sub-account misconfig class. New env vars are documented in §2.2.
+- **Periodic permission probe**: every 5 minutes, call a minimal spot read + a minimal futures read on each gateway. On unexpected permission errors, emit a critical anomaly (`api_permission_drift`). Rate-limit budget: 2 calls × N gateways × 12/hour = trivially below any venue's per-IP limit; no rate-limiter contention with the scanner.
+- **Token-bucket rate limiter** per venue, with priority queues (orders + close paths > scans > diagnostics > housekeeping). Prevents scan storms from starving order placement.
+
+**Process layer:**
+- **Static-import smoke at deploy**: `python -c "import app.main"` must succeed before the container is considered healthy. Catches NameError / missing-import regressions before they kill cycles (§16 L02).
+- **Cycle-error-rate anomaly**: §8.2 adds `cycle_error_rate_high` — fires when `error_count / cycles_in_window > 0.5`. Catches the silent-NameError class while it's measurable.
+- **Graceful shutdown** on SIGTERM: cancel scans, complete in-flight orders' settlement reads (bounded to 10s — beyond that, persist as "in-flight unresolved" and let next-cycle reconciliation finish), flush DB, exit. Coolify deploys don't leave indeterminate state.
+- **Migration unit tests**: every schema migration runs against a copy of the production DB in CI before deploy.
+
+**Stablecoin / cross-stable:**
+- **Tighter de-peg guard** (25 bps vs the previous 50). Reduces stablecoin-execution slippage at the small cost of more rejected swap candidates.
 
 ### 3.2 Cross-venue funding arb [PLANNED]
 
@@ -647,7 +740,7 @@ The bot, when running on a given strategy, reads a **merged view** of the two ta
 |---|---|---|
 | **Thresholds** (entry/exit min net APY, exit-basis buffer multiplier, max-exit-basis bps, stop-loss percent) | **Yes** | Different strategies, different risk profiles. |
 | **Sizing** (min/max position percent) | **Yes** | Strategies size differently. |
-| **Execution** (entry/exit tick buffer bps, perp leverage, max perp leverage) | **Yes** | Venue tick density and leverage policy diverge. |
+| **Execution** (sub-target sizing factor, perp leverage, max perp leverage, order policy) | **Yes** | Venue depth profile, slippage tolerance, and leverage policy diverge. |
 | **Wallet** (auto-transfer flag, auto-quote-swap flag, futures-buffer percent) | **Yes** | Unified-margin venues don't need these; Classic does. |
 | **Account-level caps** (max open positions, max trades per day) | **No** (global) | These cap portfolio risk across the entire account. |
 | **Process** (loop seconds) | **No** (global) | One bot process, one loop period. |
@@ -669,13 +762,13 @@ The bot, when running on a given strategy, reads a **merged view** of the two ta
 | Basis dislocation exit bps | 50.0 | Mandatory exit when `(live_basis − entry_basis)` exceeds this — the live basis has moved farther adverse than our cost model assumed at entry, so the position's economics are no longer the ones the gate approved. |
 | Min position percent | 0.005 (= 0.5%) | Sizing floor as fraction of equity. |
 | Max position percent | 0.10 (= 10%) | Sizing ceiling. |
-| Entry tick-buffer bps | 1.0 | Limit-IOC entry price padding above worst-walked fill. |
-| Exit tick-buffer bps | 2.0 | Same on exit. |
+| Sub-target sizing factor | 0.75 | Final qty multiplier after closed-form max (§3.1 math). Absorbs reservation buffers, book-move slippage, and racing actors. Lower = lower reject rate at smaller position size. |
 | Perp leverage | 1 | Only safe value for delta-neutral. |
 | Max perp leverage | 1 | Hard cap (also shown on dashboard for effective-APY display). |
 | Auto-transfer flag | true | Pre-trade spot↔futures rebalance for split-wallet venues. |
 | Auto-quote-swap flag | true | Auto-swap USDT↔USDC pre-trade when a quote wallet is starved. |
 | Futures-buffer percent | 0.20 (= 20%) | Margin buffer kept on futures wallet during post-cycle drain. |
+| Tighter de-peg guard bps | 25.0 | Maximum |USDC/USDT − 1| basis tolerated for auto-swap (v1.4: reduced from 50 → 25 to bound execution slippage in stable swaps). |
 
 **Global:**
 
@@ -717,6 +810,7 @@ Earlier iterations carried fields that were retired as the strategy matured. A f
 - **Master entry/exit toggles on the strategy config**. Those belong on the mode-state and per-strategy-state tables, not on the runtime config singleton. Mixing them invited stale-read bugs.
 - **Names that promise raw funding** for thresholds that are actually net APY. The names lied for months. See §16 Learning L01.
 - **Time-based exits (`max_hold_hours`).** Removed v1.3. Time is not a meaningful exit axis for this strategy — money is. Forward-profitability decay and basis dislocation cover every case the time cap was approximating, and they're directly economic rather than proxy. The column is retained on the schema per additive-only policy but the exit logic no longer consults it. See §16 Learning L37.
+- **Limit-IOC orders + tick-buffer bps.** Removed v1.4. The iterative book-walk + limit-IOC + tick-buffer pattern was replaced by **closed-form sizing + market+FOK orders** (§3.1 math, §0.2). Tick-buffer fields (`entry_tick_buffer_bps`, `exit_tick_buffer_bps`) are retained on the schema but the order-placement path no longer uses them. See §16 L38–L40.
 
 ---
 
@@ -828,7 +922,7 @@ If we're rebuilding the UI from scratch, **keep**:
 
 **Throw away:**
 
-- Deprecated form fields still showing on `/safety` (`min_24h_quote_volume`, `min_order_book_depth_usdt`, etc. were purged from `/config` in PR #34 — but check `/safety` and `/monitoring` exports for stragglers).
+- Deprecated form fields still showing on `/safety` (`min_24h_quote_volume`, `min_order_book_depth_usdt`, etc. were purged from `/config` in PR #34 — but check `/safety` and `/monitoring` exports for stragglers). **v1.4 additions to the hide-list**: `entry_tick_buffer_bps`, `exit_tick_buffer_bps`, `max_hold_hours` — schema-retained per additive-only policy, but should not be editable from `/config` (the form should not even render their inputs). Add `sub_target_sizing_factor`, `basis_dislocation_exit_bps`, `depeg_guard_bps` as new inputs.
 - Any `<input>` whose `name` is still `entry_funding_threshold_pct` rather than `entry_min_net_apy_pct` — accepted as a back-compat alias for one cycle, drop after the next release.
 - The strategy placeholder rows on `/config` for trade-types that aren't wired (cross-venue, IBKR) — keep as "coming soon" notes but don't render disabled form controls.
 
@@ -871,7 +965,7 @@ If we rewrite, the build-step-free Vanilla setup is worth preserving — it keep
 ### 6.4 Cross-stable USDT ↔ USDC
 - Per-quote sizing reads the spot leg from the spot-quote wallet and the perp leg from the perp-quote wallet — these are independent buckets for cross-stable arbs.
 - Auto-swap fires only for same-stable arbs (spot and perp share quote) when the relevant pool is below the min-notional and the other stable has surplus.
-- Swap path: walk the USDC/USDT order book, place a limit-IOC at the worst-walked-price ± tick buffer, with a ±50 bps de-peg guard. Cost is charged to the profitability gate.
+- Swap path: snapshot the USDC/USDT order book, run the closed-form sizing (§3.1 math), submit as **market+FOK** subject to the `depeg_guard_bps` (default 25 bps post-v1.4) limit. Cost is charged to the profitability gate before submission.
 
 ---
 
@@ -935,8 +1029,10 @@ Legacy columns retained for back-compat (no longer read): `entry_funding_thresho
 | `max_hold_hours` | integer, default 72 | **DEPRECATED** (v1.3). Column retained per additive-only policy (§7.3) but no longer read by the exit logic. Time-based exit was removed in favor of pure-economic exits (profitability + basis-dislocation). |
 | `min_position_pct` | float, default 0.005 | Sizing floor as fraction of equity. |
 | `max_position_pct` | float, default 0.10 | Sizing ceiling. |
-| `entry_tick_buffer_bps` | float, default 1.0 | Limit-IOC entry price padding above worst-fill. |
-| `exit_tick_buffer_bps` | float, default 2.0 | Same on exit. |
+| `entry_tick_buffer_bps` | float, default 1.0 | **DEPRECATED (v1.4)**. Was used to pad the limit price above worst-walked fill for limit-IOC entries. Order path is now market+FOK (§0.2); no limit price → no buffer needed. Column retained per additive-only policy. |
+| `exit_tick_buffer_bps` | float, default 2.0 | **DEPRECATED (v1.4)**. Symmetric to above for exits. Column retained per additive-only policy. |
+| `sub_target_sizing_factor` | float, default 0.75 | Final qty multiplier applied to the closed-form max from §3.1 math. Absorbs reservation buffers, book-move slippage, and racing actors. Lower = fewer rejects, smaller positions. |
+| `depeg_guard_bps` | float, default 25.0 | Maximum \|USDC/USDT − 1\| basis tolerated for auto-swap (v1.4: tightened from 50 → 25). |
 | `perp_leverage` | integer, default 1 | Only safe value for delta-neutral. |
 | `max_perp_leverage` | integer, default 1 | Hard cap (also displayed on dashboard). |
 | `auto_transfer_enabled` | bool, default true | Pre-trade spot↔futures rebalance toggle. |
@@ -1228,6 +1324,9 @@ Constraints / invariants the rewrite must preserve:
 | `no_trades_despite_scans` | warn | 0 recent trades AND > 20 rejections in window |
 | `error_burst` | warn | > 20 ERROR events in window |
 | `close_blocked` | warn | Open Position with non-empty `last_close_error` |
+| `cycle_error_rate_high` | critical | `error_count / cycles_in_window > 0.10` (v1.4 — 10% errors-per-cycle; "almost everything broken" not "something wrong"). Catches silent-cycle-killer regressions (the L02 NameError class) by measuring the error-per-cycle ratio rather than just liveness. Operators can tune. |
+| `api_permission_drift` | critical | The periodic permission probe (§3.1 mitigations) returned an unexpected permission error on any leg (v1.4). |
+| `slippage_above_forecast` | warn | Realized fill on a leg diverged from the closed-form vwap forecast by more than `slippage_alert_bps` (default 10 bps). Sub-target sizing should keep this near zero; persistent alerts indicate book-snapshot staleness or matching-engine drift. |
 
 ### 8.3 Cron + tracker
 
@@ -1258,13 +1357,15 @@ Separate Claude session. Reads this doc on every wake-up. Subscribes to the trac
 | `no_spot_market` | Perp's base has no spot pair on the venue. | None — perp-only listing. |
 | `insufficient_annualized_profit` | Tier-3 gate: real net APY (after live fees + fill basis) < threshold. | None unless threshold mis-calibrated. |
 | `below min position pct` | Sized notional < `min_position_pct × equity`. Wallet starvation. | Inspect `wallets` for stranded funds. |
-| `below_min_pct_after_clamp` | Reservation clamp shrunk size below min. | None — genuinely too small. |
-| `no_book_depth` | The book-walk simulation returned zero fill; the underlying error is embedded in the rejection reason. | Inspect the inner error (venue limit param, bad symbol, network). |
-| `reservation_clamp_zeroed` | Wallet too small even for limit-price reservation. | None. |
+| `below_min_pct_after_clamp` | Closed-form sizing × sub-target shrunk size below `min_position_pct × equity`. | None — genuinely too small for the binding wallet. |
+| `no_book_depth` | The book snapshot returned zero (venue limit param, bad symbol, network). | Inspect the inner error. |
+| `reservation_clamp_zeroed` | Wallet too small for even the smallest viable order at top-of-book. | None. |
 | `basis_dislocated` | **DEPRECATED** — gate retired in PR #9. Should be 0. If non-zero, regression. |
-| `spot_buy_error: ... Balance insufficient!` | Mid-fill reservation overflow (pre-PR-#10 era) or thin-book partial fill. | After PR #10/14/15 should drop near zero. |
-| `spot_buy_error: ... Order size below minimum` | Sizing dropped below venue min after clamp. | Investigate sizing math. |
-| `spot_ioc_zero_fill` / `perp_ioc_zero_fill` | Book moved during round-trip. Transient. | None — retries next cycle. |
+| `spot_buy_error: ... Balance insufficient!` | **DEPRECATED in v1.4** — mid-fill reservation overflow class. Should be 0 post-v1.4 (market+FOK + sub-target sizing eliminates the class). If non-zero, regression. |
+| `spot_buy_error: ... Order size below minimum` | Sizing floor below venue min after clamp + sub-target. Investigate sizing math; lower `min_position_pct` or raise equity. |
+| `spot_ioc_zero_fill` / `perp_ioc_zero_fill` | **DEPRECATED in v1.4** — limit-IOC class. Market+FOK either fills or rejects atomically; replaced by `fok_rejected` below. |
+| `fok_rejected_spot` / `fok_rejected_perp` | Market+FOK on a leg rejected by the venue (book didn't have full depth at submission time, or wallet reservation hit a buffer the sub-target factor didn't cover). Transient — retries next cycle with fresh snapshots. Persistent occurrence on a symbol → tighten `sub_target_sizing_factor`. |
+| `single_leg_orphan` | Parallel placement filled one leg, the other rejected, and the same-cycle rollback succeeded. No naked row persisted. Should be rare; if frequent, indicates correlated leg failure (e.g. account-level rate-limit) that needs operator attention. |
 | `strategy_disabled:<trade_type>` | Operator killed strategy via `/config`. | None unless unintentional. |
 
 ### 9.2 Common log patterns (informational)
@@ -1286,7 +1387,7 @@ Separate Claude session. Reads this doc on every wake-up. Subscribes to the trac
 ### 9.3 Log patterns that indicate a regression
 
 - `Loop iteration error (<mode>): name '<X>' is not defined` — Python NameError from a missing import. Open a PR. Past examples: `total_funding_income`, `rt_basis_bps`.
-- `Reservation clamp on <symbol>` — should NOT appear (clamp moved inside walk loop in PR #12). If it surfaces, regression.
+- `Reservation clamp on <symbol>` — should NOT appear post-v1.4 (closed-form sizing eliminates the walk-loop clamp class). If it surfaces, regression.
 - `basis_dislocated` rejections — should be 0. Regression if non-zero.
 
 ---
@@ -1302,7 +1403,9 @@ Separate Claude session. Reads this doc on every wake-up. Subscribes to the trac
 | Naked spot whose underlying spot disappeared from wallet | Stale-reconciliation pass at top of recovery | Auto-mark closed |
 | Naked perp whose underlying perp short was closed externally / liquidated | Stale-reconciliation pass at top of recovery — symmetric branch | Auto-mark closed |
 | Wallet starvation | "below min position pct" rejection | Wallet-breakdown diagnostic surfaces where funds are stranded (`/api/diagnostics` payload includes the per-wallet-type view) |
-| Book moves during round-trip | Zero-fill on the limit-IOC | Reject, retry next cycle |
+| Book moves during round-trip | Market+FOK rejects atomically (no partial fill) | Reject, retry next cycle. Parallel placement (v1.4) shortens the round-trip; correlated rejections on both legs are a fair signal that conditions actually changed. |
+| Single-leg orphan (parallel placement: one leg filled, other rejected) | Same-cycle reverse-market+FOK rollback on the filled leg | If rollback succeeds → reject with `single_leg_orphan`, no naked row. If rollback fails → naked_spot or naked_perp persisted; Phase A recovery handles next cycle (§3.1 Phase A, L21). |
+| Realized slippage diverges from forecast | Per-leg `actual_avg_fill` vs `forecast_vwap`; tracked into the `slippage_above_forecast` anomaly (§8.2) | Persistent alerts → tighten `sub_target_sizing_factor` or shorten snapshot-to-submit window. |
 | KuCoin futures→spot drain "balance insufficient" / wallet oscillation | Post-cycle drain WARN repeating every cycle on idle accounts (21k+/24h) | **Resolved across PR #29 + PR #33.** Three layers: (1) routing — switched from spot-side universal-transfer to the futures-side legacy transfer-out endpoint, which is the only one that can see the futures wallet; (2) two-hop — append the main→trade hop via spot inner-transfer so funds land where the spot order book can spend them; (3) idle-cycle gate — pre-trade rebalance only fires when a candidate passed the scan, breaking the drain↔rebalance oscillation. Persistent failures are deduped via an error-message throttle. |
 | Symbol drift across ccxt versions | Exit funding miss WARN | Falls back to stale `last_funding_rate`; logged. |
 | Loop crash | Outer exception handler at the cycle boundary | Logged as ERROR with the full traceback; loop continues next cycle. (Crashes that silently swallow whole cycles are the most insidious failure mode — see §16 L02.) |
@@ -1402,6 +1505,7 @@ Append-only. Format: `YYYY-MM-DD · PR# · §sections touched · summary`.
 
 | Date | PR | Sections | Summary |
 |---|---|---|---|
+| 2026-05-13 | doc | §0.2, §3.1 SOP + math + new mitigation subsection, §4, §7.1.1, §8.2, §9.1, §10, §16 L38–L43 (new), §18 closures | **Execution-layer refactor (v1.3 → v1.4) — SPEC ONLY; code follows.** This PR rewrites the spec to describe the v1.4 execution layer. The implementation (bot.py, exchange.py, ccxt order parameters, sub-target sizing field on the schema, new anomalies, /config form changes, account-id env vars) is a follow-up. Monitor chat should NOT flag the running bot's v1.3 behavior as anomalous against this v1.4 spec until the code lands. (1) Iterative book-walk REPLACED by **closed-form sizing** (single pass per book, argmax of feasibility per level). (2) **limit-IOC DEPRECATED** in favor of **market+FOK** on every leg — pre-trade depth analysis + sub-target sizing makes market+FOK strictly better at our sizing range (L39). (3) Legs now fire **in parallel** (concurrent submission), not sequential — closes the inter-leg latency window that front-running actors exploited (L40). (4) Atomic spot+perp brackets preferred where the venue supports them. (5) New `sub_target_sizing_factor` (default 0.75) absorbs reservation buffers + book moves + racing actors (L41). (6) **Execution-risk mitigation policy** codified: deterministic client-order-ids, T-0 funding rate freshness, ccxt metadata cache TTL + reject-driven refresh, eager strategy-config seed, account-id assertion at boot, periodic permission probe, cycle-error-rate anomaly, static-import deploy smoke, graceful SIGTERM, token-bucket rate-limiter, migration unit tests, tighter 25bps depeg guard. (7) `entry/exit_tick_buffer_bps` deprecated (schema retained per additive-only). (8) Anomalies: `cycle_error_rate_high`, `api_permission_drift`, `slippage_above_forecast`. (9) Rejection categories updated: `fok_rejected_spot/perp`, `single_leg_orphan`; old `ioc_zero_fill` and mid-fill `spot_buy_error` classes deprecated. (10) §18 closures: per-symbol fee caching, two-hop step-1-ok/step-2-fail, wallet-consolidation atomicity, tick-buffer rationale. (11) L38–L43: walks are solvers, limit-IOC's price guarantee is illusory at our depth, sequential legs are a front-runner gift, sub-target is cheap insurance, co-temporal snapshots are non-negotiable, client-order-id is the cheapest network-blip insurance. |
 | 2026-05-13 | doc | §0.3, §3.1 SOP + math, §4, §7.1.1, §16 L37 (new) | Exit-logic refactor (v1.2 → v1.3). **Removed `max_hold_hours`** time-based exit (column retained per additive-only policy; exit logic no longer reads it). **Added `basis_dislocation_exit_bps`** (default 50.0 bps) as a mandatory exit trigger: `(b_l − b_e) > threshold` → close. Rationale: the gate's worst-case cost is `m × \|b_e\|`; when the live basis has actually moved that far adverse, the position's economics no longer match what the gate approved. Pure-economic exits only — no time proxy. New L37: "Exit on economics, not on time." |
 | 2026-05-13 | (merged-parallel) | §10 | Dust-convert ineligible fallback. `KuCoinGateway.convert_dust_to_native` now returns the actual API rejection error when a callable endpoint raises (rather than the misleading "not available" fallback). Dust-sweep in `recover_phantom_spot` marks positions `closed` with `last_close_error='dust_convert_ineligible: …'` when the endpoint exists but rejects the asset (e.g. DOGE). Resolves the DOGE $0.19 naked_spot stuck since 2026-05-11T19h. |
 | 2026-05-12 | doc | §0.10, §3.1 SOP + math, §7.3/4/5, §18 (new) | Implementer-gap audit (v1.1 → v1.2). Added §0.10 stack assumptions (Python / FastAPI / ccxt / SQLAlchemy / UTC-aware datetimes). Math: defined "worst-walked price"; mandated tick-rounding + lot-step flooring with explicit conservative-rounding direction per side. SOP: detailed hedge-integrity detection rule, maintenance-mode mechanics (limit-IOC, never market), paper-mode probe-vs-order delineation. §7.3 cursor placement; new §7.4 timestamp discipline; new §7.5 `external_id` construction table. New §18 enumerates Tier B (strategy-correctness) and Tier C (polish) gaps that the spec is still silent on. |
@@ -1507,6 +1611,15 @@ The hard lessons distilled from the first implementation. **Read this section be
 
 - **L37 — Exit on economics, not on time.** A max-hold timer is a proxy for "the operator doesn't trust the economic gates to fire on time." The right fix is to make the economic gates trustworthy, not to add a fallback time cap. The bot now exits voluntarily when forward net APY drops below the exit threshold (deferrable on adverse basis) and mandatorily when the live basis dislocates beyond `(b_l − b_e) > basis_dislocation_exit_bps` — directly economic, no time proxy needed. A position whose funding stays high and basis stays sane can run for weeks; one whose economics break exits within a cycle. Removed `max_hold_hours` in v1.3.
 
+### Execution
+
+- **L38 — Iterative walks are solvers, not strategies.** A 4-pass walk loop with `target_qty` shrinking each pass is a fixed-point iteration on a problem that has a closed-form solution. For a monotone constraint set (cumulative depth vs reservation-per-level), the optimum is a single binding level per book, computable in one pass. Iterative solvers exist when you don't yet understand the problem; once you do, replace them with the closed form. Replaced the walk in v1.4 — same answer, no race between passes, materially faster cycle.
+- **L39 — Limit-IOC's price guarantee is illusory at our sizing range.** The pre-v1.4 spec used limit-IOC for the price guarantee. But on the books we trade (thin enough that we walk multiple levels), the tick-buffer we have to add to make limit-IOC actually fill (1–2 bps) is ≈ market-order slippage at the same depth. The "guarantee" is a paper one: you pay it as buffer instead of as slippage, but the actual fill quality is the same. Meanwhile, limit-IOC's round-trip (walk → construct limit → submit) gives other actors a latency window market+FOK closes. Net: market+FOK is strictly better for our sizing range.
+- **L40 — Sequential legs are a front-runner gift.** Spot-then-perp ordering creates a ~50-200ms gap between leg-1 print and leg-2 submission. That gap is visible to anyone watching the order flow. Any actor who knows the strategy can move the perp's price against you between when spot prints and when perp lands. Parallel placement (concurrent async + atomic brackets where available) shrinks this gap to the venue's own internal coordination time — measured in microseconds, not the network round-trip. Adopted in v1.4.
+- **L41 — Sub-target sizing is cheap insurance.** Sizing at 99% of the closed-form max chases the last 1% of position at the cost of a non-trivial reject rate from reservation buffers, racing actors, and book moves. Sizing at 75% buys near-zero reject rate for a 25% position-size haircut. Across a long-run portfolio compounded daily, the "missed 25%" on each trade is well dominated by the "every-trade clean-fill" property. Adopted as policy in v1.4 with `sub_target_sizing_factor = 0.75`.
+- **L42 — Co-temporal book snapshots are non-negotiable.** Closed-form sizing math is only correct if both books were snapshotted at the same instant. A 100ms stale snapshot on the spot side while the perp side is fresh produces a forecast that diverges from reality on submission. Use websocket frames where available; bound REST snapshots to <50ms between calls and reject the candidate if the window blows out. Adopted in v1.4.
+- **L43 — Client-order-id is the cheapest insurance against network blips.** A deterministic order id (e.g. `hash(cycle_id, candidate_symbol, leg)`) means a retry of the same call is a no-op at the venue — duplicate-order rejects rather than placing two orders by accident. The bookkeeping is one extra field; the alternative is "the network blipped, did my order go through or not?" forever. Adopted as policy in v1.4.
+
 ---
 
 ## 17. Rewrite plan (core + UI from scratch)
@@ -1582,7 +1695,7 @@ The rewrite proceeds in ordered stages. Each stage has explicit **entry criteria
 **Entry criteria:** Stage 1 done.
 
 **Work, per venue:**
-1. Implement the venue gateway protocol: read funding rates, simulate fill, place limit-IOC (spot + perp), transfer (spot↔futures), consolidate wallets, dust-convert, account-mode probe.
+1. Implement the venue gateway protocol: read funding rates, snapshot book (spot + perp), place market+FOK on each leg (idempotent client-order-id, parallel-fire), transfer (spot↔futures), consolidate wallets, dust-convert, account-mode probe.
 2. Bake in the per-venue quirks documented in §6 + §16 L11:
    - **Binance**: PM-only routing, per-currency futures balance, dust → BNB endpoint, `crossMarginFree + umWalletBalance + cmWalletBalance` aggregation, NEVER use OR-chain on string fields (L15).
    - **KuCoin**: Classic wallet model (main/trade/margin/isolated/contract/pool), futures-side transfer for OUT direction (L11), two-hop drain (§6.2), per-currency futures balance fetch, book-depth limit must be 20 or 100, dust → KCS endpoint.
@@ -1701,9 +1814,9 @@ Catalogued from the "if a from-scratch coding agent built this with only the spe
 | **Funding accrual formula not written** | §0.5 "Funding income" defines the concept; §7.1.1 `funding_income_accrued` + `last_funding_accrual_ts` columns exist. Update rule per cycle is not specified. | Paper: `Δaccrued = position_notional × current_funding_rate × min(1, elapsed_since_last_accrual / funding_interval)`. Live: derive from per-cycle delta of the futures wallet's funding-history endpoint, attributed by symbol. Document both. |
 | **Cross-stable arb sizing formula** | §6.4 says "independent buckets" but never writes the formula. | `sized_qty = min(spot_quote_wallet × safety_factor / spot_limit, perp_quote_wallet × safety_factor × leverage / perp_limit)` then floor to lot step. Same formula as same-stable but reads each wallet independently. |
 | **Auto-swap 5 bps basis cost** | §3.1 math `fees_RT_bps` formula uses "+5 bps USDC/USDT spot basis" as a magic constant. | Promote to a per-strategy config field with default 5.0; or document that it's a hardcoded safety margin and why 5 specifically. |
-| **Per-symbol fee caching policy** | §3.1 says "live per-symbol taker fees from the venue's fee API"; cache TTL unspecified. | Recommended: fetch once per cycle into a `{symbol: (spot_fee_bps, perp_fee_bps)}` dict; invalidate at the top of the next cycle. Rate-limit budget assumes this. |
-| **Two-hop drain: step-1-succeeded, step-2-failed** | §6.2 specifies the two-hop but not the half-failed state. | Funds land in `main`; next cycle's wallet-consolidation sweep (Phase C entry-prep) picks them up. Document this explicitly so an implementer doesn't add a separate retry. |
-| **Wallet-consolidation atomicity** | §6.2 says "sweep all sibling spot wallets into trade" but error semantics undefined. | Best-effort per source bucket; on per-source failure log WARN and continue with the others (a partial sweep still improves the "spendable in trade" total). Do not abort the cycle. |
+| ~~**Per-symbol fee caching policy**~~ | RESOLVED v1.4 in §3.1 mitigation policy: per-cycle TTL with force-refresh on tick/lot/min-notional rejects. | — |
+| ~~**Two-hop drain: step-1-succeeded, step-2-failed**~~ | RESOLVED v1.4 in §3.1 mitigation policy: best-effort, partial sweep is still useful; next cycle picks up stranded funds. | — |
+| ~~**Wallet-consolidation atomicity**~~ | RESOLVED v1.4 in §3.1 mitigation policy: best-effort per source bucket; per-bucket failure logs WARN, continues. | — |
 | **Mode-state vs strategy-state precedence** | §4 + §7.1 define both `mode_state.entry_enabled` and `strategy_state.entry_enabled` but never the AND. | AND of both. Rejection category when mode-disabled: `mode_disabled:<mode>`. When strategy-disabled: `strategy_disabled:<trade_type>`. Document the precedence. |
 | **Partial-window funding on fresh opens** | §0.4 + §3.1 — position opens mid-window; first funding payment lands at next scheduled time. | The funding accrual formula above (with `min(1, elapsed/interval)`) handles this correctly; document the property explicitly. |
 
@@ -1712,7 +1825,7 @@ Catalogued from the "if a from-scratch coding agent built this with only the spe
 | Gap | Where in spec |
 |---|---|
 | Vocabulary drift: "asset" vs "currency", "60min" vs "3600s", "spot symbol" vs "spot pair" | scattered |
-| Tick-buffer rationale (why default 1 bp entry / 2 bps exit) | §4 active fields |
+| ~~Tick-buffer rationale~~ | RESOLVED v1.4: fields deprecated; market+FOK has no limit price to buffer. |
 | `rejected_candidates` retention policy ("prune old rows") — keep how long? | §3.1 SOP post-cycle |
 | `/config` strategy tab source — `StrategyConfigPerStrategy` rows, or a static `ACTIVE_STRATEGIES` constant? | §5.3 |
 | Dashboard view-cookie name + max-age | §5 |
