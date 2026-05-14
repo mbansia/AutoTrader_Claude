@@ -135,9 +135,7 @@ def build_snapshot(session: Session, hours_raw: int = 24) -> dict[str, Any]:
 
     total_rejections, grouped = repo.rejections_grouped(session, hours=hours)
 
-    # Approximate wallets fixture: real gateways provide this; the diag
-    # endpoint pulls the latest balance_snapshots when available.
-    wallets: dict[str, Any] = {}
+    wallets = _collect_wallets()
 
     snapshot: dict[str, Any] = {
         "generated_at_utc": _iso_z(now_utc),
@@ -193,3 +191,29 @@ def _approx_cycles_in_window(hours: int, loop_seconds: int) -> int:
     if loop_seconds <= 0:
         return 0
     return int((hours * 3600) / loop_seconds)
+
+
+def _collect_wallets() -> dict[str, Any]:
+    """Aggregate balances from every registered gateway across (mode, venue).
+    Shape: {venue_id: {asset: {wallet_type: {free, total}}}} per §8.1.
+
+    Per-asset enumeration: we ask each gateway for the canonical quote
+    currencies (USDT, USDC) since base-asset balances are derived from
+    open positions (handled in `positions`). Per-venue probe failures are
+    surfaced inline as `{"error": "..."}` rather than dropping the asset.
+    """
+    from core.config import list_gateways
+
+    out: dict[str, Any] = {}
+    for _mode, exchange_id, gw in list_gateways():
+        bucket = out.setdefault(exchange_id, {})
+        for asset in ("USDT", "USDC"):
+            try:
+                bal = gw.fetch_balance(asset)
+                bucket[asset] = {
+                    "spot": {"free": bal["spot"].free, "total": bal["spot"].total},
+                    "futures": {"free": bal["futures"].free, "total": bal["futures"].total},
+                }
+            except Exception as exc:  # noqa: BLE001
+                bucket[asset] = {"error": str(exc)[:160]}
+    return out

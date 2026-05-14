@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Safety & Rules{% endblock %}
+{% block content %}
+<h1>Safety & Rules</h1>
+
+<section>
+  <h2>Mode state</h2>
+  {% for ms in mode_states %}
+  <form method="post" action="/safety/mode" class="inline">
+    <input type="hidden" name="mode" value="{{ ms.mode }}">
+    <strong>{{ ms.mode|upper }}</strong>
+    <label>Entry <input type="checkbox" name="entry_enabled" value="1" {{ 'checked' if ms.entry_enabled }}></label>
+    <label>Exit <input type="checkbox" name="exit_enabled" value="1" {{ 'checked' if ms.exit_enabled }}></label>
+    <label>Maintenance <input type="checkbox" name="maintenance_mode" value="1" {{ 'checked' if ms.maintenance_mode }}></label>
+    <button type="submit">Save</button>
+  </form>
+  {% endfor %}
+</section>
+
+<section>
+  <h2>Active guardrails (read-only mirror of /config)</h2>
+  <table>
+    <tr><th>Field</th><th>Value</th></tr>
+    {% for k, v in guardrails.items() %}
+    <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+    {% endfor %}
+  </table>
+</section>
+
+<section>
+  <h2>Outbound IP (for venue whitelisting)</h2>
+  <p>{{ outbound_ip }}</p>
+</section>
+{% endblock %}

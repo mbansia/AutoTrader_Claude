@@ -14,5 +14,15 @@ dependencies = [
   "jinja2>=3.1.4"
 ]
 
+[project.scripts]
+# v1.4 entrypoint. Operators flip Coolify's start command to:
+#   uvicorn web.app:app --host 0.0.0.0 --port 8000
+# Legacy v1.3 entry (`uvicorn app.main:app`) remains available as a
+# fallback during the §17 Stage 6 cutover window.
+autotrader = "web.app:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.uv]
-dev-dependencies = ["pytest>=8.3.3", "ruff>=0.8.0"]
+dev-dependencies = ["pytest>=8.3.3", "ruff>=0.8.0", "httpx>=0.27"]

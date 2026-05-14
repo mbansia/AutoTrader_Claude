@@ -190,6 +190,28 @@ def test_snapshot_empty_db_no_crash(session):
     assert "no_recent_events" in rules
 
 
+def test_diagnostics_wallets_populated_from_registry(session):
+    """v1.4: registered gateways contribute to the wallets payload."""
+    _seed_mode(session)
+    from core.config import clear_registry, register_gateway
+    from core.types import WalletBalance
+    from gateways.paper import InMemoryGateway
+    clear_registry()
+    gw = InMemoryGateway(exchange_id="binance")
+    gw.balances["spot"]["USDT"] = WalletBalance(123.45, 200.0)
+    gw.balances["futures"]["USDT"] = WalletBalance(67.0, 67.0)
+    register_gateway("paper", "binance", gw)
+    try:
+        from state.repository import log_event
+        log_event(session, mode="paper", exchange="binance", level="INFO", message="t")
+        snap = build_snapshot(session, hours_raw=24)
+        assert "binance" in snap["wallets"]
+        assert snap["wallets"]["binance"]["USDT"]["spot"]["free"] == 123.45
+        assert snap["wallets"]["binance"]["USDT"]["futures"]["total"] == 67.0
+    finally:
+        clear_registry()
+
+
 def test_cycle_error_rate_below_threshold_no_anomaly():
     snap = {
         "cycle_health": {"seconds_since_last_event": 30},

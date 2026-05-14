@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}Logs & Scans{% endblock %}
+{% block content %}
+<h1>Logs & Scans ({{ view_mode }})</h1>
+<h2>Events</h2>
+{% if events %}
+<table class="events">
+  <thead><tr><th>TS</th><th>Mode</th><th>Venue</th><th>Level</th><th>Message</th></tr></thead>
+  <tbody>
+    {% for e in events %}
+    <tr class="{{ e.level }}"><td>{{ e.ts }}</td><td>{{ e.mode }}</td><td>{{ e.exchange }}</td><td>{{ e.level }}</td><td>{{ e.message }}</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}<p>No events.</p>{% endif %}
+
+<h2>Rejected candidates</h2>
+{% if rejections %}
+<table class="rejections">
+  <thead><tr><th>TS</th><th>Venue</th><th>Symbol</th><th>Funding APR</th><th>Reason</th></tr></thead>
+  <tbody>
+    {% for r in rejections %}
+    <tr><td>{{ r.ts }}</td><td>{{ r.exchange }}</td><td>{{ r.symbol }}</td><td>{{ "%.4f%%"|format(r.funding_rate * 100) }}</td><td>{{ r.reason }}</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}<p>No rejections in window.</p>{% endif %}
+{% endblock %}
