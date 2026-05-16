@@ -18,6 +18,26 @@
 </section>
 
 <section>
+  <h2>Venues</h2>
+  <p class="muted">Toggle which venues the bot trades. Credentials must also be set in env vars; a venue without creds will skip even if active here.</p>
+  {% for v in venues %}
+  <form method="post" action="/safety/venue" class="inline venue-row">
+    <input type="hidden" name="exchange_id" value="{{ v.exchange_id }}">
+    <strong>{{ v.exchange_id }}</strong>
+    <label>Active <input type="checkbox" name="active" value="1" {{ 'checked' if v.active }}></label>
+    <label>Expected account id
+      <input type="text" name="expected_account_id" value="{{ v.expected_account_id }}" size="44" placeholder="(unset — soft probe only)">
+    </label>
+    {% if v.actual_account_id %}
+      <span class="muted">live reports: <code>{{ v.actual_account_id }}</code></span>
+    {% endif %}
+    <input type="text" name="notes" value="{{ v.notes }}" size="20" placeholder="notes">
+    <button type="submit">Save</button>
+  </form>
+  {% endfor %}
+</section>
+
+<section>
   <h2>Active guardrails (read-only mirror of /config)</h2>
   <table>
     <tr><th>Field</th><th>Value</th></tr>

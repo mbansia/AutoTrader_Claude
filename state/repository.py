@@ -70,6 +70,21 @@ def get_or_create_strategy_state(
     return row
 
 
+def list_venue_states(session: Session) -> list[m.VenueState]:
+    return list(session.scalars(select(m.VenueState).order_by(m.VenueState.exchange_id)))
+
+
+def get_venue_state(session: Session, exchange_id: str) -> m.VenueState | None:
+    return session.get(m.VenueState, exchange_id)
+
+
+def active_exchange_ids(session: Session) -> list[str]:
+    return [
+        v.exchange_id
+        for v in session.scalars(select(m.VenueState).where(m.VenueState.active.is_(True)))
+    ]
+
+
 # ─── positions ─────────────────────────────────────────────────────────────
 
 OPEN_STATUSES_SQL = ("open", "naked_spot", "naked_perp")

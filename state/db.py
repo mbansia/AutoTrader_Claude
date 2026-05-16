@@ -115,7 +115,37 @@ def run_migrations(engine: Engine | None = None) -> None:
 
 
 def init_db(engine: Engine | None = None) -> None:
-    """Create tables + apply migrations + seed singletons. Idempotent."""
+    """Create tables + apply migrations + seed venue defaults. Idempotent."""
     eng = engine or get_engine()
     Base.metadata.create_all(eng)
     run_migrations(eng)
+    _seed_venue_defaults(eng)
+
+
+def _seed_venue_defaults(engine: Engine) -> None:
+    """Seed `venue_state` with default rows on first boot. Binance + KuCoin
+    default to active=true (the v1.3 baseline); Hyperliquid defaults to
+    active=false (opt-in via the dashboard, per §6.4). Subsequent runs
+    don't touch existing rows.
+    """
+    from .models import VenueState
+
+    defaults = (
+        ("binance", True),
+        ("kucoin", True),
+        ("hyperliquid", False),
+    )
+    with engine.begin() as conn:
+        from sqlalchemy import select
+        existing = {row[0] for row in conn.execute(select(VenueState.exchange_id)).all()}
+        for exchange_id, active in defaults:
+            if exchange_id in existing:
+                continue
+            conn.execute(
+                VenueState.__table__.insert().values(
+                    exchange_id=exchange_id,
+                    active=active,
+                    expected_account_id="",
+                    notes="",
+                )
+            )
