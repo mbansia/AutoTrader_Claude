@@ -1,12 +1,14 @@
 """Venue-adapter layer. Each module implements the `Gateway` protocol.
 
-`InMemoryGateway` powers paper mode + tests. `BinanceGateway` and
-`KuCoinGateway` are ccxt-backed live adapters per §6.1/§6.2 wallet models
-and §16 L11 quirks. Live cutover validation is §17 Stage 5.
+`InMemoryGateway` powers paper mode + tests. `BinanceGateway`,
+`KuCoinGateway`, and `HyperliquidGateway` are ccxt-backed live adapters
+per §6.1/§6.2/§6.4 wallet models and §16 L11 quirks. Live cutover
+validation is §17 Stage 5.
 """
 
 from .base import Gateway
 from .binance import BinanceGateway
+from .hyperliquid import HyperliquidGateway
 from .kucoin import KuCoinGateway
 from .paper import InMemoryGateway
 
@@ -28,5 +30,11 @@ def build_live_gateway(exchange_id: str, *, env):
             api_secret=env.kucoin_api_secret,
             passphrase=env.kucoin_passphrase,
             expected_account_id=env.kucoin_expected_account_id,
+        )
+    if exchange_id == "hyperliquid":
+        return HyperliquidGateway(
+            wallet_address=env.hyperliquid_wallet_address,
+            private_key=env.hyperliquid_private_key,
+            expected_account_id=env.hyperliquid_expected_account_id,
         )
     raise ValueError(f"unknown exchange: {exchange_id}")
