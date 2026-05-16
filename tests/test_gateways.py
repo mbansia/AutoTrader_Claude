@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from gateways import BinanceGateway, InMemoryGateway, KuCoinGateway
+from gateways import BinanceGateway, HyperliquidGateway, InMemoryGateway, KuCoinGateway
 from gateways._ccxt_helpers import ErrorDedup, book_from_ccxt, order_to_fill_result
 from gateways.base import Gateway
 from gateways.binance import _is_real_spot_asset, _parse_float
@@ -48,11 +48,19 @@ PROTOCOL_METHODS = (
     "factory",
     [
         lambda: InMemoryGateway(),
+        lambda: InMemoryGateway(exchange_id="hyperliquid"),
         # The live gateways construct ccxt clients in __init__ — that's safe
         # (no network) but probes that need creds will fail. We just check
         # the method surface.
         lambda: BinanceGateway(api_key="x", api_secret="y"),
         lambda: KuCoinGateway(api_key="x", api_secret="y", passphrase="z"),
+        # Hyperliquid wants a privateKey shaped like a 32-byte hex string
+        # for ccxt's wallet init; the dummy below satisfies the constructor
+        # without making any network call.
+        lambda: HyperliquidGateway(
+            wallet_address="0x0000000000000000000000000000000000000001",
+            private_key="0x" + "11" * 32,
+        ),
     ],
 )
 def test_protocol_surface(factory):
@@ -60,7 +68,41 @@ def test_protocol_surface(factory):
     for method in PROTOCOL_METHODS:
         assert hasattr(gw, method), f"missing {method}"
     # exchange_id should be a recognised value
-    assert gw.exchange_id in {"binance", "kucoin"}
+    assert gw.exchange_id in {"binance", "kucoin", "hyperliquid"}
+
+
+def test_hyperliquid_no_native_transfers():
+    """§6.4: unified pool — transfers + consolidate are explicit no-ops."""
+    gw = HyperliquidGateway(
+        wallet_address="0x" + "00" * 20,
+        private_key="0x" + "11" * 32,
+    )
+    assert gw.consolidate_spot_wallets("USDC") == {}
+    assert gw.transfer_spot_to_futures("USDC", 100.0) is None
+    assert gw.transfer_futures_to_spot("USDC", 100.0) is None
+
+
+def test_hyperliquid_no_native_dust_conversion():
+    """§6.4 + L11: HL has no dust endpoint; the call is a no-op."""
+    gw = HyperliquidGateway(
+        wallet_address="0x" + "00" * 20,
+        private_key="0x" + "11" * 32,
+    )
+    out = gw.convert_dust_to_native(["DOGE", "SHIB"])
+    assert out == {"DOGE": 0.0, "SHIB": 0.0}
+
+
+def test_hyperliquid_account_id_defaults_to_wallet_address():
+    """Operator can omit HYPERLIQUID_EXPECTED_ACCOUNT_ID; the wallet
+    address itself is the expected id (the address IS the account)."""
+    gw = HyperliquidGateway(
+        wallet_address="0xabc",
+        private_key="0x" + "11" * 32,
+        expected_account_id="",
+    )
+    assert gw.expected_account_id() == "0xabc"
+    assert gw.actual_account_id() == "0xabc"
+    assert gw.account_mode_probe() == "unified"
 
 
 def test_book_from_ccxt_converts_levels():

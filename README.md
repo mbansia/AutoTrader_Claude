@@ -30,11 +30,14 @@ BINANCE_API_SECRET=...
 KUCOIN_API_KEY=...
 KUCOIN_API_SECRET=...
 KUCOIN_PASSPHRASE=...
+HYPERLIQUID_WALLET_ADDRESS=0x...     # v1.5 — EVM auth (no API key)
+HYPERLIQUID_PRIVATE_KEY=0x...        # v1.5 — guard like any secret
 DASHBOARD_USER=admin
 DASHBOARD_PASSWORD=your_password
 DIAGNOSTICS_TOKEN=your_token
 BINANCE_EXPECTED_ACCOUNT_ID=...      # v1.4 — boot-time assertion
 KUCOIN_EXPECTED_ACCOUNT_ID=...       # v1.4 — boot-time assertion
+HYPERLIQUID_EXPECTED_ACCOUNT_ID=...  # v1.5 — defaults to wallet address
 DATABASE_URL=sqlite:////app/data/bot.db   # Coolify persistent volume
 ```
 

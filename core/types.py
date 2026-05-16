@@ -14,7 +14,7 @@ from typing import Literal
 
 
 Mode = Literal["paper", "live"]
-ExchangeId = Literal["binance", "kucoin", "system"]
+ExchangeId = Literal["binance", "kucoin", "hyperliquid", "system"]
 VenueLeg = Literal["spot", "futures"]
 Side = Literal["buy", "sell"]
 

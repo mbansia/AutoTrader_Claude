@@ -24,7 +24,7 @@ from typing import Literal
 from gateways.base import Gateway
 
 Mode = Literal["paper", "live"]
-ExchangeId = Literal["binance", "kucoin"]
+ExchangeId = Literal["binance", "kucoin", "hyperliquid"]
 
 
 @dataclass(frozen=True)
@@ -34,8 +34,11 @@ class EnvConfig:
     kucoin_api_key: str = ""
     kucoin_api_secret: str = ""
     kucoin_passphrase: str = ""
+    hyperliquid_wallet_address: str = ""
+    hyperliquid_private_key: str = ""
     binance_expected_account_id: str = ""
     kucoin_expected_account_id: str = ""
+    hyperliquid_expected_account_id: str = ""
     dashboard_user: str = "admin"
     dashboard_password: str = ""
     diagnostics_token: str = ""
@@ -49,8 +52,11 @@ def load_env() -> EnvConfig:
         kucoin_api_key=os.environ.get("KUCOIN_API_KEY", ""),
         kucoin_api_secret=os.environ.get("KUCOIN_API_SECRET", ""),
         kucoin_passphrase=os.environ.get("KUCOIN_PASSPHRASE", ""),
+        hyperliquid_wallet_address=os.environ.get("HYPERLIQUID_WALLET_ADDRESS", ""),
+        hyperliquid_private_key=os.environ.get("HYPERLIQUID_PRIVATE_KEY", ""),
         binance_expected_account_id=os.environ.get("BINANCE_EXPECTED_ACCOUNT_ID", ""),
         kucoin_expected_account_id=os.environ.get("KUCOIN_EXPECTED_ACCOUNT_ID", ""),
+        hyperliquid_expected_account_id=os.environ.get("HYPERLIQUID_EXPECTED_ACCOUNT_ID", ""),
         dashboard_user=os.environ.get("DASHBOARD_USER", "admin"),
         dashboard_password=os.environ.get("DASHBOARD_PASSWORD", ""),
         diagnostics_token=os.environ.get("DIAGNOSTICS_TOKEN", ""),
