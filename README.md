@@ -70,16 +70,73 @@ HTML route auth contract, config form round-trip, gateway protocol
 surface, ccxt helper utilities. Live venue integration tests (`BinanceGateway`,
 `KuCoinGateway` against real APIs) are §17 Stage 5 work.
 
-## Parity harness
+## Parity harness — pre-cutover sanity check
+
+Two modes. **In-process** is the simplest path when only v1.3 is deployed:
+
+```bash
+# 1. Grab a snapshot of the production SQLite DB from Coolify
+#    (Coolify shell → cat /app/data/bot.db | base64, or scp the volume).
+scp coolify-host:/var/lib/docker/volumes/<volume>/_data/bot.db ./prod_bot.db
+
+# 2. Run the harness. The script boots v1.5 in-process against a
+#    read-only copy of the snapshot — no trading, no DB mutation.
+python scripts/diagnostics_parity.py \
+    --legacy "https://your-bot.coolify.app/api/diagnostics?token=$DIAGNOSTICS_TOKEN" \
+    --in-process \
+    --db-snapshot ./prod_bot.db \
+    --token "$DIAGNOSTICS_TOKEN"
+
+# Exit 0 = parity OK. Exit 1 = drift + structural diff printed. Exit 2 = fetch error.
+# Add --output diff.json to capture the full diff for triage.
+```
+
+When both v1.3 and v1.5 are deployed (side-by-side validation window):
 
 ```bash
 python scripts/diagnostics_parity.py \
-    --legacy "http://localhost:8000/api/diagnostics?token=$TOK" \
-    --new    "http://localhost:8001/api/diagnostics?token=$TOK"
+    --legacy "https://prod-v1.3.app/api/diagnostics?token=$TOK" \
+    --new    "https://staging-v1.5.app/api/diagnostics?token=$TOK"
 ```
 
-Exit 0 = parity OK (modulo timestamps). Exit 1 = drift + structural diff.
-Required clean-pass for §17 Stage 5/6 cutover.
+**Caveat:** the harness compares the diagnostics SHAPE, not behavioral
+decisions. A clean-pass means the v1.5 endpoint returns identically-
+structured data to v1.3's; it does NOT confirm both bots would make the
+same trade decisions on the same inputs. For that you need 48h of
+side-by-side paper-mode running (§17 Stage 5).
+
+## Activating Hyperliquid
+
+HL is opt-in (default off). To turn it on:
+
+1. **Set env vars in Coolify:**
+   ```
+   HYPERLIQUID_WALLET_ADDRESS=0x...      # master wallet address (holds USDC)
+   HYPERLIQUID_PRIVATE_KEY=0x...         # API/agent wallet private key — NOT the master key
+   HYPERLIQUID_EXPECTED_ACCOUNT_ID=0x... # = wallet address; boot-time assertion
+   ACTIVE_EXCHANGES=binance,kucoin,hyperliquid
+   ```
+
+   **`HYPERLIQUID_PRIVATE_KEY` must be the agent wallet's key, NOT the
+   master wallet's.** Hyperliquid's UI lets you authorise an "API wallet"
+   (agent) that can place orders but NOT withdraw funds. If the env var
+   leaks, an attacker with the agent key cannot drain the pool.
+
+2. **Read `docs/SYSTEM.md` §6.4 first.** Hyperliquid pays funding HOURLY
+   (vs 4h or 8h on the CEXes). The same per-window funding rate
+   compounds to ~8× the APY on HL. **You should usually set a higher
+   `entry_min_net_apy` for the `hyperliquid_same_venue_funding_arb`
+   strategy** so the bot doesn't enter on rates that decay too fast to
+   recoup round-trip fees. The `/config?strategy=hyperliquid_same_venue_funding_arb`
+   tab in the UI lets you tune this independently of the CEX strategies.
+
+3. **Deploy.** On startup, the runner asserts that the venue reports the
+   expected account id (the wallet address) and refuses to start the
+   live worker on mismatch — catches env-var typos before any orders fire.
+
+The legacy v1.3 bot in `app/` does NOT know about Hyperliquid. You can
+only activate HL **after** the start-command cutover from
+`uvicorn app.main:app` to `uvicorn web.app:app`.
 
 ## Cutover runbook (§17 Stage 6)
 

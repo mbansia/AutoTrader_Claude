@@ -77,6 +77,35 @@ class WorkerHandle:
 _workers: list[WorkerHandle] = []
 
 
+class AccountIdMismatch(Exception):
+    """Boot-time guard per §3.1 mitigation policy: refuse to start if the
+    venue's actual account id doesn't match the operator's expected env
+    var. Eliminates the sub-account / wrong-wallet misconfig class.
+    """
+
+
+def _assert_account_id(gw: Gateway) -> None:
+    expected = gw.expected_account_id().strip().lower()
+    if not expected:
+        # No expected id configured → cannot assert; skip (operator opted out).
+        return
+    try:
+        actual = gw.actual_account_id().strip().lower()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("account-id probe failed for %s: %r", gw.exchange_id, exc)
+        return
+    if not actual:
+        log.warning("account-id probe returned empty for %s", gw.exchange_id)
+        return
+    if actual != expected:
+        raise AccountIdMismatch(
+            f"{gw.exchange_id}: expected account {expected!r} but venue "
+            f"reports {actual!r} — refusing to start. Check the *_EXPECTED_"
+            f"ACCOUNT_ID env var (and on Hyperliquid: the wallet address "
+            f"itself is the account)."
+        )
+
+
 def _build_gateway(exchange_id: ExchangeId, *, env: EnvConfig, mode: Mode) -> Gateway:
     """Live gateway in live mode; in-memory gateway in paper mode (per-venue).
     Paper-mode gateway mirrors the live venue's exchange_id so diagnostics +
@@ -211,6 +240,11 @@ def start_runner() -> list[WorkerHandle]:
                     continue
             try:
                 gw = _build_gateway(exchange_id, env=env, mode=mode)
+                # Live mode: assert wallet/account id matches operator expectation
+                # BEFORE registering or spawning a worker. Paper mode is safe
+                # (synthetic gateway returns its own configured id).
+                if mode == "live":
+                    _assert_account_id(gw)
                 register_gateway(mode, exchange_id, gw)
                 stop_event = threading.Event()
                 t = threading.Thread(
