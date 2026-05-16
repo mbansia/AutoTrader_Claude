@@ -82,6 +82,40 @@ def test_runner_is_idempotent(monkeypatch):
     assert {(h.mode, h.exchange_id) for h in first} == {(h.mode, h.exchange_id) for h in second}
 
 
+def test_account_id_mismatch_aborts_live_worker(monkeypatch):
+    """Boot-time guard: if HYPERLIQUID_EXPECTED_ACCOUNT_ID doesn't match
+    the wallet address the gateway reports, the live worker must NOT spawn.
+    Operator typo in the env var should fail loud, not start silently.
+    """
+    monkeypatch.setenv("BOT_WORKER_ENABLED", "1")
+    monkeypatch.setenv("ACTIVE_EXCHANGES", "hyperliquid")
+    monkeypatch.setenv("HYPERLIQUID_WALLET_ADDRESS", "0xAAA")
+    monkeypatch.setenv("HYPERLIQUID_PRIVATE_KEY", "0x" + "11" * 32)
+    monkeypatch.setenv("HYPERLIQUID_EXPECTED_ACCOUNT_ID", "0xBBB")  # mismatch
+    import loop.runner as r
+    handles = r.start_runner()
+    # Live worker must NOT have been spawned for hyperliquid.
+    live_hl = [h for h in handles if h.mode == "live" and h.exchange_id == "hyperliquid"]
+    assert live_hl == [], "live HL worker spawned despite account-id mismatch"
+
+
+def test_account_id_match_starts_live_worker(monkeypatch):
+    """When expected == actual, the live worker spawns normally.
+    Hyperliquid: the wallet address IS the account id (gateway returns
+    `self._wallet_address` from actual_account_id), so expected = wallet
+    address = match."""
+    monkeypatch.setenv("BOT_WORKER_ENABLED", "1")
+    monkeypatch.setenv("ACTIVE_EXCHANGES", "hyperliquid")
+    addr = "0x" + "0a" * 20
+    monkeypatch.setenv("HYPERLIQUID_WALLET_ADDRESS", addr)
+    monkeypatch.setenv("HYPERLIQUID_PRIVATE_KEY", "0x" + "11" * 32)
+    monkeypatch.setenv("HYPERLIQUID_EXPECTED_ACCOUNT_ID", addr)
+    import loop.runner as r
+    handles = r.start_runner()
+    live_hl = [h for h in handles if h.mode == "live" and h.exchange_id == "hyperliquid"]
+    assert len(live_hl) == 1
+
+
 def test_runner_registers_gateways_for_diagnostics(monkeypatch):
     """After start, the registry should contain the spawned gateways so
     the /api/diagnostics wallets payload picks them up."""
