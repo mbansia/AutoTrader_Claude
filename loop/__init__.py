@@ -3,3 +3,4 @@
 from .cycle import CycleResult, run_cycle
 from .executor import EntryOutcome, EntryResult, parallel_market_fok_entry
 from .idempotency import client_order_id, make_cycle_id
+from .runner import WorkerHandle, start_runner, stop_runner
