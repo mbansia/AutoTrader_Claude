@@ -100,6 +100,22 @@ class StrategyState(Base):
     exit_all_pending: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
+class VenueState(Base):
+    """Per-venue activation + the wallet-id assertion lock. Replaces the
+    `ACTIVE_EXCHANGES` env var (v1.6). Operator toggles via `/safety`.
+    Defaults: binance + kucoin active=true; hyperliquid active=false (opt-in).
+    """
+
+    __tablename__ = "venue_state"
+    exchange_id: Mapped[str] = mapped_column(String(16), primary_key=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    expected_account_id: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
 class Position(Base):
     __tablename__ = "positions"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

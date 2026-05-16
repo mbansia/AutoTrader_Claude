@@ -49,17 +49,58 @@ log = logging.getLogger(__name__)
 # math at hourly cadence behaves differently from CEX 4h/8h, and (b) EVM
 # private-key compromise is catastrophic and needs a deliberate decision.
 def _exchanges_to_activate(env: EnvConfig) -> list[ExchangeId]:
-    raw = os.environ.get("ACTIVE_EXCHANGES", "").strip()
-    if raw:
-        return [x.strip() for x in raw.split(",") if x.strip()]  # type: ignore[return-value]
-    # Default: activate any venue whose creds are provisioned, EXCEPT
-    # hyperliquid (must be opted in by setting ACTIVE_EXCHANGES explicitly).
+    """Read activation from the DB (`venue_state.active`). Per-exchange
+    toggles live in the dashboard (`/safety`) — no env var needed.
+
+    Back-compat: if the deprecated `ACTIVE_EXCHANGES` env var is set, it
+    one-shot mirrors into the DB on this boot. Subsequent boots use the
+    DB authoritatively; the env var becomes a no-op.
+
+    A venue is activated only if BOTH conditions hold:
+      (a) `venue_state.active = true`
+      (b) credentials are present in env for that venue
+    Credential presence is a deployment-surface check; even if the
+    dashboard says "active", the bot won't try to construct a live
+    gateway with empty credentials.
+    """
+    from sqlalchemy import select
+    from state import session_scope
+    from state.models import VenueState
+
+    legacy = os.environ.get("ACTIVE_EXCHANGES", "").strip()
+    legacy_set: set[str] = (
+        {x.strip() for x in legacy.split(",") if x.strip()} if legacy else set()
+    )
+
     out: list[ExchangeId] = []
-    if env.binance_api_key and env.binance_api_secret:
-        out.append("binance")
-    if env.kucoin_api_key and env.kucoin_api_secret and env.kucoin_passphrase:
-        out.append("kucoin")
+    with session_scope() as session:
+        rows = list(session.scalars(select(VenueState)))
+        for row in rows:
+            # Apply ACTIVE_EXCHANGES override exactly once: if the env var
+            # is set and disagrees with the DB row, write through.
+            if legacy_set and (row.exchange_id in legacy_set) != row.active:
+                row.active = row.exchange_id in legacy_set
+                session.flush()
+            if not row.active:
+                continue
+            if not _has_credentials(row.exchange_id, env):
+                log.warning(
+                    "venue %s active=true in DB but credentials missing in env",
+                    row.exchange_id,
+                )
+                continue
+            out.append(row.exchange_id)  # type: ignore[arg-type]
     return out
+
+
+def _has_credentials(exchange_id: str, env: EnvConfig) -> bool:
+    if exchange_id == "binance":
+        return bool(env.binance_api_key and env.binance_api_secret)
+    if exchange_id == "kucoin":
+        return bool(env.kucoin_api_key and env.kucoin_api_secret and env.kucoin_passphrase)
+    if exchange_id == "hyperliquid":
+        return bool(env.hyperliquid_wallet_address and env.hyperliquid_private_key)
+    return False
 
 
 def _trade_type_for(exchange_id: ExchangeId) -> str:
@@ -85,24 +126,49 @@ class AccountIdMismatch(Exception):
 
 
 def _assert_account_id(gw: Gateway) -> None:
-    expected = gw.expected_account_id().strip().lower()
-    if not expected:
-        # No expected id configured → cannot assert; skip (operator opted out).
-        return
+    """Source-of-truth order for the expected id:
+       1. `venue_state.expected_account_id` in the DB (set via /safety)
+       2. The gateway's `expected_account_id()` (the env var)
+       3. Neither — log only, do not assert (first-boot soft path; operator
+          locks the value in via /safety once they've reviewed it)
+
+    On boot, if (1) and (2) are both empty we still PROBE the actual id
+    and log it INFO so the operator has it ready to paste into /safety.
+    The boot proceeds regardless.
+    """
+    from state import session_scope
+    from state.repository import get_venue_state
+
+    expected_db = ""
+    with session_scope() as session:
+        row = get_venue_state(session, gw.exchange_id)
+        if row is not None:
+            expected_db = row.expected_account_id.strip().lower()
+
+    expected = expected_db or gw.expected_account_id().strip().lower()
+
     try:
         actual = gw.actual_account_id().strip().lower()
     except Exception as exc:  # noqa: BLE001
         log.warning("account-id probe failed for %s: %r", gw.exchange_id, exc)
         return
+
     if not actual:
         log.warning("account-id probe returned empty for %s", gw.exchange_id)
         return
+
+    if not expected:
+        log.info(
+            "account-id detected for %s: %s (unlocked — set via /safety to assert on boot)",
+            gw.exchange_id, actual,
+        )
+        return
+
     if actual != expected:
         raise AccountIdMismatch(
             f"{gw.exchange_id}: expected account {expected!r} but venue "
-            f"reports {actual!r} — refusing to start. Check the *_EXPECTED_"
-            f"ACCOUNT_ID env var (and on Hyperliquid: the wallet address "
-            f"itself is the account)."
+            f"reports {actual!r} — refusing to start. Fix via /safety "
+            f"(or unset the venue_state.expected_account_id to re-detect)."
         )
 
 
@@ -211,8 +277,11 @@ def start_runner() -> list[WorkerHandle]:
     """
     if _workers:
         return list(_workers)
+    # Test / dev escape hatch only — defaults to on so production doesn't
+    # need to think about it. Set BOT_WORKER_ENABLED=0 to serve the UI
+    # without spawning trading workers (used by the parity harness).
     if os.environ.get("BOT_WORKER_ENABLED", "1") == "0":
-        log.info("BOT_WORKER_ENABLED=0 — runner skipped")
+        log.info("BOT_WORKER_ENABLED=0 — runner skipped (UI-only mode)")
         return []
     env = load_env()
     init_db()

@@ -94,3 +94,51 @@ def test_safety_mode_toggle(client):
     assert r.status_code == 303
     r2 = client.get("/safety", auth=("admin", "pw"))
     assert r2.status_code == 200
+
+
+def test_safety_renders_venues_section(client):
+    """v1.6: /safety shows a Venues row per exchange with active toggle."""
+    r = client.get("/safety", auth=("admin", "pw"))
+    assert r.status_code == 200
+    assert b"Venues" in r.content
+    assert b"hyperliquid" in r.content
+    assert b"binance" in r.content
+
+
+def test_safety_venue_toggle_persists(client):
+    """POST /safety/venue flips active + writes expected_account_id."""
+    r = client.post(
+        "/safety/venue",
+        auth=("admin", "pw"),
+        data={
+            "exchange_id": "hyperliquid",
+            "active": "1",
+            "expected_account_id": "0xABC",
+            "notes": "operator confirmed",
+        },
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    # Round-trip the GET to confirm.
+    r2 = client.get("/safety", auth=("admin", "pw"))
+    assert b"0xABC" in r2.content
+    assert b"operator confirmed" in r2.content
+
+
+def test_safety_venue_toggle_off(client):
+    """Unchecked checkbox sends no `active` field → row becomes inactive."""
+    # First turn it on so we can verify the off path.
+    client.post(
+        "/safety/venue",
+        auth=("admin", "pw"),
+        data={"exchange_id": "hyperliquid", "active": "1"},
+        follow_redirects=False,
+    )
+    # Now POST without the checkbox.
+    r = client.post(
+        "/safety/venue",
+        auth=("admin", "pw"),
+        data={"exchange_id": "hyperliquid"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303

@@ -22,28 +22,49 @@ cutover (see §17 of `docs/SYSTEM.md`):
 The v1.4 packages share NO code with `app/`. Cutover is a single Coolify
 start-command change; rollback is the reverse.
 
-## Required environment
+## Required environment (only secrets + DB pointer)
 
 ```env
+# Auth — required, must be env (you can't store the dashboard's own
+# password inside the dashboard).
+DASHBOARD_USER=admin
+DASHBOARD_PASSWORD=your_password
+DIAGNOSTICS_TOKEN=your_token
+
+# Venue credentials — required for each venue you want to use.
 BINANCE_API_KEY=...
 BINANCE_API_SECRET=...
 KUCOIN_API_KEY=...
 KUCOIN_API_SECRET=...
 KUCOIN_PASSPHRASE=...
-HYPERLIQUID_WALLET_ADDRESS=0x...     # v1.5 — EVM auth (no API key)
-HYPERLIQUID_PRIVATE_KEY=0x...        # v1.5 — guard like any secret
-DASHBOARD_USER=admin
-DASHBOARD_PASSWORD=your_password
-DIAGNOSTICS_TOKEN=your_token
-BINANCE_EXPECTED_ACCOUNT_ID=...      # v1.4 — boot-time assertion
-KUCOIN_EXPECTED_ACCOUNT_ID=...       # v1.4 — boot-time assertion
-HYPERLIQUID_EXPECTED_ACCOUNT_ID=...  # v1.5 — defaults to wallet address
-DATABASE_URL=sqlite:////app/data/bot.db   # Coolify persistent volume
+HYPERLIQUID_WALLET_ADDRESS=0x...   # master wallet (holds USDC)
+HYPERLIQUID_PRIVATE_KEY=0x...      # AGENT wallet key — never the master key
+
+# DB pointer — required.
+DATABASE_URL=sqlite:////app/data/bot.db
 ```
+
+That's everything you need to set in env. **Per-venue activation +
+account-id assertion now live in the dashboard** at `/safety` — no env
+vars needed. First boot seeds the DB with `binance` and `kucoin` active
+by default; `hyperliquid` inactive (opt-in via the dashboard toggle).
 
 Every UI route except `/health` and `/api/diagnostics` requires HTTP Basic.
 `/api/diagnostics` is `?token=...` matched against `DIAGNOSTICS_TOKEN`;
 returns 503 if the env var is unset (refuses to be silently public).
+
+Optional env overrides (you almost certainly don't need them):
+
+- `BOT_WORKER_ENABLED=0` — UI-only mode. Defaults to on. Used by the
+  parity harness's in-process flow.
+- `ACTIVE_EXCHANGES=binance,kucoin,hyperliquid` — **deprecated** v1.6
+  back-compat shim. If set, mirrors into the DB once on next boot. Use
+  the `/safety` dashboard going forward.
+- `BINANCE_EXPECTED_ACCOUNT_ID` / `KUCOIN_EXPECTED_ACCOUNT_ID` /
+  `HYPERLIQUID_EXPECTED_ACCOUNT_ID` — **deprecated** v1.6. The expected
+  account id lives on `venue_state.expected_account_id` in the DB and is
+  edited via `/safety`. Env values still work but DB takes precedence
+  when both are set.
 
 ## Running
 
@@ -107,35 +128,36 @@ side-by-side paper-mode running (§17 Stage 5).
 
 ## Activating Hyperliquid
 
-HL is opt-in (default off). To turn it on:
+HL is opt-in. Three steps, two of them in the dashboard:
 
-1. **Set env vars in Coolify:**
+1. **Set the two HL secrets in env** (the only HL config that needs to
+   be in env):
+
    ```
-   HYPERLIQUID_WALLET_ADDRESS=0x...      # master wallet address (holds USDC)
-   HYPERLIQUID_PRIVATE_KEY=0x...         # API/agent wallet private key — NOT the master key
-   HYPERLIQUID_EXPECTED_ACCOUNT_ID=0x... # = wallet address; boot-time assertion
-   ACTIVE_EXCHANGES=binance,kucoin,hyperliquid
+   HYPERLIQUID_WALLET_ADDRESS=0x...   # master wallet address (holds USDC)
+   HYPERLIQUID_PRIVATE_KEY=0x...      # AGENT wallet private key — NOT master
    ```
 
-   **`HYPERLIQUID_PRIVATE_KEY` must be the agent wallet's key, NOT the
-   master wallet's.** Hyperliquid's UI lets you authorise an "API wallet"
-   (agent) that can place orders but NOT withdraw funds. If the env var
-   leaks, an attacker with the agent key cannot drain the pool.
+   `HYPERLIQUID_PRIVATE_KEY` **must** be the agent wallet's key from
+   Hyperliquid's API page, never the master wallet's. The agent key can
+   trade but not withdraw — leaking it doesn't drain the pool.
 
-2. **Read `docs/SYSTEM.md` §6.4 first.** Hyperliquid pays funding HOURLY
-   (vs 4h or 8h on the CEXes). The same per-window funding rate
-   compounds to ~8× the APY on HL. **You should usually set a higher
-   `entry_min_net_apy` for the `hyperliquid_same_venue_funding_arb`
-   strategy** so the bot doesn't enter on rates that decay too fast to
-   recoup round-trip fees. The `/config?strategy=hyperliquid_same_venue_funding_arb`
-   tab in the UI lets you tune this independently of the CEX strategies.
+2. **In `/safety` → Venues**, check **Active** on the `hyperliquid` row.
+   Paste your wallet address into **Expected account id** and click Save.
 
-3. **Deploy.** On startup, the runner asserts that the venue reports the
-   expected account id (the wallet address) and refuses to start the
-   live worker on mismatch — catches env-var typos before any orders fire.
+3. **In `/config?strategy=hyperliquid_same_venue_funding_arb`**, set a
+   higher `entry_min_net_apy` than for the CEX strategies. HL pays
+   funding HOURLY — the same per-window rate compounds to ~8× the APY of
+   a Binance 8h pair, so positions decay much faster (per `docs/SYSTEM.md`
+   §6.4). Default 20% will work but you should review.
 
-The legacy v1.3 bot in `app/` does NOT know about Hyperliquid. You can
-only activate HL **after** the start-command cutover from
+On the next cycle, the runner reads `venue_state.active = true`,
+constructs the live `HyperliquidGateway` from the env secrets, asserts
+that the venue reports your wallet address (refuses to start on
+mismatch), registers the gateway, and spawns paper + live worker threads.
+
+The legacy v1.3 bot in `app/` does NOT know about Hyperliquid. HL
+activation only works after the start-command cutover from
 `uvicorn app.main:app` to `uvicorn web.app:app`.
 
 ## Cutover runbook (§17 Stage 6)

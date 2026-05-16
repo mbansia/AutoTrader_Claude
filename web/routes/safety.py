@@ -11,7 +11,12 @@ from sqlalchemy import select
 
 from state import models as m
 from state import session_scope
-from state.repository import get_or_create_mode_state, get_or_create_strategy_config
+from state.repository import (
+    get_or_create_mode_state,
+    get_or_create_strategy_config,
+    get_venue_state,
+    list_venue_states,
+)
 from web.auth import require_basic_auth
 from web.view_mode import get_view_mode
 
@@ -33,6 +38,21 @@ def _outbound_ip() -> str:
         return "unknown"
 
 
+def _probe_actual_account(exchange_id: str) -> str:
+    """Best-effort live probe of the venue's reported account id. Used on
+    /safety so the operator can see what to paste into the expected field.
+    """
+    from core.config import get_gateway
+
+    gw = get_gateway("live", exchange_id)  # type: ignore[arg-type]
+    if gw is None:
+        return ""
+    try:
+        return gw.actual_account_id() or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 @router.get("/safety", response_class=HTMLResponse)
 def safety(request: Request, _user: str = Depends(require_basic_auth)) -> HTMLResponse:
     with session_scope() as session:
@@ -46,6 +66,17 @@ def safety(request: Request, _user: str = Depends(require_basic_auth)) -> HTMLRe
                 "maintenance_mode": r.maintenance_mode,
             }
             for r in rows
+        ]
+        venue_rows = list_venue_states(session)
+        venues = [
+            {
+                "exchange_id": v.exchange_id,
+                "active": v.active,
+                "expected_account_id": v.expected_account_id,
+                "actual_account_id": _probe_actual_account(v.exchange_id),
+                "notes": v.notes,
+            }
+            for v in venue_rows
         ]
         glob = get_or_create_strategy_config(session)
         per_st_rows = session.scalars(select(m.StrategyConfigPerStrategy)).all()
@@ -73,10 +104,27 @@ def safety(request: Request, _user: str = Depends(require_basic_auth)) -> HTMLRe
             "view_mode": get_view_mode(request),
             "saved": request.query_params.get("saved") == "1",
             "mode_states": ms_data,
+            "venues": venues,
             "guardrails": guard,
             "outbound_ip": _outbound_ip(),
         },
     )
+
+
+@router.post("/safety/venue")
+async def safety_venue_post(
+    request: Request,
+    _user: str = Depends(require_basic_auth),
+) -> RedirectResponse:
+    form = await request.form()
+    exchange_id = str(form.get("exchange_id") or "")
+    with session_scope() as session:
+        row = get_venue_state(session, exchange_id)
+        if row is not None:
+            row.active = form.get("active") == "1"
+            row.expected_account_id = str(form.get("expected_account_id") or "").strip()
+            row.notes = str(form.get("notes") or "").strip()
+    return RedirectResponse(url="/safety?saved=1", status_code=303)
 
 
 @router.post("/safety/mode")
