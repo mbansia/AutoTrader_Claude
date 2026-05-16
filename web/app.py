@@ -5,6 +5,7 @@ contractual endpoints (§5.6 /health, §8.1 /api/diagnostics).
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query
@@ -15,8 +16,26 @@ from diagnostics import build_snapshot
 from state import init_db, session_scope
 
 
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # Startup: kick the bot loop unless the operator opts out (API-only
+    # replicas set BOT_WORKER_ENABLED=0).
+    from loop import start_runner, stop_runner
+
+    start_runner()
+    try:
+        yield
+    finally:
+        # Graceful SIGTERM — finish in-flight cycles, then exit.
+        stop_runner(timeout_s=10.0)
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="AutoTrader_Codex (v1.4)", version="1.4.0")
+    app = FastAPI(
+        title="AutoTrader_Codex (v1.5)",
+        version="1.5.0",
+        lifespan=_lifespan,
+    )
     init_db()
 
     @app.get("/health")

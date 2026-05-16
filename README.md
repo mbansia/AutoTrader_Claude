@@ -83,12 +83,36 @@ Required clean-pass for §17 Stage 5/6 cutover.
 
 ## Cutover runbook (§17 Stage 6)
 
-1. Deploy v1.4 alongside v1.3 (different port).
-2. Run parity harness for 48 hours paper-mode (`--legacy` v1.3, `--new` v1.4).
-3. After 48h clean: switch Coolify start command from `uvicorn app.main:app`
-   to `uvicorn web.app:app`. Same DB, same env vars.
-4. Keep v1.3 deployable for 7 days as fallback (do not delete `app/`).
-5. After 7 days clean: archive `app/`.
+The v1.5 app is **runnable** — `web/app.py`'s `lifespan` boots a
+background loop runner (`loop.runner`) that spawns one thread per
+`(mode, exchange)`. Pre-v1.5 the new app had no loop and would have
+been silent in production; that gap is now closed.
+
+To cut over:
+
+1. **Provision env vars** in Coolify if not already set: `DASHBOARD_USER`,
+   `DASHBOARD_PASSWORD`, `DIAGNOSTICS_TOKEN`, `BINANCE_API_KEY/SECRET`,
+   `BINANCE_EXPECTED_ACCOUNT_ID`, `KUCOIN_API_KEY/SECRET/PASSPHRASE`,
+   `KUCOIN_EXPECTED_ACCOUNT_ID`, `BOT_WORKER_ENABLED=1`, and the
+   `DATABASE_URL` already pointing at the persistent volume.
+2. **Deploy v1.5 alongside v1.3** on a different port, set
+   `BOT_WORKER_ENABLED=0` on the v1.5 instance so it serves the UI but
+   does not trade.
+3. **Run the parity harness for 48 hours** (paper-mode):
+   `python scripts/diagnostics_parity.py --legacy ... --new ...`. Exit 0
+   = clean.
+4. **Atomic cutover**: change Coolify start command on the production
+   service from `uvicorn app.main:app` to `uvicorn web.app:app`. Set
+   `BOT_WORKER_ENABLED=1` (default). Coolify replaces the container in
+   one swap — no overlap window, no double-bot writes to the same DB.
+5. **Keep v1.3 deployable for 7 days** as fallback — do not delete the
+   `app/` package. Roll back = swap start command back.
+6. **After 7 days clean**: archive `app/`.
+
+To activate Hyperliquid (default-off even with creds):
+`ACTIVE_EXCHANGES=binance,kucoin,hyperliquid` + the HL env vars. Read
+§6.4 first — hourly funding implies the `entry_min_net_apy` target on
+HL should usually be set higher than on CEX 8h venues.
 
 ## Safety / never-list
 
