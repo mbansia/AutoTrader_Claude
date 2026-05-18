@@ -30,5 +30,5 @@ read SSOT → fetch tracker issue #28 → classify anomalies per §11 → commen
 or PR per the action matrix.
 
 To run the monitor on a recurring schedule, use Claude Code's `/loop`
-skill: `/loop 3h "do a monitor pass per MONITOR_RUNBOOK.md"`. The 3-hour
+skill: `/loop 1h "do a monitor pass per MONITOR_RUNBOOK.md"`. The hourly
 cadence matches the cron's heartbeat so each pass sees the freshest data.

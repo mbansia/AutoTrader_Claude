@@ -176,9 +176,9 @@ Different venues bundle balances differently. The bot abstracts over this but th
 
 | Term | Definition |
 |---|---|
-| **Diagnostics endpoint** | An auth-gated JSON endpoint (§8) that returns a structured snapshot of cycle health, positions, wallets, recent events, recent trades, and rule-based anomalies. Polled by an external cron every 3 hours and by humans / monitor agents on demand. |
+| **Diagnostics endpoint** | An auth-gated JSON endpoint (§8) that returns a structured snapshot of cycle health, positions, wallets, recent events, recent trades, and rule-based anomalies. Polled by an external cron every hour and by humans / monitor agents on demand. |
 | **Anomaly** | A rule-based flag produced by the diagnostics endpoint when the bot's state diverges from healthy steady-state — e.g. no events in the last hour, naked leg (spot or perp) older than 1 hour, error burst, etc. |
-| **Heartbeat tracker** | A persistent GitHub issue that the diagnostics cron updates every 3 hours regardless of anomaly state. Posting a comment per run guarantees a webhook fires every cycle so the monitor chat can confirm "the bot's still alive". |
+| **Heartbeat tracker** | A persistent GitHub issue that the diagnostics cron updates every hour regardless of anomaly state. Posting a comment per run guarantees a webhook fires every cycle so the monitor chat can confirm "the bot's still alive". |
 | **Monitor chat** | A dedicated Claude session subscribed to the heartbeat tracker. Reads this doc on every wake-up before judging anomalies. Responds inline on the tracker with one-line acknowledgements on clean runs, full diagnosis on anomaly runs, or PRs when it detects a code regression. |
 
 ### 0.10 Implementation primitives (the stack this spec assumes)
@@ -251,7 +251,7 @@ Deploys via Nixpacks on push to `main`. Webhook is the only deploy trigger. ~1-2
 - Required repo secrets (Settings → Secrets and variables → Actions → Repository secrets):
   - `BOT_URL` — `http://m1348vwvjs47x081vz06b141.45.32.53.166.sslip.io` (no trailing slash)
   - `DIAGNOSTICS_TOKEN` — matches the bot's env var
-- Workflow: `.github/workflows/diagnostics.yml`, cron `0 */3 * * *`.
+- Workflow: `.github/workflows/diagnostics.yml`, cron `0 * * * *` (hourly).
 
 ### 2.4 Binance
 
@@ -1348,7 +1348,7 @@ Constraints / invariants the rewrite must preserve:
 
 ### 8.3 Cron + tracker
 
-`.github/workflows/diagnostics.yml` runs every 3h. Required repo secrets: `BOT_URL`, `DIAGNOSTICS_TOKEN`.
+`.github/workflows/diagnostics.yml` runs every hour. Required repo secrets: `BOT_URL`, `DIAGNOSTICS_TOKEN`.
 
 The cron pipes the JSON into `.github/scripts/diagnostics_post.py`, which uses the **heartbeat model** (PR #27):
 
@@ -1478,7 +1478,7 @@ Combine related anomalies into one reply.
 | Job | Schedule | Trigger | Side effects |
 |---|---|---|---|
 | Bot's own loop | every `cfg.loop_seconds` (default 30s) | in-process thread per (mode, gateway) | runs the full cycle in §3.1 |
-| Diagnostics workflow | `0 */3 * * *` (every 3h) | GitHub Actions cron | hits `/api/diagnostics`, updates the persistent tracker issue body, posts heartbeat comment. Comment fires the webhook to the monitor chat. |
+| Diagnostics workflow | `0 * * * *` (hourly) | GitHub Actions cron | hits `/api/diagnostics`, updates the persistent tracker issue body, posts heartbeat comment. Comment fires the webhook to the monitor chat. |
 
 No external crons beyond these.
 
@@ -1523,6 +1523,7 @@ Append-only. Format: `YYYY-MM-DD · PR# · §sections touched · summary`.
 
 | Date | PR | Sections | Summary |
 |---|---|---|---|
+| 2026-05-18 | ops | §0.9, §2.3, §12, §16 L27 | Diagnostics cron cadence: **every 3h → every hour**. Operator runs the autoworker /loop hourly; the cron is now aligned. Doc terminology updated throughout (§0.9 "Diagnostics endpoint" + "Heartbeat tracker", §2.3 setup note, §12 cron table, §16 L27). MONITOR_RUNBOOK + CLAUDE.md pointers updated to `/loop 1h`. No code change beyond `.github/workflows/diagnostics.yml`. |
 | 2026-05-16 | code | §2.2, web/app + loop/runner | **Loop runner — the v1.4 / v1.5 rewrite was NOT runnable until this PR.** The new `web/app.py` exposed the HTTP surface but never called `run_cycle` on a schedule — the rewrite was effectively a dormant binary. Added `loop/runner.py`: one background thread per `(mode, exchange)`, FastAPI `lifespan` startup/shutdown, graceful 10s SIGTERM drain, idempotent start, `BOT_WORKER_ENABLED=0` opt-out for API-only replicas, `ACTIVE_EXCHANGES` whitelist. Hyperliquid stays opt-in even with creds present (§6.4 reasoning). After this PR a single Coolify start-command swap (`uvicorn app.main:app` → `uvicorn web.app:app`) is the entire cutover. |
 | 2026-05-14 | doc+code | §0.7, §2.2, §6.4 (new), §6.5 (renum), §7.5, §16 L11 | **v1.4 → v1.5: Hyperliquid added.** Third venue; DEX wallet model (EVM auth, single unified USDC pool, no sub-buckets, no transfers, no native dust endpoint). Funding settles HOURLY (interval=1h) — APY math automatically picks this up via the venue's reported interval. New env vars: `HYPERLIQUID_WALLET_ADDRESS`, `HYPERLIQUID_PRIVATE_KEY`, `HYPERLIQUID_EXPECTED_ACCOUNT_ID`. New reserved trade_type: `hyperliquid_same_venue_funding_arb`. `external_id` rule: `hyperliquid:<flow_type>:<txhash>` (Arbitrum L1). L11 expanded with HL quirks (hourly funding, EVM rotation = catastrophic, no dust endpoint). |
 | 2026-05-13 | doc | §0.2, §3.1 SOP + math + new mitigation subsection, §4, §7.1.1, §8.2, §9.1, §10, §16 L38–L43 (new), §18 closures | **Execution-layer refactor (v1.3 → v1.4) — SPEC ONLY; code follows.** This PR rewrites the spec to describe the v1.4 execution layer. The implementation (bot.py, exchange.py, ccxt order parameters, sub-target sizing field on the schema, new anomalies, /config form changes, account-id env vars) is a follow-up. Monitor chat should NOT flag the running bot's v1.3 behavior as anomalous against this v1.4 spec until the code lands. (1) Iterative book-walk REPLACED by **closed-form sizing** (single pass per book, argmax of feasibility per level). (2) **limit-IOC DEPRECATED** in favor of **market+FOK** on every leg — pre-trade depth analysis + sub-target sizing makes market+FOK strictly better at our sizing range (L39). (3) Legs now fire **in parallel** (concurrent submission), not sequential — closes the inter-leg latency window that front-running actors exploited (L40). (4) Atomic spot+perp brackets preferred where the venue supports them. (5) New `sub_target_sizing_factor` (default 0.75) absorbs reservation buffers + book moves + racing actors (L41). (6) **Execution-risk mitigation policy** codified: deterministic client-order-ids, T-0 funding rate freshness, ccxt metadata cache TTL + reject-driven refresh, eager strategy-config seed, account-id assertion at boot, periodic permission probe, cycle-error-rate anomaly, static-import deploy smoke, graceful SIGTERM, token-bucket rate-limiter, migration unit tests, tighter 25bps depeg guard. (7) `entry/exit_tick_buffer_bps` deprecated (schema retained per additive-only). (8) Anomalies: `cycle_error_rate_high`, `api_permission_drift`, `slippage_above_forecast`. (9) Rejection categories updated: `fok_rejected_spot/perp`, `single_leg_orphan`; old `ioc_zero_fill` and mid-fill `spot_buy_error` classes deprecated. (10) §18 closures: per-symbol fee caching, two-hop step-1-ok/step-2-fail, wallet-consolidation atomicity, tick-buffer rationale. (11) L38–L43: walks are solvers, limit-IOC's price guarantee is illusory at our depth, sequential legs are a front-runner gift, sub-target is cheap insurance, co-temporal snapshots are non-negotiable, client-order-id is the cheapest network-blip insurance. |
@@ -1610,7 +1611,7 @@ The hard lessons distilled from the first implementation. **Read this section be
 
 ### Monitoring & ops
 
-- **L27 — Heartbeat, not anomaly-triggered alerts.** The monitor chain MUST post something every cycle (every 3h), not only when anomalies fire. Silence is ambiguous: "no anomalies" and "the workflow is broken" look identical from the outside. The heartbeat is the proof of life.
+- **L27 — Heartbeat, not anomaly-triggered alerts.** The monitor chain MUST post something every cycle (hourly), not only when anomalies fire. Silence is ambiguous: "no anomalies" and "the workflow is broken" look identical from the outside. The heartbeat is the proof of life.
 - **L28 — Webhook subscription is session-scoped.** Subscribing the monitor chat to the tracker issue happens once per session and ends when the session closes. The runbook needs to mention this; otherwise the operator wonders why notifications stopped.
 - **L29 — The single-instance host is a single point of failure.** SQLite on local NVMe with no auto-backups means a host failure wipes the entire trade history. Either enable host-level snapshots or run an off-host backup cron. Cost: ~$1/month. Pretending this isn't a problem cost serious trade history.
 - **L30 — PR-via-MCP, not direct push.** When the deployment infrastructure blocks direct `git push origin main`, every change must go through a PR. The MCP API path works where the git proxy doesn't. Don't fight it; embrace it.
