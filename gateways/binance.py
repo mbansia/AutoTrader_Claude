@@ -120,7 +120,10 @@ class BinanceGateway:
 
     def _market(self, symbol: str) -> dict[str, Any]:
         self.load_markets()
-        return self._client.markets[symbol]
+        # §16 L44: futures-only client only has perp symbols (e.g. LITE/USDT:USDT),
+        # not spot symbols (LITE/USDT). Direct indexing raises KeyError and kills
+        # the cycle; .get() with {} lets helpers return safe defaults.
+        return self._client.markets.get(symbol, {})
 
     def tick_size(self, symbol: str) -> float:
         m = self._market(symbol)

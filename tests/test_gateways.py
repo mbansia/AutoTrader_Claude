@@ -211,3 +211,30 @@ def test_binance_fetch_balance_papi_list_response(monkeypatch):
 
     result_btc = gw.fetch_balance("BTC")
     assert result_btc["spot"].free == 0.001
+
+
+def test_binance_market_unknown_spot_symbol_returns_defaults():
+    """§16 L44: futures-only client markets dict has LITE/USDT:USDT but not
+    LITE/USDT (spot). Direct markets[symbol] raises KeyError; .get({}) must
+    let lot_step / tick_size / min_notional return safe defaults instead."""
+    class FakeClient:
+        markets = {"LITE/USDT:USDT": {"precision": {"price": 0.0001, "amount": 0.1}}}
+        _markets_loaded = True
+
+        def load_markets(self, reload=False):
+            pass
+
+    gw = BinanceGateway.__new__(BinanceGateway)
+    gw._client = FakeClient()
+    gw._markets_loaded = False
+    gw._error_dedup = ErrorDedup()
+    gw._padding_bps = 100.0
+    gw._expected_account_id = ""
+
+    # Known perp symbol should resolve correctly.
+    assert gw.lot_step("LITE/USDT:USDT") == 0.1
+
+    # Unknown spot symbol must NOT raise KeyError — returns method defaults.
+    assert gw.lot_step("LITE/USDT") == 0.001
+    assert gw.tick_size("LITE/USDT") == 0.01
+    assert gw.min_notional("LITE/USDT") == 5.0
