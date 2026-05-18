@@ -51,7 +51,13 @@ def load_env() -> EnvConfig:
         binance_api_secret=os.environ.get("BINANCE_API_SECRET", ""),
         kucoin_api_key=os.environ.get("KUCOIN_API_KEY", ""),
         kucoin_api_secret=os.environ.get("KUCOIN_API_SECRET", ""),
-        kucoin_passphrase=os.environ.get("KUCOIN_PASSPHRASE", ""),
+        # Accept both env var names. The legacy v1.3 deploy uses
+        # KUCOIN_API_PASSPHRASE; if the operator already has it set we
+        # honour it. KUCOIN_PASSPHRASE is the shorter v1.5 form.
+        kucoin_passphrase=(
+            os.environ.get("KUCOIN_API_PASSPHRASE")
+            or os.environ.get("KUCOIN_PASSPHRASE", "")
+        ),
         hyperliquid_wallet_address=os.environ.get("HYPERLIQUID_WALLET_ADDRESS", ""),
         hyperliquid_private_key=os.environ.get("HYPERLIQUID_PRIVATE_KEY", ""),
         binance_expected_account_id=os.environ.get("BINANCE_EXPECTED_ACCOUNT_ID", ""),
