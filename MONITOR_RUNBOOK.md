@@ -129,58 +129,94 @@ history is readable.
 - **2026-05-11 outage**: identical-message storm from a single failing
   KuCoin transfer call. L20 dedup shipped, hasn't recurred.
 
-## Upgrade mode (optional second half of the pass)
+## Upgrade mode (autopilot)
 
 After the monitor steps complete, the session MAY also ship one upgrade
-PR from the backlog. This is opt-in per pass — only run upgrade mode when
-ALL of the following are true:
+PR. Self-directed: the loop finds work from defined safe surfaces; no
+operator-marked authorisation needed. Run upgrade mode when ALL of the
+following are true:
 
 1. **Bot is healthy.** No critical anomalies in the latest cron run. If
    `endpoint_returned_error`, `no_recent_events`, `cycle_error_rate_high`,
    or `api_permission_drift` is active, STAY in monitor mode only.
 2. **No open PR-in-flight from a prior pass.** Check
    `mcp__github__list_pull_requests(state="open")`. If a recent
-   `claude/*` PR is open and not merged, give the operator a turn to
-   review — don't pile on.
+   `claude/*` PR is open and was last touched > 24h ago without operator
+   activity, STAY in monitor mode — don't pile on.
 3. **CI on `main` is green.** Don't ship on a broken base.
-4. **`UPGRADE_BACKLOG.md` has at least one item with `status: ready`.**
+
+### Work-selection surfaces (in priority order)
+
+Pick the FIRST opportunity found on any of these surfaces. The loop
+generates its own work; the operator's `UPGRADE_BACKLOG.md` is a
+"suggestion box" the loop reads first, but it's not required.
+
+1. **Anomaly-driven bug fixes** — if the monitor classified a regression
+   (NameError pattern, broken endpoint, deprecated rejection category
+   surfacing, log pattern that §9.3 marks as regression), ship the fix.
+   This is the highest-value autopilot work.
+2. **`UPGRADE_BACKLOG.md` hints** — operator-suggested items. Treat as
+   first-class work if they pass the never-autoship policy check.
+3. **`docs/SYSTEM.md` §18 Tier C polish items** — operator-acknowledged
+   TODOs, low-risk by definition. Close one row at a time.
+4. **Test coverage gaps** — find a `core/` or `state/` function with no
+   direct test; add a unit test. Never weaken existing assertions.
+5. **Documentation drift** — typos, broken section references, stale
+   PR numbers in changelog. Doc-only PRs are always low-risk.
+6. **Dead code / `TODO` / `FIXME`** — `git grep -n "TODO\\|FIXME"`.
+   Address one; do not auto-mark items "done" if the underlying issue
+   isn't actually fixed.
+
+If NONE of the surfaces yields a safe-to-ship item: stay in monitor mode.
+Do NOT invent work outside these surfaces.
+
+### Never autoship — POLICY hard line
+
+These categories trigger an immediate STOP regardless of work surface.
+If a candidate change touches any of them, abandon it and (if it came
+from `UPGRADE_BACKLOG.md`) move the suggestion to a "needs operator"
+section with a note. Comment on the tracker proposing the change if you
+think it's important.
+
+- **§3.1 math** — gates, basis, APY, fees, deferral, exit triggers.
+- **§4 active fields + defaults** — entry/exit thresholds, sizing %,
+  basis-dislocation, stop-loss, sub-target, depeg guard.
+- **§7.1.1 frozen schema** — additive migrations only; never rename,
+  never drop, never reshape an existing column.
+- **§8.1 frozen `/api/diagnostics` JSON contract.**
+- **Venue gateways' order placement paths** — `place_market_fok` and
+  rollback logic.
+- **`docs/SYSTEM.md` spec sections** — §0, §3 (any subsection), §4,
+  §7.1.1, §8.1. Allowed: §16 append-only learnings, §18 closures of
+  existing rows. Never edit a definition or threshold without operator
+  authorisation.
+- **Credentials, env-var names, auth paths.**
 
 ### Upgrade pass — exact steps
 
-1. Read `UPGRADE_BACKLOG.md`. Pick the FIRST item with `status: ready`,
-   `risk: low | medium` (never `high`), and an acceptance criterion the
-   loop can self-verify.
-2. Confirm the planned change does NOT touch the "Never autoship" list
-   (§3.1 math, §4 fields, §7.1.1 schema beyond additive, §8.1 contract,
-   gateway order-placement code, `docs/SYSTEM.md` outside of additive
-   doc notes, credentials, auth). If the work would touch any of those:
-   move the item to `blocked` with a note, comment on the tracker that
-   operator decision is needed, and stop.
-3. Branch: `claude/<item-id>`.
-4. Implement. Keep the diff small — ideally < 200 lines + tests. If the
-   item turns out larger, mark `blocked`, comment, stop.
-5. Add tests covering the acceptance criterion. Run `pytest tests/` —
-   ALL must pass before commit. If any test fails, do NOT debug
-   indefinitely; mark the backlog item `blocked` with the failure note,
-   abandon the branch, return to monitor mode.
-6. Commit + push + open PR. Title: `<item-id>: <short summary>`. Body
-   references the backlog id + acceptance criterion.
+1. Survey the work-selection surfaces in priority order. Pick the first
+   safe candidate.
+2. Sanity-check against the "Never autoship" list. If conflicted:
+   abandon + comment on the tracker.
+3. Branch: `claude/<short-slug>`.
+4. Implement. Diff target < 200 lines + tests. If the work turns out
+   larger: abandon, comment on the tracker proposing the larger work.
+5. Add tests for the acceptance criterion. Run `pytest tests/`. ALL
+   must pass. Any failure → abandon the branch, do NOT debug
+   indefinitely; comment on the tracker with the failure, return to
+   monitor mode.
+6. Commit + push + open PR. Title: short, imperative summary.
+   Body: what it does + why it's safe + which surface it came from.
 7. Merge per CLAUDE.md's pre-authorised autonomy.
-8. **Update `UPGRADE_BACKLOG.md`** in a SEPARATE small commit on `main`
-   (after the merge): move the item from "Ready" to "Done" with the PR
-   number and merge SHA.
-9. Add a one-line note to the tracker issue body summarising what
-   shipped, if any of the changes affect anomaly classification.
 
-### Hard stops in upgrade mode
+### Hard stops
 
-- If CI is red on the PR: revert / close, mark the item `blocked` with
-  reasoning, stop.
-- If a prior loop pass shipped a similar PR that's still un-reviewed
-  (no operator interaction in 24h): do NOT ship another upgrade.
-  Comment on the tracker reminding the operator and stop.
-- If the backlog has been exhausted (no `ready` items): do NOT invent
-  new items. Stay in monitor-only mode.
+- CI red on the PR: revert / close, comment, stop.
+- Operator pushback on a recent PR (their comment, an unmerge, a
+  manual revert): treat as authority withdrawal for that surface; stop
+  upgrade mode for the next 3 passes.
+- Backlog of un-reviewed claude/* PRs > 1: stop shipping until the
+  oldest gets reviewed.
 
 ## What this runbook is NOT
 
