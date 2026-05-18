@@ -129,6 +129,59 @@ history is readable.
 - **2026-05-11 outage**: identical-message storm from a single failing
   KuCoin transfer call. L20 dedup shipped, hasn't recurred.
 
+## Upgrade mode (optional second half of the pass)
+
+After the monitor steps complete, the session MAY also ship one upgrade
+PR from the backlog. This is opt-in per pass — only run upgrade mode when
+ALL of the following are true:
+
+1. **Bot is healthy.** No critical anomalies in the latest cron run. If
+   `endpoint_returned_error`, `no_recent_events`, `cycle_error_rate_high`,
+   or `api_permission_drift` is active, STAY in monitor mode only.
+2. **No open PR-in-flight from a prior pass.** Check
+   `mcp__github__list_pull_requests(state="open")`. If a recent
+   `claude/*` PR is open and not merged, give the operator a turn to
+   review — don't pile on.
+3. **CI on `main` is green.** Don't ship on a broken base.
+4. **`UPGRADE_BACKLOG.md` has at least one item with `status: ready`.**
+
+### Upgrade pass — exact steps
+
+1. Read `UPGRADE_BACKLOG.md`. Pick the FIRST item with `status: ready`,
+   `risk: low | medium` (never `high`), and an acceptance criterion the
+   loop can self-verify.
+2. Confirm the planned change does NOT touch the "Never autoship" list
+   (§3.1 math, §4 fields, §7.1.1 schema beyond additive, §8.1 contract,
+   gateway order-placement code, `docs/SYSTEM.md` outside of additive
+   doc notes, credentials, auth). If the work would touch any of those:
+   move the item to `blocked` with a note, comment on the tracker that
+   operator decision is needed, and stop.
+3. Branch: `claude/<item-id>`.
+4. Implement. Keep the diff small — ideally < 200 lines + tests. If the
+   item turns out larger, mark `blocked`, comment, stop.
+5. Add tests covering the acceptance criterion. Run `pytest tests/` —
+   ALL must pass before commit. If any test fails, do NOT debug
+   indefinitely; mark the backlog item `blocked` with the failure note,
+   abandon the branch, return to monitor mode.
+6. Commit + push + open PR. Title: `<item-id>: <short summary>`. Body
+   references the backlog id + acceptance criterion.
+7. Merge per CLAUDE.md's pre-authorised autonomy.
+8. **Update `UPGRADE_BACKLOG.md`** in a SEPARATE small commit on `main`
+   (after the merge): move the item from "Ready" to "Done" with the PR
+   number and merge SHA.
+9. Add a one-line note to the tracker issue body summarising what
+   shipped, if any of the changes affect anomaly classification.
+
+### Hard stops in upgrade mode
+
+- If CI is red on the PR: revert / close, mark the item `blocked` with
+  reasoning, stop.
+- If a prior loop pass shipped a similar PR that's still un-reviewed
+  (no operator interaction in 24h): do NOT ship another upgrade.
+  Comment on the tracker reminding the operator and stop.
+- If the backlog has been exhausted (no `ready` items): do NOT invent
+  new items. Stay in monitor-only mode.
+
 ## What this runbook is NOT
 
 - Not a substitute for reading `docs/SYSTEM.md`. The doc is binding; this
@@ -137,3 +190,6 @@ history is readable.
   updated in the same PR that introduces them.
 - Not a replacement for operator judgement on strategy / threshold changes.
   Always ask before acting on policy.
+- Not a license for the loop to "improve" anything not in
+  `UPGRADE_BACKLOG.md`. The backlog is operator-curated; never extend it
+  autonomously.
