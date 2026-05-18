@@ -205,7 +205,16 @@ class BinanceGateway:
             return {"spot": WalletBalance(0.0, 0.0), "futures": WalletBalance(0.0, 0.0)}
 
         # §16 L15: parse to float FIRST, never trust truthiness of strings.
-        info = raw.get("info", {})
+        # Binance PAPI /papi/v1/balance returns a list of per-asset dicts at
+        # raw["info"]; find the entry for the requested asset (§16 L11).
+        info_raw = raw.get("info", {})
+        if isinstance(info_raw, list):
+            info: dict = next(
+                (item for item in info_raw if isinstance(item, dict) and item.get("asset") == asset),
+                {},
+            )
+        else:
+            info = info_raw if isinstance(info_raw, dict) else {}
         cross_free = _parse_float(info.get("crossMarginFree"))
         um_wallet = _parse_float(info.get("umWalletBalance"))
         cm_wallet = _parse_float(info.get("cmWalletBalance"))

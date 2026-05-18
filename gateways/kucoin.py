@@ -46,6 +46,21 @@ from ._ccxt_helpers import ErrorDedup, book_from_ccxt, order_to_fill_result
 log = logging.getLogger(__name__)
 
 
+def _parse_interval_hours(raw: Any, default: float = 8.0) -> float:
+    """KuCoin returns funding interval as either a number or a string like '8h'.
+    Parse both forms safely (§16 L11).
+    """
+    if isinstance(raw, str):
+        try:
+            return float(raw.rstrip("h"))
+        except ValueError:
+            return default
+    try:
+        return float(raw)
+    except (ValueError, TypeError):
+        return default
+
+
 class KuCoinGateway:
     exchange_id: ExchangeId = "kucoin"
 
@@ -146,12 +161,7 @@ class KuCoinGateway:
             rate = info.get("fundingRate")
             if rate is None:
                 continue
-            interval_h = float(info.get("interval", 8))  # KuCoin defaults vary
-            if isinstance(info.get("interval"), str):
-                try:
-                    interval_h = float(str(info["interval"]).rstrip("h"))
-                except ValueError:
-                    interval_h = 8.0
+            interval_h = _parse_interval_hours(info.get("interval", 8))
             out.append(
                 FundingInfo(
                     symbol=sym,
@@ -168,7 +178,7 @@ class KuCoinGateway:
         return FundingInfo(
             symbol=perp_symbol,
             predicted_rate=rate,
-            interval_hours=float(info.get("interval") or 8.0),
+            interval_hours=_parse_interval_hours(info.get("interval", 8)),
             next_funding_ts=utcnow(),
         )
 

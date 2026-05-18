@@ -19,6 +19,7 @@ from gateways import BinanceGateway, HyperliquidGateway, InMemoryGateway, KuCoin
 from gateways._ccxt_helpers import ErrorDedup, book_from_ccxt, order_to_fill_result
 from gateways.base import Gateway
 from gateways.binance import _is_real_spot_asset, _parse_float
+from gateways.kucoin import _parse_interval_hours
 
 
 PROTOCOL_METHODS = (
@@ -163,3 +164,50 @@ def test_binance_parse_float_l15():
     assert _parse_float(None) == 0.0
     assert _parse_float("") == 0.0
     assert _parse_float("garbage") == 0.0
+
+
+def test_kucoin_parse_interval_hours_string():
+    """KuCoin returns '8h' / '4h' strings; must not raise ValueError (§16 L11)."""
+    assert _parse_interval_hours("8h") == 8.0
+    assert _parse_interval_hours("4h") == 4.0
+    assert _parse_interval_hours("1h") == 1.0
+    assert _parse_interval_hours(8) == 8.0
+    assert _parse_interval_hours(4.0) == 4.0
+    assert _parse_interval_hours("bad", default=8.0) == 8.0
+    assert _parse_interval_hours(None, default=8.0) == 8.0
+
+
+def test_binance_fetch_balance_papi_list_response(monkeypatch):
+    """PAPI /papi/v1/balance returns a list; fetch_balance must not crash (§16 L11)."""
+    papi_list = [
+        {
+            "asset": "USDT",
+            "crossMarginFree": "50.0",
+            "umWalletBalance": "25.0",
+            "cmWalletBalance": "10.0",
+        },
+        {
+            "asset": "BTC",
+            "crossMarginFree": "0.001",
+            "umWalletBalance": "0.0",
+            "cmWalletBalance": "0.0",
+        },
+    ]
+
+    class FakeClient:
+        def fetch_balance(self, params=None):
+            return {"info": papi_list}
+
+    gw = BinanceGateway.__new__(BinanceGateway)
+    gw._client = FakeClient()
+    gw._error_dedup = ErrorDedup()
+    gw._padding_bps = 100.0
+    gw._expected_account_id = ""
+    gw._markets_loaded = False
+
+    result = gw.fetch_balance("USDT")
+    assert result["spot"].free == 85.0   # 50+25+10
+    assert result["futures"].free == 85.0
+
+    result_btc = gw.fetch_balance("BTC")
+    assert result_btc["spot"].free == 0.001
