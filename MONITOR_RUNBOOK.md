@@ -7,7 +7,7 @@ exactly. Self-contained — point a fresh session at this file plus
 
 ## Wake-up signal
 
-The cron in `.github/workflows/diagnostics.yml` runs every 3 hours. It hits
+The cron in `.github/workflows/diagnostics.yml` runs every hour. It hits
 `/api/diagnostics`, then `.github/scripts/diagnostics_post.py` updates issue
 **[bot-diagnostics] Tracker** (issue #28) and posts a comment per run.
 
@@ -16,9 +16,9 @@ ways to drive one:
 
 1. **Manual** — operator opens a Claude Code session and says "monitor the
    bot". Session runs through this runbook once.
-2. **/loop** — operator runs `/loop 3h <prompt>` where the prompt is "do a
+2. **/loop** — operator runs `/loop 1h <prompt>` where the prompt is "do a
    monitor pass per MONITOR_RUNBOOK.md". Claude Code re-invokes the prompt
-   every 3 hours, self-pacing the work.
+   every hour, lined up with the cron's heartbeat.
 3. **External cron** — an external scheduler (cron / GitHub Action / Coolify
    timer) launches `claude` via the Anthropic SDK on a schedule. This is
    what currently posts the tracker comments under @mbansia.
