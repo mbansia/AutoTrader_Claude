@@ -1,23 +1,25 @@
-# Upgrade suggestions (operator hint box)
+# Upgrade backlog (AutoTrader_Codex)
 
-**Not gating.** The autopilot loop in `MONITOR_RUNBOOK.md` self-directs;
-it doesn't require entries here. Use this file to:
+**Not gating.** AutoWorker self-directs from `MASTER_DIRECTIVES.md`; it
+doesn't need entries here to do work. Use this file when you want to:
 
-- Drop a hint when you want the loop to prioritise something specific.
-- Mark items the loop should NOT pick up (move to "Hold").
-- Record what shipped so the loop avoids re-doing it.
+- Drop a hint so the next pass prioritises something specific.
+- Park an item the agent should NOT pick up yet (move to **Hold**).
+- Track what's already shipped so the agent avoids re-doing it.
 
-The loop reads this file as priority #2 (after anomaly-driven bug fixes,
-before §18 Tier C polish). Hints are treated as first-class work IF
-they pass the never-autoship policy check in the runbook.
+The agent reads this file as work-selection priority #2 (after
+anomaly-driven bug fixes, before directive open items). Hints are
+treated as first-class work IF they pass §8 of the directives.
 
 ---
 
-## Hints (loop will pick these up first)
+## Hints (the agent picks these up first)
 
 Format:
+
 ```
 - <one-line title>
+  - dimension: product | tech | security | ux | marketing | feedback
   - notes: <optional context>
 ```
 
@@ -27,17 +29,18 @@ Format:
 
 ## Hold (do not autoship)
 
-Reasons an operator might park work here:
-- The change is policy-sensitive (touches §3.1 math, §4 fields, etc.).
-- The change requires a venue test the operator wants to run first.
-- The work needs design discussion before code.
+Reasons to park work here:
+
+- The change is policy-sensitive (touches §8).
+- The change needs a manual test the operator wants to run first.
+- The work needs design discussion before any code.
 
 (empty)
 
 ---
 
-## Shipped (loop archives here)
+## Shipped (the agent archives here)
 
-Format: `<title> — PR #<n> @ <merge SHA> on <date>`
+Format: `<title> — PR #<n> @ <merge SHA> on <date> [dimension]`
 
 (empty — first autopilot shipments will appear here)

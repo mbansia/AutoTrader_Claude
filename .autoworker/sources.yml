@@ -1,0 +1,4 @@
+enabled:
+  - diagnostics_endpoint:
+      endpoint: /api/diagnostics
+      hours_param: hours

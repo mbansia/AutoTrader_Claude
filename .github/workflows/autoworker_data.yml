@@ -1,0 +1,62 @@
+name: AutoWorker data ingest
+
+# Polls configured data sources on a schedule and updates the persistent
+# tracker issue. The agent reads the tracker as its primary input each
+# pass.
+#
+# Enabled sources are configured in .autoworker/sources.yml. Built-in
+# collectors live in .github/scripts/autoworker_sources/. Add your own
+# by dropping a Python module in that directory that exposes
+# `collect(config: dict) -> dict`.
+#
+# REPO SECRETS (set what you use):
+#   - BOT_URL, DIAGNOSTICS_TOKEN     (for the diagnostics_endpoint source)
+#   - X_BEARER_TOKEN                 (for the social_x source — opt-in)
+#   - GITHUB_TOKEN                    (provided automatically, used for
+#                                      the github_signals source)
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      hours_window:
+        description: 'Lookback window for time-bounded sources'
+        required: false
+        default: '24'
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: autoworker-data
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyyaml
+
+      - name: Run data ingest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HOURS: ${{ github.event.inputs.hours_window || '24' }}
+          BOT_URL: ${{ secrets.BOT_URL }}
+          DIAGNOSTICS_TOKEN: ${{ secrets.DIAGNOSTICS_TOKEN }}
+          X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
+        run: |
+          python .github/scripts/autoworker_data_ingest.py
