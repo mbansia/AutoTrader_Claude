@@ -191,12 +191,30 @@ PR with a `needs-operator-review` label, but it must not merge.
 - The runbook's hard-stop rules
 - Anything labelled `do-not-autoship` on GitHub
 
-**Project-specific never-touch list — fill in:**
+**Project-specific never-touch list (AutoTrader_Codex):**
 
-- [e.g. core business-logic math]
-- [e.g. order placement paths]
-- [e.g. consent / GDPR flows]
-- [...]
+Cross-references `docs/SYSTEM.md` (the binding spec) and `MONITOR_RUNBOOK.md`
+(the legacy precursor). Autopilot may NEVER:
+
+- Touch `docs/SYSTEM.md` §3.1 math — gates, basis, APY, fees, deferral, exit
+  triggers. Strategy policy lives there.
+- Touch `docs/SYSTEM.md` §4 active fields + defaults — entry/exit thresholds,
+  sizing %, basis-dislocation, stop-loss, sub-target sizing factor,
+  depeg-guard bps. Risk-policy lives there.
+- Reshape `docs/SYSTEM.md` §7.1.1 schema beyond additive. No renames, no
+  drops, no type changes. Additive `ALTER TABLE ADD COLUMN` is fine.
+- Modify `docs/SYSTEM.md` §8.1 frozen `/api/diagnostics` JSON contract.
+- Edit venue gateways' order-placement paths (`place_market_fok`,
+  rollback) without operator review. Read-only changes (logging, error
+  classification) are fine.
+- Touch `docs/SYSTEM.md` spec sections (§0, §3, §4, §7.1.1, §8.1).
+  Allowed exceptions: §16 (append-only learnings) and §18 (closing
+  existing TODO rows).
+- Touch credentials, env-var names, or auth paths.
+- Modify the legacy `MONITOR_RUNBOOK.md` / `.github/workflows/diagnostics.yml`
+  / `.github/scripts/diagnostics_post.py` / tracker issue #28. The
+  precursor pattern coexists by operator choice; AutoWorker does not
+  retire it unilaterally.
 
 The agent re-reads this section on every pass. Updating it tightens or
 loosens the boundary immediately.
