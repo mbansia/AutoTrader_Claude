@@ -43,6 +43,13 @@ describes the two-part pass: read `MASTER_DIRECTIVES.md` → fetch
 tracker issue #58 → classify per the action
 matrix → optional autopilot upgrade from defined surfaces.
 
+**Operator driver:** local Claude Code session via `/loop` (no
+`ANTHROPIC_API_KEY` needed — uses the operator's Claude subscription
+auth). The scheduled `autoworker_loop.yml` GitHub Actions workflow that
+the AutoWorker template would install is intentionally NOT present in
+this repo. Only the data-ingest cron runs on GitHub Actions; the agent
+loop runs locally.
+
 To run on a schedule locally: `/loop 1h
 "do an AutoWorker pass per RUNBOOK.md"`.
 
