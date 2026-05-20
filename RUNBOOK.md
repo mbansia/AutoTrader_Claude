@@ -16,20 +16,24 @@ project prefs, five-pass persona audit before merge, new branch always,
 
 ## Wake-up
 
-A pass starts in one of three ways:
+A pass starts in one of two ways (operator chose local-driven only):
 
-1. **Scheduled** — `.github/workflows/autoworker_loop.yml` runs at
-   `0 * * * *` and invokes the agent CLI configured by your
-   adapter (`adapters/claude_code.md`).
-2. **`/loop`** — for Claude Code: `/loop 1h "do one
-   AutoWorker pass per RUNBOOK.md"`.
-3. **Manual** — operator opens an agent session, says "do an autoworker
-   pass".
+1. **`/loop`** — Claude Code's recurring skill. From a session opened in
+   this repo: `/loop 1h "do an AutoWorker pass per RUNBOOK.md"`. The
+   session re-runs the prompt every hour, lined up with the data
+   ingest cron's tracker updates.
+2. **Manual** — operator opens an agent session, says "do an autoworker
+   pass". Single pass, no recurrence.
 
 The data ingestion cron (`.github/workflows/autoworker_data.yml`) runs
-on the same cadence and updates the tracker issue body + posts a
-heartbeat comment. The comment fires the webhook that wakes scheduled
-sessions where applicable.
+every hour and updates the tracker issue body + posts a heartbeat
+comment. The local `/loop` session reads that tracker on each pass.
+
+> **Note:** The scheduled `claude --print` GitHub Actions workflow that
+> the AutoWorker README documents is **NOT** installed in this repo —
+> operator prefers running the loop via a local Claude Code session
+> (no Anthropic API key required; uses the operator's Claude
+> subscription auth instead).
 
 ---
 
