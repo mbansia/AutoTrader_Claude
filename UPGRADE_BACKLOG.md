@@ -43,4 +43,4 @@ Reasons to park work here:
 
 Format: `<title> — PR #<n> @ <merge SHA> on <date> [dimension]`
 
-(empty — first autopilot shipments will appear here)
+Close 3 Tier C TODO rows in docs/SYSTEM.md §18 — PR #62 @ e4b5461 on 2026-05-20 [tech/docs]
