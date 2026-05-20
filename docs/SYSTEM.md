@@ -1848,12 +1848,12 @@ Catalogued from the "if a from-scratch coding agent built this with only the spe
 |---|---|
 | Vocabulary drift: "asset" vs "currency", "60min" vs "3600s", "spot symbol" vs "spot pair" | scattered |
 | ~~Tick-buffer rationale~~ | RESOLVED v1.4: fields deprecated; market+FOK has no limit price to buffer. |
-| `rejected_candidates` retention policy ("prune old rows") — keep how long? | §3.1 SOP post-cycle |
+| ~~`rejected_candidates` retention policy ("prune old rows") — keep how long?~~ | RESOLVED: 7-day retention (`_REJECTED_RETENTION_DAYS = 7`), pruned once per hour via `_maybe_prune_rejected_candidates` (single `DELETE WHERE ts < cutoff`; prune interval 3 600 s). |
 | `/config` strategy tab source — `StrategyConfigPerStrategy` rows, or a static `ACTIVE_STRATEGIES` constant? | §5.3 |
-| Dashboard view-cookie name + max-age | §5 |
+| ~~Dashboard view-cookie name + max-age~~ | RESOLVED: cookie name `atc_view`, max-age 30 days (2 592 000 s), `httponly=True`, `samesite="strict"`. Set by `web/view_mode.py:set_view_mode`. |
 | Should `/api/diagnostics` omit `perp_entry_price=0` / `spot_entry_price=0` sentinel fields for naked rows, or surface them with a `is_real_leg` boolean? | §8.1 |
 | Re-validate the "venue dust endpoint min" floor: $0.10 tracking floor is a magic number | §3.1 SOP Phase A |
-| `last_close_error` retention — does it clear on successful retry, or accumulate? | §7.1.1 |
+| ~~`last_close_error` retention — does it clear on successful retry, or accumulate?~~ | RESOLVED: clears on successful retry (set to `''` in four close-path branches in `app/bot.py`); does NOT accumulate across cycles. |
 
 Resolution policy: each Tier B gap should be closed in a separate doc PR (or in the PR that implements the corresponding behavior). Tier C gets one consolidated cleanup PR before the rewrite kicks off at Stage 0.
 
