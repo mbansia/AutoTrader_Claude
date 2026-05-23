@@ -228,3 +228,4 @@ memory the next pass relies on.
 Format: `YYYY-MM-DD PR #N — <summary> [directive: §X]`
 
 2026-05-20 PR #62 — Closed 3 Tier C TODO rows in docs/SYSTEM.md §18 (rejected_candidates 7-day retention, view-cookie atc_view/30d, last_close_error clears on success). Answers derived from source code; pure doc change, 135/135 tests. [directive: §18 polish]
+2026-05-23 PR #64 — Add hourly heartbeat INFO event in _worker_loop; eliminates false-positive no_recent_events CRITICAL that fired on every healthy-loop pass because bot_events is only written on errors/warnings. 137/137 tests. [directive: §8.2 monitoring]
