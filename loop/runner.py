@@ -43,6 +43,30 @@ from state.repository import (
 
 log = logging.getLogger(__name__)
 
+# Heartbeat: log one INFO event per (mode, exchange) per interval so
+# diagnostics' `seconds_since_last_event` stays below the 3600s threshold
+# on a healthy loop that never hits errors or warnings.
+_HEARTBEAT_INTERVAL_S = 3600
+_last_heartbeat: dict[tuple[str, str], float] = {}
+
+
+def _heartbeat_if_due(mode: str, exchange_id: str) -> None:
+    key = (mode, exchange_id)
+    now = time.time()
+    if now - _last_heartbeat.get(key, 0.0) >= _HEARTBEAT_INTERVAL_S:
+        _last_heartbeat[key] = now
+        try:
+            with session_scope() as session:
+                log_event(
+                    session,
+                    mode=mode,
+                    exchange=exchange_id,
+                    level="INFO",
+                    message="loop heartbeat",
+                )
+        except Exception:  # noqa: BLE001
+            pass
+
 
 # Per §6.4 + L11, Hyperliquid is opt-in: the gateway code is in repo but
 # trading on it requires explicit operator activation since (a) the funding
@@ -254,6 +278,7 @@ def _worker_loop(
                     )
             except Exception:  # noqa: BLE001
                 pass
+        _heartbeat_if_due(mode, exchange_id)
         # Sleep `loop_seconds` minus elapsed, but never less than 1s and
         # never more than the configured value. Re-read config every cycle
         # so live edits take effect on the next iteration.

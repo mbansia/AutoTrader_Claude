@@ -182,3 +182,42 @@ def test_runner_registers_gateways_for_diagnostics(monkeypatch):
     r.start_runner()
     registered = {(m, x) for m, x, _ in list_gateways()}
     assert registered == {("paper", "binance"), ("live", "binance")}
+
+
+def test_heartbeat_logs_when_overdue():
+    """_heartbeat_if_due writes an INFO bot_event when last heartbeat is stale."""
+    import time
+    import loop.runner as r
+    from sqlalchemy import select
+    from state import session_scope
+    from state.models import BotEvent
+
+    r._last_heartbeat[("live", "binance")] = time.time() - r._HEARTBEAT_INTERVAL_S - 1
+    r._heartbeat_if_due("live", "binance")
+
+    with session_scope() as session:
+        evt = session.execute(
+            select(BotEvent).where(BotEvent.message == "loop heartbeat")
+        ).scalar_one_or_none()
+        assert evt is not None
+        assert evt.level == "INFO"
+        assert evt.mode == "live"
+        assert evt.exchange == "binance"
+
+
+def test_heartbeat_skips_when_recent():
+    """_heartbeat_if_due does NOT log if last heartbeat was within the interval."""
+    import time
+    import loop.runner as r
+    from sqlalchemy import select
+    from state import session_scope
+    from state.models import BotEvent
+
+    r._last_heartbeat[("live", "binance")] = time.time() - 1
+    r._heartbeat_if_due("live", "binance")
+
+    with session_scope() as session:
+        evt = session.execute(
+            select(BotEvent).where(BotEvent.message == "loop heartbeat")
+        ).scalar_one_or_none()
+        assert evt is None
