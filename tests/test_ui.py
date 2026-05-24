@@ -142,3 +142,62 @@ def test_safety_venue_toggle_off(client):
         follow_redirects=False,
     )
     assert r.status_code == 303
+
+
+def test_monitoring_renders_gateway_cards(client):
+    """Monitoring page renders probe cards when a gateway is registered."""
+    import core.config as cfg
+
+    class _StubGateway:
+        exchange_id = "binance"
+
+        def expected_account_id(self) -> str:
+            return "acct-123"
+
+        def actual_account_id(self) -> str:
+            return "acct-123"
+
+        def probe_permissions(self) -> dict:
+            return {"spot_read": True, "futures_read": True}
+
+        def account_mode_probe(self) -> str:
+            return "portfolio_margin"
+
+    cfg.register_gateway("paper", "binance", _StubGateway())
+    try:
+        r = client.get("/monitoring", auth=("admin", "pw"))
+        assert r.status_code == 200
+        assert b"binance" in r.content
+        assert b"acct-123" in r.content
+        assert b"portfolio_margin" in r.content
+    finally:
+        cfg.clear_registry()
+
+
+def test_monitoring_gateway_probe_exceptions_handled(client):
+    """Exception in all three probe calls must not crash /monitoring."""
+    import core.config as cfg
+
+    class _BrokenGateway:
+        exchange_id = "kucoin"
+
+        def expected_account_id(self) -> str:
+            return "expected-kucoin"
+
+        def actual_account_id(self) -> str:
+            raise RuntimeError("no network")
+
+        def probe_permissions(self) -> dict:
+            raise RuntimeError("permission denied")
+
+        def account_mode_probe(self) -> str:
+            raise RuntimeError("mode error")
+
+    cfg.register_gateway("live", "kucoin", _BrokenGateway())
+    try:
+        r = client.get("/monitoring", auth=("admin", "pw"))
+        assert r.status_code == 200
+        assert b"kucoin" in r.content
+        assert b"expected-kucoin" in r.content
+    finally:
+        cfg.clear_registry()
