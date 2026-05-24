@@ -229,3 +229,4 @@ Format: `YYYY-MM-DD PR #N — <summary> [directive: §X]`
 
 2026-05-20 PR #62 — Closed 3 Tier C TODO rows in docs/SYSTEM.md §18 (rejected_candidates 7-day retention, view-cookie atc_view/30d, last_close_error clears on success). Answers derived from source code; pure doc change, 135/135 tests. [directive: §18 polish]
 2026-05-24 PR #65 — Closed Tier C gap in docs/SYSTEM.md §18: /config strategy tab source is StrategyConfigPerStrategy DB rows ordered by trade_type (config_routes.py:84-88); falls back to query param default when table empty. Pure doc change, 137/137 tests. [directive: §18 polish]
+2026-05-24 PR #67 — Closed 2 Tier C gaps in docs/SYSTEM.md §18: naked-row sentinel fields (leg_entry_price only, no is_real_leg boolean, diagnostics/endpoint.py:86-104) + venue dust floors (DUST_USDT=0.10 noise pre-filter vs VENUE_MIN_NOTIONAL_USDT per-venue trade min). Pure doc change, 137/137 tests. [directive: §18 polish]
