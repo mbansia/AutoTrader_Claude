@@ -47,3 +47,4 @@ Close 3 Tier C TODO rows in docs/SYSTEM.md §18 — PR #62 @ e4b5461 on 2026-05-
 Close Tier C gap: /config strategy tab source — PR #65 @ fd00c30 on 2026-05-24 [tech/docs]
 Close 2 Tier C gaps: diagnostics sentinel fields + venue dust floors — PR #67 @ f04d18e on 2026-05-24 [tech/docs]
 Test coverage: monitoring route 52% → 100% — PR #69 @ 9123dc7 on 2026-05-24 [tech/tests]
+Test coverage: anomaly error_burst + close_blocked + safety per-strategy guardrails — PR #72 @ 1056622 on 2026-05-24 [tech/tests]
