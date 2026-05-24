@@ -853,7 +853,7 @@ Six routed HTML pages + JSON / Markdown endpoints. **The "purpose" column is the
 
 After PR #35 (per-strategy config split):
 
-- **`/config`** has a tab strip with one tab per active trade_type. Switching tabs reloads with `?strategy=<trade_type>` and shows that strategy's per-strategy fields. Global fields display the same across all tabs.
+- **`/config`** has a tab strip with one tab per active trade_type. Switching tabs reloads with `?strategy=<trade_type>` and shows that strategy's per-strategy fields. Global fields display the same across all tabs. Tab list source: all `StrategyConfigPerStrategy` rows ordered alphabetically by `trade_type` (`web/routes/config_routes.py:84-88`); falls back to the current `?strategy=` query param (default `"binance_same_venue_funding_arb"`) when the table is empty.
 - **`/dashboard` position rows** carry `trade_type`. **Should** show "Threshold X% (binance_funding_arb)" inline per row so the operator can see per-position thresholds at a glance. *(Today still shows global threshold. Deferred follow-up.)*
 - **`/safety`** **should** mirror `/config`'s strategy tabs. *(Today shows global only. Deferred follow-up.)*
 - **`/monitoring`** already has per-strategy enable/exit state via `StrategyState`. Per-strategy config can be inlined into the same card per trade_type. *(Today not done.)*
@@ -1850,7 +1850,7 @@ Catalogued from the "if a from-scratch coding agent built this with only the spe
 | Vocabulary drift: "asset" vs "currency", "60min" vs "3600s", "spot symbol" vs "spot pair" | scattered |
 | ~~Tick-buffer rationale~~ | RESOLVED v1.4: fields deprecated; market+FOK has no limit price to buffer. |
 | ~~`rejected_candidates` retention policy ("prune old rows") — keep how long?~~ | RESOLVED: 7-day retention (`_REJECTED_RETENTION_DAYS = 7`), pruned once per hour via `_maybe_prune_rejected_candidates` (single `DELETE WHERE ts < cutoff`; prune interval 3 600 s). |
-| `/config` strategy tab source — `StrategyConfigPerStrategy` rows, or a static `ACTIVE_STRATEGIES` constant? | §5.3 |
+| ~~`/config` strategy tab source — `StrategyConfigPerStrategy` rows, or a static `ACTIVE_STRATEGIES` constant?~~ | RESOLVED: `StrategyConfigPerStrategy` DB rows ordered by `trade_type` (`web/routes/config_routes.py:84-88`); falls back to the `?strategy=` query param default when the table is empty. No static `ACTIVE_STRATEGIES` constant involved. |
 | ~~Dashboard view-cookie name + max-age~~ | RESOLVED: cookie name `atc_view`, max-age 30 days (2 592 000 s), `httponly=True`, `samesite="strict"`. Set by `web/view_mode.py:set_view_mode`. |
 | Should `/api/diagnostics` omit `perp_entry_price=0` / `spot_entry_price=0` sentinel fields for naked rows, or surface them with a `is_real_leg` boolean? | §8.1 |
 | Re-validate the "venue dust endpoint min" floor: $0.10 tracking floor is a magic number | §3.1 SOP Phase A |
