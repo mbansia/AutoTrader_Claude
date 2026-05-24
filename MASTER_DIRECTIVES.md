@@ -228,3 +228,4 @@ memory the next pass relies on.
 Format: `YYYY-MM-DD PR #N — <summary> [directive: §X]`
 
 2026-05-20 PR #62 — Closed 3 Tier C TODO rows in docs/SYSTEM.md §18 (rejected_candidates 7-day retention, view-cookie atc_view/30d, last_close_error clears on success). Answers derived from source code; pure doc change, 135/135 tests. [directive: §18 polish]
+2026-05-24 PR #65 — Closed Tier C gap in docs/SYSTEM.md §18: /config strategy tab source is StrategyConfigPerStrategy DB rows ordered by trade_type (config_routes.py:84-88); falls back to query param default when table empty. Pure doc change, 137/137 tests. [directive: §18 polish]

@@ -44,3 +44,4 @@ Reasons to park work here:
 Format: `<title> — PR #<n> @ <merge SHA> on <date> [dimension]`
 
 Close 3 Tier C TODO rows in docs/SYSTEM.md §18 — PR #62 @ e4b5461 on 2026-05-20 [tech/docs]
+Close Tier C gap: /config strategy tab source — PR #65 @ fd00c30 on 2026-05-24 [tech/docs]
