@@ -48,3 +48,4 @@ Close Tier C gap: /config strategy tab source — PR #65 @ fd00c30 on 2026-05-24
 Close 2 Tier C gaps: diagnostics sentinel fields + venue dust floors — PR #67 @ f04d18e on 2026-05-24 [tech/docs]
 Test coverage: monitoring route 52% → 100% — PR #69 @ 9123dc7 on 2026-05-24 [tech/tests]
 Test coverage: anomaly error_burst + close_blocked + safety per-strategy guardrails — PR #72 @ 1056622 on 2026-05-24 [tech/tests]
+Test coverage: loop/executor.py 80% → 100% (both-rejected + timeout paths) — PR #74 @ f7ef729 on 2026-05-24 [tech/tests]
