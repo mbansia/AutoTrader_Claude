@@ -144,6 +144,17 @@ def test_safety_venue_toggle_off(client):
     assert r.status_code == 303
 
 
+def test_safety_renders_per_strategy_guardrails(client):
+    """GET /safety renders per-strategy APY guardrails when config rows exist (lines 92-98)."""
+    from state import session_scope
+    from state.repository import get_or_seed_per_strategy_config
+    with session_scope() as s:
+        get_or_seed_per_strategy_config(s, "binance_same_venue_funding_arb")
+    r = client.get("/safety", auth=("admin", "pw"))
+    assert r.status_code == 200
+    assert b"binance_same_venue_funding_arb" in r.content
+
+
 def test_monitoring_renders_gateway_cards(client):
     """Monitoring page renders probe cards when a gateway is registered."""
     import core.config as cfg

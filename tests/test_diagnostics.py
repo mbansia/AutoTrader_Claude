@@ -226,3 +226,40 @@ def test_cycle_error_rate_below_threshold_no_anomaly():
         cycle_error_rate_threshold=0.10,
     )
     assert all(r["rule"] != "cycle_error_rate_high" for r in out)
+
+
+def test_error_burst_anomaly():
+    """error_count > 20 fires error_burst warn."""
+    snap = {
+        "cycle_health": {"seconds_since_last_event": 30},
+        "positions": {"naked": [], "open": []},
+        "recent_trades_count": 0,
+        "rejections_total": 0,
+    }
+    out = detect_anomalies(
+        snapshot=snap,
+        error_count=21,
+        cycle_count_estimate=0,
+        cycle_error_rate_threshold=0.10,
+    )
+    assert any(r["rule"] == "error_burst" for r in out)
+
+
+def test_close_blocked_anomaly():
+    """Open position with non-empty last_close_error fires close_blocked."""
+    snap = {
+        "cycle_health": {"seconds_since_last_event": 30},
+        "positions": {
+            "naked": [],
+            "open": [{"symbol": "ETH/USDT", "last_close_error": "timeout"}],
+        },
+        "recent_trades_count": 0,
+        "rejections_total": 0,
+    }
+    out = detect_anomalies(
+        snapshot=snap,
+        error_count=0,
+        cycle_count_estimate=0,
+        cycle_error_rate_threshold=0.10,
+    )
+    assert any(r["rule"] == "close_blocked" for r in out)
