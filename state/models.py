@@ -233,12 +233,16 @@ class CapitalFlow(Base):
     exchange: Mapped[str] = mapped_column(String(16), nullable=False, index=True, default="binance")
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
     amount_usdt: Mapped[float] = mapped_column(Float, nullable=False)
-    flow_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    flow_type: Mapped[str] = mapped_column(String(32), nullable=False, default="")
     note: Mapped[str] = mapped_column(Text, nullable=False, default="")
     detected_by: Mapped[str] = mapped_column(String(16), nullable=False, default="auto")
     # §7.5: external_id construction is "<venue>:<flow_type>:<id>" to guarantee
     # disambiguation across venues and idempotent re-ingestion.
     external_id: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    # Legacy v1.3 column shim — predecessor of `flow_type`. Written
+    # alongside `flow_type` on new rows so a legacy-shaped read (e.g.
+    # the legacy bot still running in parallel) can interpret them.
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="")
 
 
 class ScanResult(Base):

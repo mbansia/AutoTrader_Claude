@@ -370,3 +370,52 @@ class KuCoinGateway:
             if self._dedup.should_log(f"dust:{type(exc).__name__}"):
                 log.warning("kucoin dust conversion failed: %r", exc)
             return {a: 0.0 for a in assets}
+
+    def list_capital_flow_records(self, lookback_days: int = 30) -> list[dict]:
+        """§7.5 + §6.2: KuCoin deposits + withdrawals + inter-sub-account
+        transfers (intra-account moves between KC's main/trade/etc. are
+        NOT capital flows — those are the bot's own shuttle).
+        """
+        from datetime import datetime, timedelta, timezone as _tz
+
+        since_ms = int((datetime.now(_tz.utc) - timedelta(days=lookback_days)).timestamp() * 1000)
+        rows: list[dict] = []
+        try:
+            deps = self._spot.fetch_deposits("USDT", since=since_ms) or []
+        except Exception:  # noqa: BLE001
+            deps = []
+        try:
+            wdrs = self._spot.fetch_withdrawals("USDT", since=since_ms) or []
+        except Exception:  # noqa: BLE001
+            wdrs = []
+        for d in deps:
+            ts = _ms_to_dt_kc(d.get("timestamp"))
+            amt = float(d.get("amount") or 0.0)
+            ext_id = str(d.get("id") or d.get("txid") or "")
+            if not ext_id or amt <= 0.0:
+                continue
+            rows.append({
+                "ts": ts, "amount_usdt": amt, "flow_type": "deposit",
+                "external_id": f"kucoin:deposit:{ext_id}",
+                "note": "KuCoin external deposit",
+            })
+        for w in wdrs:
+            ts = _ms_to_dt_kc(w.get("timestamp"))
+            amt = -abs(float(w.get("amount") or 0.0))
+            ext_id = str(w.get("id") or w.get("txid") or "")
+            if not ext_id or amt == 0.0:
+                continue
+            rows.append({
+                "ts": ts, "amount_usdt": amt, "flow_type": "withdrawal",
+                "external_id": f"kucoin:withdrawal:{ext_id}",
+                "note": "KuCoin external withdrawal",
+            })
+        return rows
+
+
+def _ms_to_dt_kc(ms):
+    from datetime import datetime, timezone as _tz
+
+    if ms is None:
+        return datetime.now(_tz.utc)
+    return datetime.fromtimestamp(float(ms) / 1000.0, tz=_tz.utc)
