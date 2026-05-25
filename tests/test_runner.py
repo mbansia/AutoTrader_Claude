@@ -221,3 +221,20 @@ def test_heartbeat_skips_when_recent():
             select(BotEvent).where(BotEvent.message == "loop heartbeat")
         ).scalar_one_or_none()
         assert evt is None
+
+
+def test_build_engine_sets_wal_mode_and_busy_timeout(tmp_path):
+    """build_engine() on a file-based SQLite DB applies WAL journal mode and
+    busy_timeout=5000 so concurrent runner threads don't get 'database is locked'
+    crashes when flushing balance snapshots + capital flows simultaneously.
+    """
+    from sqlalchemy import text as sqla_text
+    from state.db import build_engine
+
+    eng = build_engine(f"sqlite:///{tmp_path / 'wal_check.db'}")
+    with eng.connect() as conn:
+        mode = conn.execute(sqla_text("PRAGMA journal_mode")).scalar()
+        timeout = conn.execute(sqla_text("PRAGMA busy_timeout")).scalar()
+    eng.dispose()
+    assert mode == "wal"
+    assert timeout == 5000
