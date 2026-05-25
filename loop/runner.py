@@ -248,6 +248,46 @@ def _run_one(gw: Gateway, mode: Mode, trade_type: str) -> None:
             config=cfg,
             trade_type=trade_type,
         )
+        _write_balance_snapshot(session, gw, mode)
+
+
+def _write_balance_snapshot(session, gw: Gateway, mode: Mode) -> None:
+    """Per-cycle BalanceSnapshot — gives the dashboard a fresh fallback
+    when no live gateway aggregation is available. Writes BOTH v1.5
+    columns (spot_free_usdt / futures_free_usdt / total_equity_usdt /
+    mode) AND legacy columns (spot_usdt / futures_usdt / total_usdt /
+    source) so reads against either schema generation surface the row.
+    Best-effort: balance fetch failures log + skip rather than crash
+    the cycle.
+    """
+    from state import models as m
+
+    try:
+        bal_usdt = gw.fetch_balance("USDT")
+        bal_usdc = gw.fetch_balance("USDC")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("snapshot write skipped for %s/%s: %r", mode, gw.exchange_id, exc)
+        return
+    spot_free = bal_usdt["spot"].free + bal_usdc["spot"].free
+    futures_free = bal_usdt["futures"].free + bal_usdc["futures"].free
+    spot_total = bal_usdt["spot"].total + bal_usdc["spot"].total
+    futures_total = bal_usdt["futures"].total + bal_usdc["futures"].total
+    total_equity = spot_total + futures_total
+    snap = m.BalanceSnapshot(
+        mode=mode,
+        exchange=gw.exchange_id,
+        spot_free_usdt=spot_free,
+        futures_free_usdt=futures_free,
+        total_equity_usdt=total_equity,
+        # Legacy back-compat columns — populated so the v1.3-shape
+        # dashboard read still sees real values.
+        source=mode,
+        spot_usdt=spot_total,
+        futures_usdt=futures_total,
+        total_usdt=total_equity,
+    )
+    session.add(snap)
+    session.flush()
 
 
 def _worker_loop(
