@@ -50,3 +50,4 @@ Test coverage: monitoring route 52% → 100% — PR #69 @ 9123dc7 on 2026-05-24 
 Test coverage: anomaly error_burst + close_blocked + safety per-strategy guardrails — PR #72 @ 1056622 on 2026-05-24 [tech/tests]
 Test coverage: loop/executor.py 80% → 100% (both-rejected + timeout paths) — PR #74 @ f7ef729 on 2026-05-24 [tech/tests]
 Test coverage: diagnostics/endpoint.py + config_routes.py 86% → 100% — PR #76 @ 8bc4799 on 2026-05-25 [tech/tests]
+Test coverage: core/sizing.py + dashboard.py 87-89% → 100% (13 tests) — PR #77 @ d959c4c on 2026-05-25 [tech/tests]
