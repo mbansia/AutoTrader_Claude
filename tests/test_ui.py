@@ -185,6 +185,40 @@ def test_monitoring_renders_gateway_cards(client):
         cfg.clear_registry()
 
 
+def test_config_save_global_fields(client):
+    """POST /config with GLOBAL_FIELDS values exercises the global update loop (lines 138-142)."""
+    r = client.post(
+        "/config",
+        auth=("admin", "pw"),
+        data={
+            "strategy": "binance_same_venue_funding_arb",
+            "max_open_positions": "3",
+            "loop_seconds": "60",
+        },
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    r2 = client.get("/config?strategy=binance_same_venue_funding_arb", auth=("admin", "pw"))
+    assert r2.status_code == 200
+    assert b"60" in r2.content
+
+
+def test_config_save_invalid_values_silently_ignored(client):
+    """Invalid form values hit except branches without crashing (lines 120-121, 129-130, 141-142)."""
+    r = client.post(
+        "/config",
+        auth=("admin", "pw"),
+        data={
+            "strategy": "binance_same_venue_funding_arb",
+            "entry_min_net_apy_pct": "not-a-float",
+            "sub_target_sizing_factor": "bad-value",
+            "max_open_positions": "invalid",
+        },
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+
+
 def test_monitoring_gateway_probe_exceptions_handled(client):
     """Exception in all three probe calls must not crash /monitoring."""
     import core.config as cfg

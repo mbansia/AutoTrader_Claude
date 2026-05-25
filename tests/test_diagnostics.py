@@ -263,3 +263,114 @@ def test_close_blocked_anomaly():
         cycle_error_rate_threshold=0.10,
     )
     assert any(r["rule"] == "close_blocked" for r in out)
+
+
+# ── coverage gap tests (lines 24, 68-69, 110, 122, 179-181, 186, 192, 217-218) ──
+
+def test_iso_z_returns_none_for_none():
+    """_iso_z(None) short-circuits to None (line 24)."""
+    from diagnostics.endpoint import _iso_z
+    assert _iso_z(None) is None
+
+
+def test_approx_cycles_zero_loop_seconds():
+    """loop_seconds <= 0 guard returns 0 without dividing (line 192)."""
+    from diagnostics.endpoint import _approx_cycles_in_window
+    assert _approx_cycles_in_window(24, 0) == 0
+
+
+def test_snapshot_open_position(session):
+    """OPEN position exercises open_rows append + _age_hours helper (lines 68-69, 179-181).
+    tz-naive opened_at also triggers the tzinfo replace branch (line 180).
+    """
+    _seed_mode(session)
+    pos = m.Position(
+        mode="paper",
+        exchange="binance",
+        trade_type="binance_same_venue_funding_arb",
+        status="open",
+        symbol="BTC",
+        spot_symbol="BTC/USDT",
+        perp_symbol="BTC/USDT:USDT",
+        quote_currency="USDT",
+        spot_quote_currency="USDT",
+        quantity=0.01,
+        opened_at=datetime(2026, 1, 1, 12, 0, 0),  # tz-naive → triggers line 180
+        spot_entry_price=50000.0,
+        perp_entry_price=50010.0,
+    )
+    session.add(pos)
+    log_event(session, mode="paper", exchange="binance", level="INFO", message="ok")
+    session.flush()
+    snap = build_snapshot(session, hours_raw=24)
+    assert len(snap["positions"]["open"]) == 1
+    assert snap["positions"]["open"][0]["symbol"] == "BTC"
+    assert snap["positions"]["open"][0]["age_hours"] >= 0.0
+
+
+def test_snapshot_recent_events_and_trades(session):
+    """WARN event + Trade row exercise rec_events/rec_trades loop bodies (lines 110, 122)."""
+    _seed_mode(session)
+    log_event(session, mode="paper", exchange="binance", level="WARN", message="warn-event")
+    trade = m.Trade(
+        mode="paper",
+        exchange="binance",
+        symbol="ETH/USDT",
+        venue="spot",
+        side="buy",
+        quantity=1.0,
+        price=2000.0,
+    )
+    session.add(trade)
+    session.flush()
+    snap = build_snapshot(session, hours_raw=24)
+    assert any(e["level"] == "WARN" for e in snap["recent_events"])
+    assert snap["recent_trades_count"] >= 1
+
+
+def test_age_minutes_tznaive_opened_at(session):
+    """Naked position with tz-naive opened_at hits the tzinfo replace guard (line 186)."""
+    _seed_mode(session)
+    pos = m.Position(
+        mode="paper",
+        exchange="binance",
+        trade_type="binance_same_venue_funding_arb",
+        status="naked_spot",
+        symbol="LTC",
+        spot_symbol="LTC/USDT",
+        perp_symbol="LTC/USDT:USDT",
+        quote_currency="USDT",
+        spot_quote_currency="USDT",
+        quantity=1.0,
+        opened_at=datetime(2026, 1, 1, 12, 0, 0),  # tz-naive → triggers line 186
+        spot_entry_price=80.0,
+        perp_entry_price=0.0,
+    )
+    session.add(pos)
+    log_event(session, mode="paper", exchange="binance", level="INFO", message="ok")
+    session.flush()
+    snap = build_snapshot(session, hours_raw=24 * 365)
+    assert len(snap["positions"]["naked"]) == 1
+    assert snap["positions"]["naked"][0]["age_minutes"] >= 0.0
+
+
+def test_collect_wallets_error_branch(session):
+    """Gateway that raises on fetch_balance produces inline error key (lines 217-218)."""
+    _seed_mode(session)
+    from core.config import clear_registry, register_gateway
+
+    class _RaisingGateway:
+        exchange_id = "binance"
+
+        def fetch_balance(self, asset: str):
+            raise RuntimeError("no connection")
+
+    clear_registry()
+    register_gateway("paper", "binance", _RaisingGateway())
+    try:
+        log_event(session, mode="paper", exchange="binance", level="INFO", message="t")
+        snap = build_snapshot(session, hours_raw=24)
+        assert "binance" in snap["wallets"]
+        assert "error" in snap["wallets"]["binance"].get("USDT", {})
+    finally:
+        clear_registry()
