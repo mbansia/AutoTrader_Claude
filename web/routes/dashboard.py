@@ -130,6 +130,58 @@ def _net_injected_capital(session, mode: str) -> float:
     return sum(r.amount_usdt for r in rows)
 
 
+def _realized_trade_pnl(session, mode: str) -> float:
+    """Sum of realized P&L from closed positions in the given mode.
+
+    For a long-spot + short-perp pair:
+       realized_pnl = qty × (spot_exit − spot_entry) + qty × (perp_entry − perp_exit)
+       fees are tracked separately on the Trade rows; this is gross of fees.
+
+    Exit prices come from the per-position Trade rows tagged with the closing
+    side. We pair them in time order — last buy-back on perp + last sell on
+    spot constitute the close. If a position has no clear close pair (e.g.
+    naked_spot dust-converted), it's excluded.
+    """
+    closed = session.scalars(
+        select(m.Position).where(m.Position.mode == mode, m.Position.status == "closed")
+    ).all()
+    total = 0.0
+    for p in closed:
+        if not p.id:
+            continue
+        trades = session.scalars(
+            select(m.Trade).where(m.Trade.position_id == p.id).order_by(m.Trade.ts)
+        ).all()
+        # Exit legs are: sell on spot, buy on futures. Find the last of each.
+        spot_exit = next(
+            (t for t in reversed(trades) if t.venue == "spot" and t.side == "sell"),
+            None,
+        )
+        perp_exit = next(
+            (t for t in reversed(trades) if t.venue == "futures" and t.side == "buy"),
+            None,
+        )
+        if spot_exit is None or perp_exit is None:
+            continue  # not a clean both-leg close
+        spot_leg = p.quantity * (spot_exit.price - p.spot_entry_price)
+        perp_leg = p.quantity * (p.perp_entry_price - perp_exit.price)
+        total += spot_leg + perp_leg
+    return total
+
+
+def _funding_income(session, mode: str) -> float:
+    """Sum of funding_income_accrued across all positions in the given mode.
+    Includes both open and closed positions — funding earned in life-of-position
+    sticks even after close.
+    """
+    total = 0.0
+    for p in session.scalars(
+        select(m.Position).where(m.Position.mode == mode)
+    ).all():
+        total += float(p.funding_income_accrued or 0.0)
+    return total
+
+
 def _open_positions_query(session, mode: str):
     """Select open / naked positions tolerating legacy rows that were
     mis-tagged `mode='paper'` by the v1.3 migration's default. In live
@@ -178,6 +230,14 @@ def dashboard(request: Request, _user: str = Depends(require_basic_auth)) -> HTM
             ).all()
         )
 
+        # Total PnL decomposition. Each component computed independently
+        # so the dashboard can surface which part of P&L is driving the
+        # bottom-line number. Components SHOULD sum to `equity − net_injected`
+        # for a clean ledger; drift indicates either un-ingested capital flows
+        # or stale snapshots.
+        trade_pnl = _realized_trade_pnl(session, mode)
+        funding_income = _funding_income(session, mode)
+
         open_pos_payload = [
             {
                 "exchange": p.exchange,
@@ -216,6 +276,8 @@ def dashboard(request: Request, _user: str = Depends(require_basic_auth)) -> HTM
                 "equity_source": equity_source,
                 "net_injected": net_injected,
                 "total_pnl": equity - net_injected,
+                "trade_pnl": trade_pnl,
+                "funding_income": funding_income,
                 "open_count": len(open_positions),
                 "total_fees": total_fees,
                 "free_deployable": free_deployable,
