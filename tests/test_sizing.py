@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import timedelta
 
 from core.sizing import (
+    _floor_to_step,
+    _vwap_up_to,
     size_buy_spot_price_dependent,
     size_entry,
     size_perp_flat_cap,
@@ -196,3 +198,104 @@ def test_snapshots_skew_rejected():
     a = _book("A", 100.0, asks=[(100.0, 1.0)], bids=[(99.0, 1.0)], ts=_ts(0))
     b = _book("B", 100.0, asks=[(100.0, 1.0)], bids=[(99.0, 1.0)], ts=_ts(200))
     assert not snapshots_co_temporal(a, b)
+
+
+# ─── _vwap_up_to edge cases (line coverage) ────────────────────────────────
+
+
+def test_vwap_up_to_zero_qty_target():
+    """qty_target <= 0 early-returns 0.0 immediately (line 33)."""
+    assert _vwap_up_to([BookLevel(100.0, 5.0)], 0.0) == 0.0
+
+
+def test_vwap_up_to_breaks_early_when_qty_filled():
+    """First level fills the entire target → break fires before second level is visited (line 38)."""
+    result = _vwap_up_to([BookLevel(99.0, 10.0), BookLevel(98.0, 10.0)], 3.0)
+    assert abs(result - 99.0) < 1e-9
+
+
+def test_vwap_up_to_empty_levels_returns_zero():
+    """Empty levels list → spent_qty stays 0 → returns 0.0 (line 43)."""
+    assert _vwap_up_to([], 5.0) == 0.0
+
+
+# ─── _floor_to_step edge cases ─────────────────────────────────────────────
+
+
+def test_floor_to_step_zero_step_returns_value():
+    """step <= 0 returns the raw value unchanged (line 49)."""
+    assert _floor_to_step(3.7, 0.0) == 3.7
+
+
+# ─── buy-spot zero-price level + no-feasible-level rejection ───────────────
+
+
+def test_buy_spot_zero_price_level_skipped_returns_no_feasible():
+    """Level with price=0 is skipped (line 70); no remaining levels → no_feasible_level (line 79)."""
+    asks = [BookLevel(price=0.0, depth=10.0)]
+    r = size_buy_spot_price_dependent(asks, wallet_quote_free=1000.0, safety=1.0)
+    assert r.qty == 0.0
+    assert r.rejection == "no_feasible_level"
+
+
+# ─── sell-spot rejection guards ────────────────────────────────────────────
+
+
+def test_sell_spot_empty_base_balance():
+    """Zero base balance → empty_wallet_or_book (line 94)."""
+    r = size_sell_spot_flat_cap([BookLevel(99.0, 10.0)], base_balance_free=0.0, safety=1.0)
+    assert r.qty == 0.0
+    assert r.rejection == "empty_wallet_or_book"
+
+
+def test_sell_spot_zero_depth_bids():
+    """All bids have depth=0 → cum_qty=0 → zero_qty (line 99)."""
+    r = size_sell_spot_flat_cap([BookLevel(99.0, 0.0)], base_balance_free=5.0, safety=1.0)
+    assert r.qty == 0.0
+    assert r.rejection == "zero_qty"
+
+
+# ─── perp rejection guards ─────────────────────────────────────────────────
+
+
+def test_perp_empty_wallet():
+    """Zero wallet → empty_wallet_or_book (line 116)."""
+    r = size_perp_flat_cap(
+        [BookLevel(100.0, 10.0)], mark_price=100.0,
+        wallet_quote_free=0.0, safety=1.0, leverage=1.0,
+    )
+    assert r.qty == 0.0
+    assert r.rejection == "empty_wallet_or_book"
+
+
+def test_perp_zero_depth_levels():
+    """All levels have depth=0 → cum_qty=0 → zero_qty (line 121)."""
+    r = size_perp_flat_cap(
+        [BookLevel(100.0, 0.0)], mark_price=100.0,
+        wallet_quote_free=1000.0, safety=1.0, leverage=1.0,
+    )
+    assert r.qty == 0.0
+    assert r.rejection == "zero_qty"
+
+
+# ─── size_entry rejection propagation (line 157) ───────────────────────────
+
+
+def test_size_entry_rejection_propagates():
+    """Non-empty books but zero spot wallet → spot binding rejected → propagated (line 157)."""
+    sb = _book("X/USDT", 100.0, asks=[(100.0, 10.0)], bids=[(99.0, 10.0)])
+    pb = _book("X/USDT:USDT", 100.0, asks=[(100.0, 10.0)], bids=[(100.0, 10.0)])
+    r = size_entry(
+        spot_book=sb,
+        perp_book=pb,
+        spot_wallet_quote_free=0.0,
+        perp_wallet_quote_free=1000.0,
+        leverage=1.0,
+        safety=1.0,
+        sub_target=1.0,
+        operator_cap_qty=1e9,
+        spot_lot_step=0.001,
+        perp_lot_step=0.001,
+    )
+    assert r.target_qty == 0.0
+    assert r.rejection_reason == "empty_wallet_or_book"

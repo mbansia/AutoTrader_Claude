@@ -246,3 +246,35 @@ def test_monitoring_gateway_probe_exceptions_handled(client):
         assert b"expected-kucoin" in r.content
     finally:
         cfg.clear_registry()
+
+
+def test_transactions_symbol_filter(client):
+    """GET /transactions?symbol=BTC applies the symbol WHERE clause (dashboard.py line 137)."""
+    r = client.get("/transactions?symbol=BTC", auth=("admin", "pw"))
+    assert r.status_code == 200
+
+
+def test_dashboard_with_stuck_close_shows_alert(client):
+    """Open position with last_close_error renders alert + calls _age_hours (lines 33-37, 104)."""
+    from state import models as m
+    from state import session_scope
+
+    with session_scope() as s:
+        s.add(m.Position(
+            mode="paper",
+            exchange="binance",
+            symbol="BTC/USDT",
+            status="open",
+            quantity=0.001,
+            last_close_error="close failed: timeout",
+        ))
+    r = client.get("/dashboard", auth=("admin", "pw"))
+    assert r.status_code == 200
+    assert b"close failed: timeout" in r.content
+
+
+def test_age_hours_none_returns_zero(client):
+    """_age_hours(None) returns 0.0 immediately (dashboard.py line 34)."""
+    from web.routes.dashboard import _age_hours  # noqa: PLC2701
+
+    assert _age_hours(None) == 0.0
