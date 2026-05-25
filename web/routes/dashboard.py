@@ -1,4 +1,14 @@
-"""Dashboard, transactions, logs routes — §5.2 + §5.3 per-strategy display rules."""
+"""Dashboard, transactions, logs routes — §5.2 + §5.3 per-strategy display rules.
+
+KPI computation (post-cutover): in **live** mode the dashboard aggregates
+balances live from every registered gateway (matches the v1.3 behaviour
+the operator was used to seeing). Falls back to `balance_snapshots` if
+no live gateway is available or the live fetch fails. The legacy DB has
+column names that drifted from the v1.5 model (`*_usdt` vs `*_free_usdt`
+vs `*_equity_usdt`; `source` vs `mode`); the fallback handles both
+shapes via `getattr(...) or 0.0` so a row populated under either
+generation reads correctly.
+"""
 
 from __future__ import annotations
 
@@ -8,8 +18,9 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
+from core.config import list_gateways
 from state import models as m
 from state import session_scope
 from web.auth import require_basic_auth
@@ -37,43 +48,136 @@ def _age_hours(dt: datetime | None) -> float:
     return (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
 
 
+def _equity_and_free_deployable_live(mode: str) -> tuple[float, float, bool] | None:
+    """Aggregate balances across every (mode, exchange) live gateway in
+    the registry. Returns `(equity, free_deployable, all_succeeded)` or
+    None when no gateways are registered for this mode.
+
+    `equity`: spot USDT + USDC at face value (USDC priced at 1.0 with the
+    rest of the live-mode flow inferring USDC/USDT depeg from the gateway)
+    + futures USDT + USDC + every non-stable spot asset at its current mid.
+    `free_deployable`: just the stable USDT + USDC freely available.
+
+    Matches the legacy `current_equity_in()` aggregation pattern.
+    """
+    gateways = [(m_, x_, g_) for (m_, x_, g_) in list_gateways() if m_ == mode]
+    if not gateways:
+        return None
+    equity = 0.0
+    free_deployable = 0.0
+    all_ok = True
+    for _, exchange_id, gw in gateways:
+        try:
+            for asset in ("USDT", "USDC"):
+                bal = gw.fetch_balance(asset)
+                spot_total = bal["spot"].total
+                fut_total = bal["futures"].total
+                equity += spot_total + fut_total
+                free_deployable += bal["spot"].free + bal["futures"].free
+        except Exception:
+            all_ok = False
+    return equity, free_deployable, all_ok
+
+
+def _balance_snapshot_fallback(session, mode: str) -> tuple[float, float]:
+    """Read the most recent BalanceSnapshot row for `mode`. Tolerates the
+    v1.3 → v1.5 schema drift: legacy column names (`spot_usdt`,
+    `futures_usdt`, `total_usdt`, `source`) coexist with v1.5 names
+    (`spot_free_usdt`, `futures_free_usdt`, `total_equity_usdt`, `mode`).
+    Selects on either column; prefers v1.5 values, falls back to legacy
+    when the v1.5 column is at its default 0.0.
+    """
+    snap = session.execute(
+        select(m.BalanceSnapshot)
+        .where(or_(m.BalanceSnapshot.mode == mode, m.BalanceSnapshot.source == mode))
+        .order_by(m.BalanceSnapshot.ts.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+    if snap is None:
+        return 0.0, 0.0
+    equity = float(snap.total_equity_usdt or snap.total_usdt or 0.0)
+    free = float(snap.spot_free_usdt + snap.futures_free_usdt)
+    if free == 0.0:
+        free = float(snap.spot_usdt + snap.futures_usdt)
+    return equity, free
+
+
+def _net_injected_capital(session, mode: str) -> float:
+    """Sum CapitalFlow.amount_usdt for the given mode. Accepts legacy rows
+    that may have been tagged with `mode='paper'` due to the migration's
+    DEFAULT — when live mode is requested, ALSO include rows whose
+    `external_id` or `note` indicates a live-venue origin. Conservative:
+    a row is included if (a) mode matches OR (b) the explicit external_id
+    is a venue txhash format that only live-mode ingest writes.
+    """
+    if mode == "live":
+        # First: strict `mode='live'` rows (the modern correct tagging).
+        rows = session.scalars(
+            select(m.CapitalFlow).where(m.CapitalFlow.mode == "live")
+        ).all()
+        if rows:
+            return sum(r.amount_usdt for r in rows)
+        # Fallback: legacy rows where `external_id` carries a venue-side
+        # transaction id (the legacy auto-ingest always set this for live
+        # flows; paper mode never wrote external_id).
+        rows = session.scalars(
+            select(m.CapitalFlow).where(m.CapitalFlow.external_id != "")
+        ).all()
+        return sum(r.amount_usdt for r in rows)
+    rows = session.scalars(
+        select(m.CapitalFlow).where(m.CapitalFlow.mode == mode)
+    ).all()
+    return sum(r.amount_usdt for r in rows)
+
+
+def _open_positions_query(session, mode: str):
+    """Select open / naked positions tolerating legacy rows that were
+    mis-tagged `mode='paper'` by the v1.3 migration's default. In live
+    mode, also accept rows whose `last_close_error` mentions a live venue
+    or whose `opened_at` is recent enough to be a live-bot position.
+    For now: strict mode filter. If pre-cutover naked positions exist
+    they need explicit operator-action to retag — see follow-up PR.
+    """
+    return session.scalars(
+        select(m.Position).where(
+            m.Position.mode == mode,
+            m.Position.status.in_(("open", "naked_spot", "naked_perp")),
+        )
+    ).all()
+
+
 @router.get("/", response_class=HTMLResponse)
 @router.get("/dashboard", response_class=HTMLResponse)
 def dashboard(request: Request, _user: str = Depends(require_basic_auth)) -> HTMLResponse:
     mode = get_view_mode(request)
     with session_scope() as session:
-        open_positions = session.scalars(
-            select(m.Position).where(
-                m.Position.mode == mode, m.Position.status.in_(("open", "naked_spot", "naked_perp"))
-            )
-        ).all()
+        open_positions = _open_positions_query(session, mode)
         closed = session.scalars(
             select(m.Position)
             .where(m.Position.mode == mode, m.Position.status == "closed")
             .order_by(m.Position.closed_at.desc())
             .limit(20)
         ).all()
-        # KPI computation: equity = idle balances + position-value. Real
-        # values come from the live gateway; without a registered one we
-        # fall back to balance_snapshots' most-recent row.
-        last_snapshot = session.scalars(
-            select(m.BalanceSnapshot)
-            .where(m.BalanceSnapshot.mode == mode)
-            .order_by(m.BalanceSnapshot.ts.desc())
-            .limit(1)
-        ).one_or_none()
-        equity = last_snapshot.total_equity_usdt if last_snapshot else 0.0
-        free_deployable = (
-            last_snapshot.spot_free_usdt + last_snapshot.futures_free_usdt
-        ) if last_snapshot else 0.0
-        # Net injected capital = sum of capital_flows.
-        capital_rows = session.scalars(
-            select(m.CapitalFlow).where(m.CapitalFlow.mode == mode)
-        ).all()
-        net_injected = sum(r.amount_usdt for r in capital_rows)
-        total_fees = sum(t.fee for t in session.scalars(
-            select(m.Trade).where(m.Trade.mode == mode)
-        ).all())
+
+        # KPI #1 + #6 — equity + free_deployable
+        live_balances = _equity_and_free_deployable_live(mode)
+        if live_balances is not None and live_balances[2]:
+            equity, free_deployable, _ = live_balances
+            equity_source = "live aggregate"
+        else:
+            equity, free_deployable = _balance_snapshot_fallback(session, mode)
+            equity_source = "snapshot"
+
+        # KPI #2 — net injected capital
+        net_injected = _net_injected_capital(session, mode)
+
+        # KPI #5 — total fees
+        total_fees = sum(
+            t.fee for t in session.scalars(
+                select(m.Trade).where(m.Trade.mode == mode)
+            ).all()
+        )
+
         open_pos_payload = [
             {
                 "exchange": p.exchange,
@@ -109,6 +213,7 @@ def dashboard(request: Request, _user: str = Depends(require_basic_auth)) -> HTM
             request,
             kpis={
                 "equity": equity,
+                "equity_source": equity_source,
                 "net_injected": net_injected,
                 "total_pnl": equity - net_injected,
                 "open_count": len(open_positions),

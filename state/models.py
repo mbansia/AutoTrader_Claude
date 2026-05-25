@@ -204,6 +204,16 @@ class BalanceSnapshot(Base):
     spot_free_usdt: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     futures_free_usdt: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     total_equity_usdt: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    # ─── Legacy v1.3 column shims — read-only, never written by v1.5 ───
+    # Pre-rewrite schema named these `spot_usdt`, `futures_usdt`,
+    # `total_usdt`, `source`. Declared here so dashboard reads can fall
+    # back when the v1.5-named columns are at their default 0.0 (legacy
+    # rows). Additive-only policy (§7.3) preserves them on the table;
+    # this declaration just makes them visible to the ORM.
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="paper")
+    spot_usdt: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    futures_usdt: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    total_usdt: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
 
 
 class EquityCurve(Base):

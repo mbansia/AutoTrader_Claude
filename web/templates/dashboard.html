@@ -4,7 +4,7 @@
 <h1>Dashboard ({{ view_mode }})</h1>
 
 <section class="kpis">
-  <div class="kpi"><div class="kpi-label">Current equity</div><div class="kpi-value">${{ "%.2f"|format(kpis.equity) }}</div></div>
+  <div class="kpi"><div class="kpi-label">Current equity</div><div class="kpi-value">${{ "%.2f"|format(kpis.equity) }}</div>{% if kpis.equity_source %}<div class="kpi-meta">{{ kpis.equity_source }}</div>{% endif %}</div>
   <div class="kpi"><div class="kpi-label">Net injected capital</div><div class="kpi-value">${{ "%.2f"|format(kpis.net_injected) }}</div></div>
   <div class="kpi"><div class="kpi-label">Total PnL</div><div class="kpi-value">${{ "%.2f"|format(kpis.total_pnl) }}</div></div>
   <div class="kpi"><div class="kpi-label">Open positions</div><div class="kpi-value">{{ kpis.open_count }}</div></div>
