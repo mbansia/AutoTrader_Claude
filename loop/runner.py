@@ -249,6 +249,67 @@ def _run_one(gw: Gateway, mode: Mode, trade_type: str) -> None:
             trade_type=trade_type,
         )
         _write_balance_snapshot(session, gw, mode)
+        _ingest_capital_flows(session, gw, mode)
+
+
+_CAPITAL_FLOW_INGEST_INTERVAL_S = 3600  # once per hour per (mode, exchange)
+_last_capital_flow_ingest: dict[tuple[str, str], float] = {}
+
+
+def _ingest_capital_flows(session, gw: Gateway, mode: Mode) -> None:
+    """Pull venue deposit/withdrawal history and persist new rows. Throttled
+    to once per hour per (mode, exchange) — the history endpoints are
+    rate-limited and capital flows are infrequent enough that more frequent
+    polling burns API budget for no benefit.
+
+    Idempotent: each row's `external_id` carries a `<venue>:<flow_type>:<id>`
+    composite (§7.5). The UNIQUE constraint on the column dedups across
+    re-ingests; we use `INSERT ... ON CONFLICT DO NOTHING` semantics via
+    a pre-fetch + filter so SQLAlchemy doesn't bubble an IntegrityError.
+    """
+    key = (mode, gw.exchange_id)
+    now_ts = time.time()
+    if now_ts - _last_capital_flow_ingest.get(key, 0.0) < _CAPITAL_FLOW_INGEST_INTERVAL_S:
+        return
+    try:
+        rows = gw.list_capital_flow_records(lookback_days=30)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("capital flow ingest failed for %s/%s: %r", mode, gw.exchange_id, exc)
+        return
+    _last_capital_flow_ingest[key] = now_ts
+    if not rows:
+        return
+    from sqlalchemy import select
+    from state import models as m
+
+    incoming_ids = {r["external_id"] for r in rows if r.get("external_id")}
+    existing_ids = set(
+        session.scalars(
+            select(m.CapitalFlow.external_id).where(
+                m.CapitalFlow.external_id.in_(incoming_ids)
+            )
+        ).all()
+    )
+    inserted = 0
+    for r in rows:
+        ext_id = r.get("external_id") or ""
+        if not ext_id or ext_id in existing_ids:
+            continue
+        session.add(m.CapitalFlow(
+            mode=mode,
+            exchange=gw.exchange_id,
+            ts=r.get("ts"),
+            amount_usdt=float(r["amount_usdt"]),
+            flow_type=str(r.get("flow_type") or ""),
+            kind=str(r.get("flow_type") or ""),  # legacy back-compat write
+            note=str(r.get("note") or ""),
+            detected_by="auto",
+            external_id=ext_id,
+        ))
+        inserted += 1
+    if inserted:
+        session.flush()
+        log.info("capital_flow ingest %s/%s: +%d rows", mode, gw.exchange_id, inserted)
 
 
 def _write_balance_snapshot(session, gw: Gateway, mode: Mode) -> None:

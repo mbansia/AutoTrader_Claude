@@ -267,6 +267,11 @@ class InMemoryGateway:
     def convert_dust_to_native(self, assets: list[str]) -> dict[str, float]:
         return {a: 0.0 for a in assets}
 
+    def list_capital_flow_records(self, lookback_days: int = 30) -> list[dict]:
+        """Paper-mode gateway has no real venue history. Tests can populate
+        `self.capital_flow_records` to inject fixtures."""
+        return list(getattr(self, "capital_flow_records", []))
+
 
 def _book(
     symbol: str,

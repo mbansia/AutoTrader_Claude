@@ -332,6 +332,55 @@ class BinanceGateway:
             log.warning("binance dust conversion failed: %r", exc)
             return {a: 0.0 for a in assets}
 
+    def list_capital_flow_records(self, lookback_days: int = 30) -> list[dict]:
+        """§7.5 ingest: walk Binance deposit + withdrawal history. Per
+        §6.1, intra-account universal-transfer rows are NOT capital flows
+        (PM is unified margin) and are deliberately excluded.
+        """
+        from datetime import datetime, timedelta, timezone as _tz
+
+        since_ms = int((datetime.now(_tz.utc) - timedelta(days=lookback_days)).timestamp() * 1000)
+        rows: list[dict] = []
+        try:
+            deps = self._client.fetch_deposits("USDT", since=since_ms) or []
+        except Exception:  # noqa: BLE001
+            deps = []
+        try:
+            wdrs = self._client.fetch_withdrawals("USDT", since=since_ms) or []
+        except Exception:  # noqa: BLE001
+            wdrs = []
+        for d in deps:
+            ts = _ms_to_dt(d.get("timestamp"))
+            amt = float(d.get("amount") or 0.0)
+            ext_id = str(d.get("id") or d.get("txid") or "")
+            if not ext_id or amt <= 0.0:
+                continue
+            rows.append({
+                "ts": ts, "amount_usdt": amt, "flow_type": "deposit",
+                "external_id": f"binance:deposit:{ext_id}",
+                "note": "Binance external deposit",
+            })
+        for w in wdrs:
+            ts = _ms_to_dt(w.get("timestamp"))
+            amt = -abs(float(w.get("amount") or 0.0))
+            ext_id = str(w.get("id") or w.get("txid") or "")
+            if not ext_id or amt == 0.0:
+                continue
+            rows.append({
+                "ts": ts, "amount_usdt": amt, "flow_type": "withdrawal",
+                "external_id": f"binance:withdrawal:{ext_id}",
+                "note": "Binance external withdrawal",
+            })
+        return rows
+
+
+def _ms_to_dt(ms: int | float | None):
+    from datetime import datetime, timezone as _tz
+
+    if ms is None:
+        return datetime.now(_tz.utc)
+    return datetime.fromtimestamp(float(ms) / 1000.0, tz=_tz.utc)
+
 
 def _parse_float(value: Any) -> float:
     """§16 L15: parse to float before any truthiness checks. The string

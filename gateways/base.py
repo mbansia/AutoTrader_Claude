@@ -73,3 +73,14 @@ class Gateway(Protocol):
     def transfer_spot_to_futures(self, asset: str, amount: float) -> None: ...
     def transfer_futures_to_spot(self, asset: str, amount: float) -> None: ...
     def convert_dust_to_native(self, assets: list[str]) -> dict[str, float]: ...
+
+    # ─── capital flows ─────────────────────────────────────────────────
+    # §7.5 external_id construction; idempotent ingest. Per-venue impl
+    # walks deposits + withdrawals + (where applicable) sub-account
+    # transfers. Returns a list of normalised dicts:
+    #   { "ts": datetime, "amount_usdt": float (signed; out=negative),
+    #     "flow_type": "deposit" | "withdrawal" | "transfer",
+    #     "external_id": "<venue>:<flow_type>:<id>",
+    #     "note": str }
+    # Empty list when no history endpoint available or zero activity.
+    def list_capital_flow_records(self, lookback_days: int = 30) -> list[dict]: ...
