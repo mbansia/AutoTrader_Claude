@@ -52,3 +52,4 @@ Test coverage: loop/executor.py 80% → 100% (both-rejected + timeout paths) —
 Test coverage: diagnostics/endpoint.py + config_routes.py 86% → 100% — PR #76 @ 8bc4799 on 2026-05-25 [tech/tests]
 Test coverage: core/sizing.py + dashboard.py 87-89% → 100% (13 tests) — PR #77 @ d959c4c on 2026-05-25 [tech/tests]
 SQLite WAL mode + busy_timeout: eliminate runner_crash database-locked on all 3 venues — PR #81 @ 7fda0a4 on 2026-05-25 [tech/bugfix]
+Test coverage: loop/cycle.py 72% → 78% (6 edge-case tests: entry/exit snapshot_skew, zero-qty, both-FOK-rejected, perp-only orphan naked, stuck-close) — PR #82 @ ac93f71 on 2026-05-25 [tech/tests]
