@@ -6,7 +6,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -33,7 +33,19 @@ def _ensure_sqlite_dir(url: str) -> None:
 def build_engine(url: str | None = None) -> Engine:
     final_url = url or _database_url()
     _ensure_sqlite_dir(final_url)
-    return create_engine(final_url, future=True)
+    engine = create_engine(final_url, future=True)
+    if final_url.startswith("sqlite"):
+        @event.listens_for(engine, "connect")
+        def _set_sqlite_pragmas(dbapi_conn, _connection_record):
+            cursor = dbapi_conn.cursor()
+            # WAL mode: allows concurrent readers while one writer holds the lock,
+            # eliminating the "database is locked" crashes when 3 runner threads
+            # (one per venue) flush balance snapshots + capital flows simultaneously.
+            cursor.execute("PRAGMA journal_mode=WAL")
+            # Give other writers up to 5 s to finish before raising OperationalError.
+            cursor.execute("PRAGMA busy_timeout=5000")
+            cursor.close()
+    return engine
 
 
 _engine: Engine | None = None
