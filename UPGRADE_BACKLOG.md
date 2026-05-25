@@ -51,3 +51,4 @@ Test coverage: anomaly error_burst + close_blocked + safety per-strategy guardra
 Test coverage: loop/executor.py 80% → 100% (both-rejected + timeout paths) — PR #74 @ f7ef729 on 2026-05-24 [tech/tests]
 Test coverage: diagnostics/endpoint.py + config_routes.py 86% → 100% — PR #76 @ 8bc4799 on 2026-05-25 [tech/tests]
 Test coverage: core/sizing.py + dashboard.py 87-89% → 100% (13 tests) — PR #77 @ d959c4c on 2026-05-25 [tech/tests]
+SQLite WAL mode + busy_timeout: eliminate runner_crash database-locked on all 3 venues — PR #81 @ 7fda0a4 on 2026-05-25 [tech/bugfix]
