@@ -13,10 +13,8 @@ via the in-memory gateway. Live mode hits real venues for both reads + orders.
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass, field
 
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from core.lifecycle import LifecycleEvent, initial_status, transition
@@ -29,7 +27,6 @@ from core.math import (
 )
 from core.sizing import size_entry, snapshots_co_temporal
 from core.types import (
-    BookSnapshot,
     GateInputs,
     MergedConfig,
     Mode,
@@ -186,10 +183,8 @@ def _recover_naked_spot(
     res: CycleResult,
 ) -> None:
     """L21 (direction-neutral): try hedge first; fall back to flat-close."""
-    perp_book = gateway.snapshot_book(pos.perp_symbol)
     funding = gateway.fetch_predicted_funding(pos.perp_symbol)
     fees = gateway.fetch_fees(pos.spot_symbol, pos.perp_symbol)
-    live_perp = perp_book.mid_price
     bal = gateway.fetch_balance(pos.symbol)["spot"]
     qty = min(bal.free + bal.total, pos.quantity)
     if qty <= 0.0:
@@ -273,7 +268,6 @@ def _recover_naked_perp(
 ) -> None:
     """Symmetric to _recover_naked_spot. Try buying matching spot to hedge;
     fall back to buying back the perp short."""
-    spot_book = gateway.snapshot_book(pos.spot_symbol)
     funding = gateway.fetch_predicted_funding(pos.perp_symbol)
     fees = gateway.fetch_fees(pos.spot_symbol, pos.perp_symbol)
     perps = {sym: q for sym, q in gateway.list_open_perp_positions()}

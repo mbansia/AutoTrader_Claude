@@ -18,7 +18,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
 
 from core.types import (
     BookLevel,
@@ -28,13 +27,12 @@ from core.types import (
     PositionStatus,
     WalletBalance,
 )
-from gateways.paper import InMemoryGateway, _book
+from gateways.paper import InMemoryGateway
 from loop.cycle import run_cycle
 from state import models as m
 from state.repository import (
     get_or_create_mode_state,
     get_or_seed_per_strategy_config,
-    log_event,
 )
 
 
@@ -104,7 +102,7 @@ def test_tier3_rejects_low_funding(session, gateway):
     _bootstrap(session)
     _seed_gateway_basic_pair(gateway, funding_rate=0.00001)  # 0.1 bps → trivially rejected
     cfg = MergedConfig()
-    res = run_cycle(session=session, gateway=gateway, mode="paper", config=cfg)
+    run_cycle(session=session, gateway=gateway, mode="paper", config=cfg)
     session.commit()
     assert session.query(m.Position).count() == 0
 
@@ -189,9 +187,11 @@ def test_forward_profit_exit_voluntary_with_basis_favourable(session, gateway):
     # Re-seed books co-temporally (basis ~10 bps, well under max_exit_basis_bps=5 default → not deferable)
     # Tighten basis to 0 so voluntary exit doesn't defer:
     now = datetime.now(timezone.utc)
-    asks = [BookLevel(100.0, 100.0)]; bids = [BookLevel(99.95, 100.0)]
+    asks = [BookLevel(100.0, 100.0)]
+    bids = [BookLevel(99.95, 100.0)]
     gateway.books["ABC/USDT"] = BookSnapshot("ABC/USDT", bids, asks, 100.0, now)
-    asks = [BookLevel(100.0, 100.0)]; bids = [BookLevel(99.95, 100.0)]
+    asks = [BookLevel(100.0, 100.0)]
+    bids = [BookLevel(99.95, 100.0)]
     gateway.books[perp_sym] = BookSnapshot(perp_sym, bids, asks, 100.0, now)
 
     gateway.seen_client_order_ids.clear()
@@ -313,7 +313,7 @@ def test_thin_book_fok_rejected(session, gateway):
         perp, [BookLevel(100.05, 0.5)], [BookLevel(100.10, 0.5)], 100.075, now
     )
     cfg = MergedConfig(sub_target_sizing_factor=1.0, max_position_pct=0.5)
-    res = run_cycle(session=session, gateway=gateway, mode="paper", config=cfg)
+    run_cycle(session=session, gateway=gateway, mode="paper", config=cfg)
     session.commit()
     # No position persisted (sizing eats the wallet cap, FOK matches the
     # book depth, so it should fill — but if the executor over-sizes vs
@@ -330,7 +330,6 @@ def test_idempotency_repeat_order_no_double_place(session, gateway):
     cfg = MergedConfig()
     run_cycle(session=session, gateway=gateway, mode="paper", config=cfg)
     session.commit()
-    first = session.query(m.Position).count()
     # Re-run WITHOUT clearing seen_client_order_ids — same cycle_id (no, new
     # cycle id each time) — but the seen-set lives on the gateway. The
     # client-order-id includes a fresh cycle_id, so a retry within a single

@@ -12,7 +12,6 @@ fields (§4 globals).
 from __future__ import annotations
 
 from datetime import timedelta
-from typing import cast
 
 from core.types import (
     BookLevel,

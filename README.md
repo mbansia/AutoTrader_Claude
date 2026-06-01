@@ -11,16 +11,17 @@ thread per (mode, gateway). Every persisted datetime is UTC-aware.
 
 ## Layout
 
-Two parallel application packages live in the repo during the v1.3 → v1.4
-cutover (see §17 of `docs/SYSTEM.md`):
+The v1.4/v1.5 spec-conformant rewrite is the active application (see §17 of
+`docs/SYSTEM.md`):
 
 | Package | Status | Entry |
 |---|---|---|
-| `app/` | **v1.3** running production (until cutover). | `uvicorn app.main:app` |
-| `core/` `state/` `gateways/` `loop/` `diagnostics/` `web/` | **v1.4** spec-conformant rewrite. | `uvicorn web.app:app` |
+| `core/` `state/` `gateways/` `loop/` `diagnostics/` `web/` | **v1.4/v1.5** — active. | `uvicorn web.app:app` |
+| `archive/v1.3-legacy/app/` | **v1.3** — retired monolith, kept as a rollback reference. | `uvicorn app.main:app` (restore first) |
 
-The v1.4 packages share NO code with `app/`. Cutover is a single Coolify
-start-command change; rollback is the reverse.
+The v1.4 packages share NO code with the archived `app/`. Rolling back to
+v1.3 = restore `archive/v1.3-legacy/app/` → `app/` and switch the Coolify
+start command back (see that directory's README).
 
 ## Required environment (only secrets + DB pointer)
 
@@ -69,10 +70,10 @@ Optional env overrides (you almost certainly don't need them):
 ## Running
 
 ```bash
-# v1.4 (post-cutover):
+# v1.4/v1.5 (active):
 uvicorn web.app:app --host 0.0.0.0 --port 8000
 
-# v1.3 (legacy, until cutover):
+# v1.3 (archived fallback — restore archive/v1.3-legacy/app/ → app/ first):
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
@@ -184,9 +185,11 @@ To cut over:
    service from `uvicorn app.main:app` to `uvicorn web.app:app`. Set
    `BOT_WORKER_ENABLED=1` (default). Coolify replaces the container in
    one swap — no overlap window, no double-bot writes to the same DB.
-5. **Keep v1.3 deployable for 7 days** as fallback — do not delete the
-   `app/` package. Roll back = swap start command back.
-6. **After 7 days clean**: archive `app/`.
+5. **Keep v1.3 deployable as fallback** — the retired `app/` package now
+   lives in `archive/v1.3-legacy/app/` (git history preserved). Roll back =
+   restore it to `app/` and swap the start command back.
+6. **Archived** — the v1.3 `app/` package has been moved to
+   `archive/v1.3-legacy/`; restore instructions are in that directory's README.
 
 To activate Hyperliquid (default-off even with creds):
 `ACTIVE_EXCHANGES=binance,kucoin,hyperliquid` + the HL env vars. Read

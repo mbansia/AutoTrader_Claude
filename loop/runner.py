@@ -18,13 +18,11 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Literal
 
 from core.config import (
     EnvConfig,
     ExchangeId,
     clear_registry,
-    list_gateways,
     load_env,
     register_gateway,
 )

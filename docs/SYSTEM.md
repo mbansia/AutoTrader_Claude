@@ -1467,7 +1467,7 @@ Combine related anomalies into one reply.
 
 1. Branch: `claude/<short-kebab>`.
 2. Small, focused. No drive-by refactors.
-3. Smoke: `python -c "import app.main"` + `curl /health` if route surface changed.
+3. Smoke: `python -c "import web.app"` + `curl /health` if route surface changed.
 4. Use `mcp__github__create_pull_request` + `mcp__github__merge_pull_request` (proxy blocks direct push).
 5. **Update SYSTEM.md** in the same PR if behavior changed (§13 makes this binding).
 
@@ -1507,13 +1507,10 @@ Reviewers reject PRs that change behavior without updating this doc. When in dou
 ## 14. Known fragile / deferred
 
 - **Vultr Auto Backups are NOT enabled.** Single-instance SQLite DB on local NVMe. Loss = entire trade / position / event history. Enable Vultr backups (~$1/mo) or run an off-host backup cron.
-- ~~**Per-strategy config split**~~ — shipped in PR #35. New `StrategyConfigPerStrategy` table; `MergedConfig` proxy reads global + per-strategy.
-- ~~**Naming**: `entry_funding_threshold` / `exit_funding_threshold` are misleading~~ — renamed in PR #32 to `entry_min_net_apy` / `exit_min_net_apy`. Legacy form names still accepted as aliases for one release cycle.
 - **Deprecated config fields** (§4) are still on the `/config` form for back-compat. Tidy-up PR pending.
 - **Maker-on-exit fee optimization** not implemented. ~30% of exit fees could be saved with post-only-with-timeout-fallback.
 - **Symbol mapping drift** across ccxt versions could leave open positions un-lookupable for exit funding refresh. Currently logs a WARN and falls back to stale `last_funding_rate`.
 - **Cross-venue + onchain strategies** are roadmap, not implemented.
-- ~~KuCoin `futures→spot` drain 112002 / 250001 / oscillation~~ **resolved in PR #29 (routing) + PR #33 (two-hop + idle-cycle gate)** — see §6.2.
 
 ---
 
@@ -1523,6 +1520,7 @@ Append-only. Format: `YYYY-MM-DD · PR# · §sections touched · summary`.
 
 | Date | PR | Sections | Summary |
 |---|---|---|---|
+| 2026-06-01 | cleanup | §11, §14, §17.7, §18, README, LOOP_PROMPT | **Repo de-bloat.** Archived the retired v1.3 monolith `app/` → `archive/v1.3-legacy/` (history preserved; no active code / test / CI path imported it) along with the superseded `docs/kucoin-integration-plan.md`. Deleted 13 already-resolved rows (§14 ×3, §18 ×10) per the §13 close-out policy. Refreshed the stale §17.7 status (rewrite built; 190 tests green). Updated the §11 deploy-smoke ref `import app.main` → `import web.app`. Trimmed `LOOP_PROMPT.md`'s duplication of `RUNBOOK.md`. Lint: removed dead vars + unused imports in active code, added a `[tool.ruff]` config that excludes `archive/`. Open follow-up: §3.1's `import app.main` deploy-smoke line is now stale but left untouched (frozen section — needs operator edit). |
 | 2026-05-18 | ops | §0.9, §2.3, §12, §16 L27 | Diagnostics cron cadence: **every 3h → every hour**. Operator runs the autoworker /loop hourly; the cron is now aligned. Doc terminology updated throughout (§0.9 "Diagnostics endpoint" + "Heartbeat tracker", §2.3 setup note, §12 cron table, §16 L27). MONITOR_RUNBOOK + CLAUDE.md pointers updated to `/loop 1h`. No code change beyond `.github/workflows/diagnostics.yml`. |
 | 2026-05-16 | code | §2.2, web/app + loop/runner | **Loop runner — the v1.4 / v1.5 rewrite was NOT runnable until this PR.** The new `web/app.py` exposed the HTTP surface but never called `run_cycle` on a schedule — the rewrite was effectively a dormant binary. Added `loop/runner.py`: one background thread per `(mode, exchange)`, FastAPI `lifespan` startup/shutdown, graceful 10s SIGTERM drain, idempotent start, `BOT_WORKER_ENABLED=0` opt-out for API-only replicas, `ACTIVE_EXCHANGES` whitelist. Hyperliquid stays opt-in even with creds present (§6.4 reasoning). After this PR a single Coolify start-command swap (`uvicorn app.main:app` → `uvicorn web.app:app`) is the entire cutover. |
 | 2026-05-14 | doc+code | §0.7, §2.2, §6.4 (new), §6.5 (renum), §7.5, §16 L11 | **v1.4 → v1.5: Hyperliquid added.** Third venue; DEX wallet model (EVM auth, single unified USDC pool, no sub-buckets, no transfers, no native dust endpoint). Funding settles HOURLY (interval=1h) — APY math automatically picks this up via the venue's reported interval. New env vars: `HYPERLIQUID_WALLET_ADDRESS`, `HYPERLIQUID_PRIVATE_KEY`, `HYPERLIQUID_EXPECTED_ACCOUNT_ID`. New reserved trade_type: `hyperliquid_same_venue_funding_arb`. `external_id` rule: `hyperliquid:<flow_type>:<txhash>` (Arbitrum L1). L11 expanded with HL quirks (hourly funding, EVM rotation = catastrophic, no dust endpoint). |
@@ -1822,7 +1820,7 @@ Estimates assume the rewrite is the only ongoing work. Concurrent feature develo
 
 ### 17.7 Status
 
-Pre-Stage-0. Awaiting operator go-ahead.
+Stages 1–4 complete. The v1.4/v1.5 rewrite (`core/` `state/` `gateways/` `loop/` `diagnostics/` `web/`) is built and runnable: `web/app.py` boots the background loop runner, and the full test suite (190 tests) is green. The retired v1.3 monolith has been archived to `archive/v1.3-legacy/` (see §15 and that directory's README for the restore/rollback path). Stage 5 (live side-by-side parity) and the final Stage 6 production cutover remain operator-attended.
 
 ---
 
@@ -1830,16 +1828,13 @@ Pre-Stage-0. Awaiting operator go-ahead.
 
 Catalogued from the "if a from-scratch coding agent built this with only the spec, where would it mess up?" review (2026-05-12). Tier A items have been closed inline above; Tier B and C remain TODOs. Each item is a place where the spec is silent or hand-wavy enough that two different implementers would build incompatible behaviors.
 
-### Tier B — strategy correctness gaps (resolve before the rewrite)
+### Tier B — strategy correctness gaps
 
 | Gap | Where in spec | Resolution direction |
 |---|---|---|
 | **Funding accrual formula not written** | §0.5 "Funding income" defines the concept; §7.1.1 `funding_income_accrued` + `last_funding_accrual_ts` columns exist. Update rule per cycle is not specified. | Paper: `Δaccrued = position_notional × current_funding_rate × min(1, elapsed_since_last_accrual / funding_interval)`. Live: derive from per-cycle delta of the futures wallet's funding-history endpoint, attributed by symbol. Document both. |
 | **Cross-stable arb sizing formula** | §6.5 says "independent buckets" but never writes the formula. | `sized_qty = min(spot_quote_wallet × safety_factor / spot_limit, perp_quote_wallet × safety_factor × leverage / perp_limit)` then floor to lot step. Same formula as same-stable but reads each wallet independently. |
 | **Auto-swap 5 bps basis cost** | §3.1 math `fees_RT_bps` formula uses "+5 bps USDC/USDT spot basis" as a magic constant. | Promote to a per-strategy config field with default 5.0; or document that it's a hardcoded safety margin and why 5 specifically. |
-| ~~**Per-symbol fee caching policy**~~ | RESOLVED v1.4 in §3.1 mitigation policy: per-cycle TTL with force-refresh on tick/lot/min-notional rejects. | — |
-| ~~**Two-hop drain: step-1-succeeded, step-2-failed**~~ | RESOLVED v1.4 in §3.1 mitigation policy: best-effort, partial sweep is still useful; next cycle picks up stranded funds. | — |
-| ~~**Wallet-consolidation atomicity**~~ | RESOLVED v1.4 in §3.1 mitigation policy: best-effort per source bucket; per-bucket failure logs WARN, continues. | — |
 | **Mode-state vs strategy-state precedence** | §4 + §7.1 define both `mode_state.entry_enabled` and `strategy_state.entry_enabled` but never the AND. | AND of both. Rejection category when mode-disabled: `mode_disabled:<mode>`. When strategy-disabled: `strategy_disabled:<trade_type>`. Document the precedence. |
 | **Partial-window funding on fresh opens** | §0.4 + §3.1 — position opens mid-window; first funding payment lands at next scheduled time. | The funding accrual formula above (with `min(1, elapsed/interval)`) handles this correctly; document the property explicitly. |
 
@@ -1848,15 +1843,8 @@ Catalogued from the "if a from-scratch coding agent built this with only the spe
 | Gap | Where in spec |
 |---|---|
 | Vocabulary drift: "asset" vs "currency", "60min" vs "3600s", "spot symbol" vs "spot pair" | scattered |
-| ~~Tick-buffer rationale~~ | RESOLVED v1.4: fields deprecated; market+FOK has no limit price to buffer. |
-| ~~`rejected_candidates` retention policy ("prune old rows") — keep how long?~~ | RESOLVED: 7-day retention (`_REJECTED_RETENTION_DAYS = 7`), pruned once per hour via `_maybe_prune_rejected_candidates` (single `DELETE WHERE ts < cutoff`; prune interval 3 600 s). |
-| ~~`/config` strategy tab source — `StrategyConfigPerStrategy` rows, or a static `ACTIVE_STRATEGIES` constant?~~ | RESOLVED: `StrategyConfigPerStrategy` DB rows ordered by `trade_type` (`web/routes/config_routes.py:84-88`); falls back to the `?strategy=` query param default when the table is empty. No static `ACTIVE_STRATEGIES` constant involved. |
-| ~~Dashboard view-cookie name + max-age~~ | RESOLVED: cookie name `atc_view`, max-age 30 days (2 592 000 s), `httponly=True`, `samesite="strict"`. Set by `web/view_mode.py:set_view_mode`. |
-| ~~Should `/api/diagnostics` omit `perp_entry_price=0` / `spot_entry_price=0` sentinel fields for naked rows, or surface them with a `is_real_leg` boolean?~~ | RESOLVED: naked rows expose a single `leg_entry_price` field (the active leg's entry price); the zero-valued missing-leg field is absent from the naked row dict. Open rows keep both `spot_entry_price` and `perp_entry_price`. No `is_real_leg` boolean added. See `diagnostics/endpoint.py:86–104`. |
-| ~~Re-validate the "venue dust endpoint min" floor: $0.10 tracking floor is a magic number~~ | RESOLVED: two separate floors exist. `DUST_USDT = 0.10` (`app/bot.py:680`) is the "not worth tracking" noise cutoff — phantom spot holdings below $0.10 notional are silently skipped in `_scan_for_phantom_legs`. Separate `VENUE_MIN_NOTIONAL_USDT = {'binance': 5.0, 'kucoin': 1.0, default: 1.0}` (`app/bot.py:763`) governs when a tracked holding is flagged as `dust_below_venue_min` and queued for native venue dust-endpoint conversion. The $0.10 is not the venue trade minimum; it is a noise pre-filter below which even the venue dust API provides no value. |
-| ~~`last_close_error` retention — does it clear on successful retry, or accumulate?~~ | RESOLVED: clears on successful retry (set to `''` in four close-path branches in `app/bot.py`); does NOT accumulate across cycles. |
 
-Resolution policy: each Tier B gap should be closed in a separate doc PR (or in the PR that implements the corresponding behavior). Tier C gets one consolidated cleanup PR before the rewrite kicks off at Stage 0.
+Resolution policy: each remaining Tier B gap should be closed in a separate doc PR (or in the PR that implements the corresponding behavior). The remaining Tier C item is low-risk polish.
 
 ---
 

@@ -12,7 +12,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from core.types import OPEN_STATUSES, PositionStatus
+from core.types import PositionStatus
 from state import models as m
 from state import repository as repo
 
