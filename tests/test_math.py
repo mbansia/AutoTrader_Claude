@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 
 from core.math import (
     apy_compound,

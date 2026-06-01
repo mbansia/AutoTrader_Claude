@@ -11,13 +11,11 @@ credentials. We verify:
 
 from __future__ import annotations
 
-import time
 
 import pytest
 
 from gateways import BinanceGateway, HyperliquidGateway, InMemoryGateway, KuCoinGateway
 from gateways._ccxt_helpers import ErrorDedup, book_from_ccxt, order_to_fill_result
-from gateways.base import Gateway
 from gateways.binance import _is_real_spot_asset, _parse_float
 from gateways.kucoin import _parse_interval_hours
 

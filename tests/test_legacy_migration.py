@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import importlib
 
-import pytest
 from sqlalchemy import create_engine, inspect, text
 
 

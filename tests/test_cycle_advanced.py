@@ -30,7 +30,8 @@ def _bootstrap(session, mode="paper"):
 def _seed_basic_pair(gateway, *, funding_rate=0.005, spot_mid=100.0, perp_mid=100.10):
     """Same as test_cycle's fixture but exposed here for reuse."""
     now = datetime.now(timezone.utc)
-    sp = "ABC/USDT"; pp = "ABC/USDT:USDT"
+    sp = "ABC/USDT"
+    pp = "ABC/USDT:USDT"
     gateway.books[sp] = BookSnapshot(
         sp,
         [BookLevel(spot_mid - 0.05, 100.0)],
@@ -108,7 +109,7 @@ def test_voluntary_exit_fires_on_favourable_negative_basis(session, gateway):
         pp, [BookLevel(99.85, 100)], [BookLevel(99.90, 100)], 99.90, now
     )
     gateway.seen_client_order_ids.clear()
-    res = run_cycle(session=session, gateway=gateway, mode="paper", config=cfg)
+    run_cycle(session=session, gateway=gateway, mode="paper", config=cfg)
     session.commit()
     closed = session.query(m.Position).filter_by(status="closed").count()
     assert closed == 1
@@ -143,7 +144,7 @@ def test_single_leg_orphan_rollback_succeeds(session, gateway, monkeypatch):
     monkeypatch.setattr(gateway, "place_market_fok", selective_fok)
 
     cfg = MergedConfig(sub_target_sizing_factor=1.0, max_position_pct=0.5)
-    res = run_cycle(session=session, gateway=gateway, mode="paper", config=cfg)
+    run_cycle(session=session, gateway=gateway, mode="paper", config=cfg)
     session.commit()
     # No naked row persisted (spot was rolled back).
     assert session.query(m.Position).count() == 0

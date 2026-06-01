@@ -31,3 +31,11 @@ dev-dependencies = [
     "httpx>=0.27",
     "pytest-cov>=7.1.0",
 ]
+
+[tool.ruff]
+# The retired v1.3 monolith lives under archive/ and is not linted.
+extend-exclude = ["archive"]
+
+[tool.ruff.lint.per-file-ignores]
+# Package __init__.py files intentionally re-export their public API.
+"__init__.py" = ["F401"]
